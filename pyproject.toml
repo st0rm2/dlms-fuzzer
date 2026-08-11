@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dlms-enum"
+version = "0.1.0"
+description = "Public-profile DLMS/COSEM serial-HDLC enumeration tool"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "gurux-dlms>=1.0.201,<2",
+  "gurux-serial>=1.0.21,<2",
+  "PyYAML>=6.0.2,<7",
+  "rich>=13,<15",
+]
+
+[project.scripts]
+dlms-enum = "dlms_enum.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

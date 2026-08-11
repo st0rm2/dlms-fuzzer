@@ -1,0 +1,40 @@
+version: 1
+
+transport:
+  type: serial_hdlc
+  device: /dev/ttyUSB0
+  baudrate: 9600
+  baudrate_candidates: [9600, 19200, 4800, 2400, 1200, 600, 300, 38400, 57600, 115200]
+  serial:
+    parity: none
+    data_bits: 8
+    stop_bits: 1
+  response_timeout_ms: 3000
+  inter_request_delay_ms: 100
+  session_guard_ms: 500
+
+scan:
+  mode: get
+  total_get_attempts: 2
+  association_view_first: true
+  common_catalogue: true
+  manufacturer_catalogue: auto
+  union_profile_test: false
+
+profiles:
+  - name: public
+    client_address: 16
+    server:
+      logical_address: 0
+      physical_address: 1
+    authentication:
+      mechanism: none
+    security:
+      policy: none
+    proposed_max_pdu_size: 65535
+
+output:
+  directory: ./runs
+  report_file: report.json
+  traffic_file: traffic.jsonl
+  redact_secrets: true
