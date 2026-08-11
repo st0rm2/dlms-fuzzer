@@ -1,7 +1,9 @@
-"""Gurux-backed direct serial HDLC transport and public association."""
+"""Gurux-backed serial HDLC sessions for public and HLS-GMAC profiles."""
 
 from __future__ import annotations
 
+import contextlib
+import io
 import time
 from typing import Any
 
@@ -14,13 +16,79 @@ from gurux_dlms import (
     GXDLMSTranslator,
     GXReplyData,
 )
-from gurux_dlms.enums import Authentication, Command, Conformance, InterfaceType, ObjectType
+from gurux_dlms.enums import Authentication, Command, Conformance, InterfaceType, ObjectType, Security
+from gurux_dlms.objects.enums import SecuritySuite
 from gurux_dlms.secure.GXDLMSSecureClient import GXDLMSSecureClient
 from gurux_serial import GXSerial
 
-from .config import AppConfig
+from .config import AppConfig, SecureProfile
+from .counter_state import InvocationCounterLease
 from .result_model import Outcome, enum_name, normalize_value
 from .traffic_logger import TrafficLogger
+
+
+_PROTECTED_COMMANDS = {
+    int(Command.GLO_INITIATE_REQUEST): "glo-initiate-request",
+    int(Command.GLO_INITIATE_RESPONSE): "glo-initiate-response",
+    int(Command.GLO_GET_REQUEST): "glo-get-request",
+    int(Command.GLO_GET_RESPONSE): "glo-get-response",
+    int(Command.GLO_METHOD_REQUEST): "glo-action-request",
+    int(Command.GLO_METHOD_RESPONSE): "glo-action-response",
+}
+_COMMAND_VALUES = {int(item) for item in Command}
+
+
+def protected_apdu_metadata(frame: bytes, *, outgoing: bool) -> dict[str, Any]:
+    """Describe the outer protected APDU without decrypting or exposing challenges."""
+
+    marker = b"\xE6\xE6\x00" if outgoing else b"\xE6\xE7\x00"
+    offset = frame.find(marker)
+    if offset < 0:
+        return {"protected": False}
+    payload = frame[offset + len(marker):]
+    if not payload:
+        return {"protected": False}
+    indexes: list[tuple[int, int]] = []
+    if payload[0] in _PROTECTED_COMMANDS:
+        indexes.append((0, payload[0]))
+    elif payload[0] in (int(Command.AARQ), int(Command.AARE), int(Command.RELEASE_REQUEST), int(Command.RELEASE_RESPONSE)):
+        command = (
+            int(Command.GLO_INITIATE_REQUEST)
+            if payload[0] in (int(Command.AARQ), int(Command.RELEASE_REQUEST))
+            else int(Command.GLO_INITIATE_RESPONSE)
+        )
+        search_from = 1
+        while True:
+            found = payload.find(bytes((command,)), search_from)
+            if found < 0:
+                break
+            # Select the APDU command followed by its short length and Suite 0
+            # security-control byte, not a coincidental byte in a challenge.
+            security = payload.find(b"\x30", found + 1, found + 6)
+            if security >= 0:
+                indexes.append((found, command))
+                break
+            search_from = found + 1
+    if not indexes:
+        return {
+            "protected": False,
+            "outer_command": enum_name(Command(payload[0])) if payload[0] in _COMMAND_VALUES else f"0x{payload[0]:02X}",
+            "outer_command_code": payload[0],
+        }
+    command_offset, command = indexes[0]
+    result: dict[str, Any] = {
+        "protected": True,
+        "protected_command": _PROTECTED_COMMANDS[command],
+        "protected_command_code": command,
+    }
+    # Suite 0 AUTHENTICATION_ENCRYPTION uses security-control byte 0x30.
+    security_offset = payload.find(b"\x30", command_offset + 1, command_offset + 6)
+    if security_offset >= 0 and len(payload) >= security_offset + 5:
+        result["security_control"] = "0x30"
+        result["invocation_counter"] = int.from_bytes(
+            payload[security_offset + 1:security_offset + 5], "big"
+        )
+    return result
 
 
 class GuruxSession:
@@ -35,11 +103,16 @@ class GuruxSession:
         server_logical_address: int | None = None,
         server_physical_address: int | None = None,
         server_address_size: int = 0,
+        client_address: int | None = None,
+        profile_name: str | None = None,
     ):
         self.config = config
         self.baudrate = baudrate
         self.traffic = traffic
         profile = config.profile
+        self.profile_name = profile_name or profile.name
+        self.authentication_name = "none"
+        self.security_name = "none"
         self.server_logical_address = (
             profile.server_logical_address
             if server_logical_address is None
@@ -58,7 +131,7 @@ class GuruxSession:
         )
         self.client = GXDLMSSecureClient(
             True,
-            profile.client_address,
+            profile.client_address if client_address is None else client_address,
             server_address,
             Authentication.NONE,
             None,
@@ -117,7 +190,12 @@ class GuruxSession:
             translator.comments = True
             translator.omitXmlDeclaration = True
             translator.omitXmlNameSpace = True
-            return {"xml": translator.messageToXml(bytearray(frame))}
+            # Some Gurux translation paths print cipher status directly. Keep
+            # protocol translation out of terminal output and log only the
+            # returned XML after the traffic logger applies challenge redaction.
+            with contextlib.redirect_stdout(io.StringIO()):
+                xml = translator.messageToXml(bytearray(frame))
+            return {"xml": xml}
         except Exception as exc:  # logging must never break a scan
             return {"decode_error": f"{type(exc).__name__}: {exc}"}
 
@@ -133,6 +211,20 @@ class GuruxSession:
             "value": normalize_value(getattr(reply, "value", None)),
             "more_data": int(getattr(reply, "moreData", 0) or 0),
         }
+
+    def _before_transmit(
+        self, raw_tx: bytes, *, operation: str, purpose: str
+    ) -> dict[str, Any]:
+        return protected_apdu_metadata(raw_tx, outgoing=True)
+
+    def _after_receive(
+        self, raw_rx: list[bytes], *, operation: str, purpose: str
+    ) -> dict[str, Any]:
+        for frame in raw_rx:
+            metadata = protected_apdu_metadata(frame, outgoing=False)
+            if metadata.get("protected"):
+                return metadata
+        return protected_apdu_metadata(raw_rx[0], outgoing=False) if raw_rx else {"protected": False}
 
     def _exchange_packet(
         self,
@@ -159,10 +251,15 @@ class GuruxSession:
         self.media.eop = receive.eop
         frame_data = GXByteBuffer()
         notification = GXReplyData()
+        tx_protocol: dict[str, Any] = {}
+        rx_protocol: dict[str, Any] = {}
 
         try:
             with self.media.getSynchronous():
                 if raw_tx:
+                    tx_protocol = self._before_transmit(
+                        raw_tx, operation=operation, purpose=purpose
+                    )
                     self.media.send(bytearray(raw_tx))
                 while not self.client.getData(frame_data, reply, notification):
                     if notification.data.size:
@@ -173,6 +270,9 @@ class GuruxSession:
                     raw_rx.append(received)
                     frame_data.set(received)
                     receive.reply = None
+            rx_protocol = self._after_receive(
+                raw_rx, operation=operation, purpose=purpose
+            )
             if reply.error:
                 raise GXDLMSException(reply.error)
         except BaseException as exc:
@@ -188,8 +288,10 @@ class GuruxSession:
                 outcome = Outcome.PROTOCOL_ERROR
         finally:
             tx_decoded = dict(tx_context or {})
+            tx_decoded.update(tx_protocol)
             tx_decoded["protocol_frames"] = [self._frame_xml(raw_tx)] if raw_tx else []
             rx_decoded = self._reply_structure(reply)
+            rx_decoded.update(rx_protocol)
             rx_decoded["protocol_frames"] = [self._frame_xml(frame) for frame in raw_rx]
             if caught is not None:
                 rx_decoded["exception"] = {
@@ -198,7 +300,7 @@ class GuruxSession:
             context = self._endpoint_context()
             context.update(object_context or {})
             self.traffic.log(
-                profile="public",
+                profile=self.profile_name,
                 phase=phase,
                 purpose=purpose,
                 object_context=context,
@@ -269,7 +371,7 @@ class GuruxSession:
             self._exchange_packet(
                 snrm,
                 reply,
-                phase="serial_and_baud_discovery",
+                phase="endpoint_discovery",
                 purpose="hdlc_link_setup",
                 operation="SNRM",
                 attempt=1,
@@ -282,7 +384,7 @@ class GuruxSession:
         self._read_blocks(
             self.client.aarqRequest(),
             reply,
-            phase="serial_and_baud_discovery",
+            phase="endpoint_discovery",
             purpose="public_association",
             operation="AARQ",
             attempt=1,
@@ -305,9 +407,9 @@ class GuruxSession:
         ]
         source_title = self.client.settings.sourceSystemTitle
         return {
-            "profile": "public",
-            "authentication": "none",
-            "security": "none",
+            "profile": self.profile_name,
+            "authentication": self.authentication_name,
+            "security": self.security_name,
             "client_address": int(self.client.clientAddress),
             "server_address": int(self.client.serverAddress),
             "server_logical_address": self.server_logical_address,
@@ -331,7 +433,7 @@ class GuruxSession:
         self._read_blocks(
             self.client.getObjectsRequest(),
             reply,
-            phase="public_reconnaissance",
+            phase=f"{self.profile_name}_reconnaissance",
             purpose="association_view_scan",
             operation="GET",
             attempt=attempt,
@@ -397,6 +499,68 @@ class GuruxSession:
             result["class_decode_note"] = class_decode_error
         return result
 
+    def read_bootstrap_value(
+        self,
+        class_id: int,
+        logical_name: str,
+        attribute_id: int,
+        *,
+        purpose: str,
+    ) -> Any:
+        target = self.create_object(class_id, logical_name)
+        reply = GXReplyData()
+        self._read_blocks(
+            self.client.read(target, attribute_id),
+            reply,
+            phase="invocation_counter_bootstrap",
+            purpose=purpose,
+            operation="GET",
+            attempt=1,
+            object_context={
+                "class_id": class_id,
+                "logical_name": logical_name,
+                "attribute_id": attribute_id,
+                "association_role": "public_bootstrap",
+            },
+            tx_context={"service": "get-request", "bootstrap": True},
+        )
+        value = reply.value
+        try:
+            return self.client.updateValue(target, attribute_id, value)
+        except (AttributeError, NotImplementedError, ValueError):
+            return value
+
+    def read_meter_identity(self) -> str:
+        value = self.read_bootstrap_value(
+            1, "0.0.42.0.0.255", 2, purpose="meter_identity_read"
+        )
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raw = bytes(value)
+            try:
+                text = raw.decode("ascii")
+                if text.isprintable():
+                    return text
+            except UnicodeDecodeError:
+                pass
+            return raw.hex().upper()
+        return str(value)
+
+    def read_invocation_counter(self, profile: SecureProfile) -> int:
+        settings = profile.invocation_counter
+        value = self.read_bootstrap_value(
+            settings.class_id,
+            settings.logical_name,
+            settings.attribute_id,
+            purpose="invocation_counter_read",
+        )
+        try:
+            counter = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("meter invocation-counter value is not an unsigned integer") from exc
+        if not 0 <= counter <= 0xFFFFFFFF:
+            raise ValueError("meter invocation-counter value is outside the uint32 range")
+        return counter
+
     def close(self) -> list[str]:
         warnings: list[str] = []
         if not self._open:
@@ -444,3 +608,205 @@ class GuruxSession:
         if self.config.transport.session_guard_ms:
             time.sleep(self.config.transport.session_guard_ms / 1000)
         return warnings
+
+
+class GuruxSecureSession(GuruxSession):
+    """HLS-GMAC Security Suite 0 association with protected xDLMS services."""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        baudrate: int,
+        traffic: TrafficLogger,
+        counter_lease: InvocationCounterLease,
+        gak: bytes,
+        guek: bytes,
+        *,
+        server_logical_address: int,
+        server_physical_address: int,
+        server_address_size: int,
+    ):
+        profile = config.profile
+        if not isinstance(profile, SecureProfile):
+            raise TypeError("GuruxSecureSession requires hls_gmac_suite0 configuration")
+        super().__init__(
+            config,
+            baudrate,
+            traffic,
+            server_logical_address=server_logical_address,
+            server_physical_address=server_physical_address,
+            server_address_size=server_address_size,
+            client_address=profile.client_address,
+            profile_name=profile.name,
+        )
+        self.counter_lease = counter_lease
+        self.authentication_name = "high_gmac"
+        self.security_name = "authentication_encryption"
+        self.client.authentication = Authentication.HIGH_GMAC
+        self.client.ciphering.systemTitle = bytearray(profile.client_system_title)
+        self.client.ciphering.authenticationKey = bytearray(gak)
+        self.client.ciphering.blockCipherKey = bytearray(guek)
+        self.client.ciphering.security = Security.AUTHENTICATION_ENCRYPTION
+        self.client.ciphering.securitySuite = SecuritySuite.SUITE_0
+        self.client.ciphering.invocationCounter = counter_lease.next_counter
+        self.client.useProtectedRelease = True
+
+    def _endpoint_context(self) -> dict[str, Any]:
+        context = super()._endpoint_context()
+        server_title = self.client.settings.sourceSystemTitle
+        context.update(
+            {
+                "authentication_mechanism": "high_gmac",
+                "security_suite": 0,
+                "security_policy": "authentication_encryption",
+                "client_system_title": bytes(self.client.ciphering.systemTitle).hex().upper(),
+                "server_system_title": bytes(server_title).hex().upper() if server_title else None,
+            }
+        )
+        return context
+
+    @staticmethod
+    def _expected_protected_command(operation: str) -> str | None:
+        return {
+            "AARQ": "glo-initiate-request",
+            "HLS_ACTION": "glo-action-request",
+            "GET": "glo-get-request",
+        }.get(operation)
+
+    @staticmethod
+    def _expected_protected_response(operation: str) -> str | None:
+        return {
+            "AARQ": "glo-initiate-response",
+            "HLS_ACTION": "glo-action-response",
+            "GET": "glo-get-response",
+        }.get(operation)
+
+    def _before_transmit(
+        self, raw_tx: bytes, *, operation: str, purpose: str
+    ) -> dict[str, Any]:
+        metadata = protected_apdu_metadata(raw_tx, outgoing=True)
+        expected = self._expected_protected_command(operation)
+        has_xdlms_apdu = metadata.get("protected") or "outer_command_code" in metadata
+        if expected and has_xdlms_apdu and metadata.get("protected_command") != expected:
+            raise RuntimeError(
+                f"refusing plaintext or incorrectly protected {operation}; expected {expected}"
+            )
+        if metadata.get("protected"):
+            # Gurux increments while generating an APDU. Persist that next value
+            # under the exclusive lease before the first byte can reach media.
+            previous_next = int(self.counter_lease.next_counter)
+            generated_next = int(self.client.ciphering.invocationCounter)
+            metadata["generated_counter_range"] = {
+                "first_counter": previous_next,
+                "next_counter": generated_next,
+                "count": generated_next - previous_next,
+            }
+            self.counter_lease.persist_next(generated_next)
+            metadata.update(
+                {
+                    "authentication_mechanism": "high_gmac",
+                    "security_suite": 0,
+                    "security_policy": "authentication_encryption",
+                    "client_system_title": bytes(self.client.ciphering.systemTitle).hex().upper(),
+                }
+            )
+        return metadata
+
+    def _after_receive(
+        self, raw_rx: list[bytes], *, operation: str, purpose: str
+    ) -> dict[str, Any]:
+        metadata = super()._after_receive(raw_rx, operation=operation, purpose=purpose)
+        expected = self._expected_protected_response(operation)
+        has_xdlms_apdu = metadata.get("protected") or "outer_command_code" in metadata
+        if expected and has_xdlms_apdu and metadata.get("protected_command") != expected:
+            raise RuntimeError(
+                f"secure {operation} response was not the expected {expected}"
+            )
+        return metadata
+
+    def connect(self) -> dict[str, Any]:
+        self.media.open()
+        self._open = True
+        reply = GXReplyData()
+        snrm = self.client.snrmRequest()
+        if snrm:
+            self._exchange_packet(
+                snrm,
+                reply,
+                phase="secure_link_setup",
+                purpose="hdlc_link_setup",
+                operation="SNRM",
+                attempt=1,
+                tx_context={"message": "set-normal-response-mode"},
+            )
+            self.client.parseUAResponse(reply.data)
+            self._linked = True
+
+        reply.clear()
+        self._read_blocks(
+            self.client.aarqRequest(),
+            reply,
+            phase="secure_association",
+            purpose="ciphered_association",
+            operation="AARQ",
+            attempt=1,
+            tx_context={
+                "message": "ciphered-application-association-request",
+                "authentication": "high_gmac",
+                "security_suite": 0,
+                "security_policy": "authentication_encryption",
+                "referencing": "logical-name",
+            },
+        )
+        self.client.parseAareResponse(reply.data)
+        if not self.client.isAuthenticationRequired:
+            raise RuntimeError("HLS-GMAC AARE did not require the HLS authentication exchange")
+        server_title = self.client.settings.sourceSystemTitle
+        if not server_title or len(server_title) != 8:
+            raise RuntimeError("HLS-GMAC AARE did not provide a valid eight-byte server system title")
+
+        reply.clear()
+        self._read_blocks(
+            self.client.getApplicationAssociationRequest(),
+            reply,
+            phase="hls_authentication",
+            purpose="association_ln_authentication",
+            operation="HLS_ACTION",
+            attempt=1,
+            object_context={
+                "class_id": 15,
+                "logical_name": "0.0.40.0.0.255",
+                "method_id": 1,
+                "only_permitted_action": True,
+            },
+            tx_context={"service": "action-request", "challenge": "<redacted>"},
+        )
+        try:
+            # Gurux 1.0.201 prints both challenge values on validation failure.
+            # Suppress that upstream diagnostic and expose only a sanitized error.
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.client.parseApplicationAssociationResponse(reply.data)
+        except Exception as exc:
+            raise RuntimeError(
+                f"HLS-GMAC server response validation failed ({type(exc).__name__})"
+            ) from None
+        self._associated = True
+        return self.association_details()
+
+    def association_details(self) -> dict[str, Any]:
+        details = super().association_details()
+        server_title = self.client.settings.sourceSystemTitle
+        details.update(
+            {
+                "profile": self.profile_name,
+                "authentication": "high_gmac",
+                "security": "authentication_encryption",
+                "security_suite": 0,
+                "cipher": "aes_gcm_128",
+                "hls_validated": self._associated,
+                "client_system_title": bytes(self.client.ciphering.systemTitle).hex().upper(),
+                "server_system_title": bytes(server_title).hex().upper() if server_title else None,
+                "next_client_invocation_counter": int(self.client.ciphering.invocationCounter),
+            }
+        )
+        return details

@@ -1,0 +1,19 @@
+version: 1
+
+transport:
+  device: /dev/ttyUSB0
+  baudrate: auto
+
+profiles:
+  - name: hls_gmac_suite0
+    client_address: 1
+    client_system_title: "hex:0011223344556677"
+    secrets:
+      gak:
+        env: DLMS_GAK
+      guek:
+        env: DLMS_GUEK
+
+# Secure defaults provide logical-name referencing, public client SAP 16 for
+# counter bootstrap, server address discovery, Security Suite 0,
+# AUTHENTICATION_ENCRYPTION, and invocation-counter object 0.0.43.1.0.255/2.

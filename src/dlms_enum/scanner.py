@@ -1,4 +1,4 @@
-"""Public-profile association discovery and GET-only scan orchestration."""
+"""Public and HLS-GMAC association discovery and GET-only scan orchestration."""
 
 from __future__ import annotations
 
@@ -12,7 +12,8 @@ from typing import Any
 
 from . import __version__
 from .catalogues import COMMON_OBIS
-from .config import AppConfig
+from .config import AppConfig, SecureProfile, resolve_secure_keys
+from .counter_state import acquire_counter_lease, counter_identity
 from .result_model import Outcome, classify_exception, enum_name, error_record, utc_now
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -178,24 +179,28 @@ def _server_address_candidates(config: AppConfig) -> tuple[dict[str, Any], ...]:
     profile = config.profile
     logical = profile.server_logical_address
     physical = profile.server_physical_address
+    configured_size = profile.server_address_size
     candidates: list[tuple[int, int, int]] = []
 
-    # A one-byte address omits the upper/logical component. It is the common
-    # direct-HDLC representation of server address 1 used by this meter.
-    if 0 < physical < 0x80:
-        candidates.append((0, physical, 1))
-
-    if logical < 0x80 and physical < 0x80:
-        if logical:
-            candidates.append((logical, physical, 2))
-        elif physical:
-            # Also test the management logical-device form when the configured
-            # endpoint already uses one-byte addressing.
-            candidates.append((1, physical, 2))
+    if configured_size != "auto":
+        candidates.append((logical, physical, int(configured_size)))
     else:
-        # Preserve compatibility with explicitly configured four-byte HDLC
-        # addresses, although automatic discovery remains intentionally bounded.
-        candidates.append((logical, physical, 4))
+        # A one-byte address omits the upper/logical component. It is the common
+        # direct-HDLC representation of server address 1 used by this meter.
+        if 0 < physical < 0x80:
+            candidates.append((0, physical, 1))
+
+        if logical < 0x80 and physical < 0x80:
+            if logical:
+                candidates.append((logical, physical, 2))
+            elif physical:
+                # Also test the management logical-device form when the configured
+                # endpoint already uses one-byte addressing.
+                candidates.append((1, physical, 2))
+        else:
+            # Preserve compatibility with explicitly configured four-byte HDLC
+            # addresses, although automatic discovery remains intentionally bounded.
+            candidates.append((logical, physical, 4))
 
     unique: list[dict[str, Any]] = []
     seen: set[tuple[int, int, int]] = set()
@@ -224,7 +229,7 @@ def scan_public(
     *,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Run a complete public association scan and return the canonical report."""
+    """Run the configured public or secure read-only scan."""
 
     progress = progress or (lambda _: None)
     started_at = utc_now()
@@ -253,6 +258,7 @@ def scan_public(
         "errors": [],
     }
     session = None
+    counter_lease = None
     association: dict[str, Any] = {}
     objects: list[Any] = []
 
@@ -279,14 +285,19 @@ def scan_public(
                         ),
                     }
                 )
-                candidate = GuruxSession(
-                    config,
-                    baudrate,
-                    traffic,
-                    server_logical_address=endpoint["logical_address"],
-                    server_physical_address=endpoint["physical_address"],
-                    server_address_size=endpoint["address_size"],
-                )
+                candidate_arguments: dict[str, Any] = {
+                    "server_logical_address": endpoint["logical_address"],
+                    "server_physical_address": endpoint["physical_address"],
+                    "server_address_size": endpoint["address_size"],
+                }
+                if isinstance(config.profile, SecureProfile):
+                    candidate_arguments.update(
+                        {
+                            "client_address": config.profile.invocation_counter.public_client_address,
+                            "profile_name": config.profile.name,
+                        }
+                    )
+                candidate = GuruxSession(config, baudrate, traffic, **candidate_arguments)
                 try:
                     association = candidate.connect()
                 except Exception as exc:
@@ -366,6 +377,100 @@ def scan_public(
         if session is None:
             raise RuntimeError("no baud rate and server-address combination produced a valid public DLMS association")
 
+        profile_name = config.profile.name
+        if isinstance(config.profile, SecureProfile):
+            from .gurux_adapter import GuruxSecureSession
+
+            bootstrap_session = session
+            endpoint = {
+                "logical_address": report["transport"]["selected_server_logical_address"],
+                "physical_address": report["transport"]["selected_server_physical_address"],
+                "address_size": report["transport"]["server_address_size"],
+                "server_address": report["transport"]["selected_server_address"],
+            }
+            progress(
+                {
+                    "phase": "invocation_counter_bootstrap",
+                    "message": "Reading meter identity and invocation counter through the public association",
+                }
+            )
+            meter_identity = config.profile.invocation_counter.meter_identity
+            if meter_identity is None:
+                meter_identity = bootstrap_session.read_meter_identity()
+            meter_counter: int | None
+            try:
+                meter_counter = bootstrap_session.read_invocation_counter(config.profile)
+            except Exception as exc:
+                if config.profile.invocation_counter.unsafe_override is None:
+                    raise RuntimeError(
+                        "public invocation-counter bootstrap failed; configure the advanced "
+                        "invocation_counter.unsafe_override only if a safe next value is known"
+                    ) from exc
+                meter_counter = None
+                report["errors"].append(
+                    error_record(
+                        exc,
+                        phase="invocation_counter_bootstrap",
+                        context={"override_used": True},
+                    )
+                )
+                progress(
+                    {
+                        "phase": "invocation_counter_bootstrap_warning",
+                        "message": "Public counter read failed; using the explicitly configured unsafe override",
+                    }
+                )
+            for warning in bootstrap_session.close():
+                report["errors"].append(
+                    {
+                        "timestamp": utc_now(),
+                        "phase": "public_bootstrap_finalization",
+                        "category": "PROTOCOL_ERROR",
+                        "type": "CleanupWarning",
+                        "message": warning,
+                        "context": {},
+                    }
+                )
+            session = None
+
+            identity = counter_identity(
+                meter_identity=meter_identity,
+                client_system_title=config.profile.client_system_title,
+                client_address=config.profile.client_address,
+                server_address=int(endpoint["server_address"]),
+            )
+            counter_lease = acquire_counter_lease(
+                config.profile.invocation_counter.state_file,
+                identity,
+                meter_reported_counter=meter_counter,
+                unsafe_override=config.profile.invocation_counter.unsafe_override,
+            )
+            starting_counter = counter_lease.next_counter
+            gak, guek = resolve_secure_keys(config.profile)
+            secure_session = GuruxSecureSession(
+                config,
+                int(report["transport"]["selected_baudrate"]),
+                traffic,
+                counter_lease,
+                gak,
+                guek,
+                server_logical_address=int(endpoint["logical_address"]),
+                server_physical_address=int(endpoint["physical_address"]),
+                server_address_size=int(endpoint["address_size"]),
+            )
+            session = secure_session
+            association = secure_session.connect()
+            association["invocation_counter_bootstrap"] = {
+                "meter_reported_counter": meter_counter,
+                "first_secure_counter": starting_counter,
+                "strictly_greater_than_meter": (
+                    starting_counter > meter_counter if meter_counter is not None else None
+                ),
+                "unsafe_override_used": meter_counter is None,
+                "counter_identity_key": counter_lease.identity_key,
+                "meter_identity": meter_identity,
+            }
+
         progress({"phase": "association_view", "message": "Reading Association LN object list"})
         discovery_error: BaseException | None = None
         association_view_attempts = 0
@@ -380,7 +485,7 @@ def scan_public(
                 report["errors"].append(
                     error_record(
                         exc,
-                        phase="public_reconnaissance",
+                        phase=f"{profile_name}_reconnaissance",
                         context={"operation": "GET", "logical_name": "0.0.40.0.0.255", "attribute_id": 2, "attempt": attempt},
                     )
                 )
@@ -421,7 +526,7 @@ def scan_public(
         get_success = 0
         get_failed = 0
         profile_result: dict[str, Any] = {
-            "name": "public",
+            "name": profile_name,
             "association": association,
             "identification": {},
             "association_view_object_count": len(objects),
@@ -446,7 +551,7 @@ def scan_public(
             if object_result["class_name"] == "GXDLMSObject":
                 report["unknown_objects"].append(
                     {
-                        "profile": "public",
+                        "profile": profile_name,
                         "class_id": class_id,
                         "logical_name": logical_name,
                         "object_version": object_result["object_version"],
@@ -456,7 +561,7 @@ def scan_public(
             for attribute_id in _ordered_attribute_ids(target, item["attributes"]):
                 advertised_access = item["attributes"][attribute_id]
                 identity = {
-                    "profile": "public",
+                    "profile": profile_name,
                     "class_id": class_id,
                     "logical_name": logical_name,
                     "object_version": int(getattr(target, "version", 0)),
@@ -509,7 +614,7 @@ def scan_public(
                     progress(
                         {
                             "phase": "get_scan",
-                            "profile": "public",
+                            "profile": profile_name,
                             "class_id": class_id,
                             "logical_name": logical_name,
                             "attribute_id": attribute_id,
@@ -601,7 +706,9 @@ def scan_public(
                 "get_failed": get_failed,
             }
         )
-        report["run"]["status"] = "completed" if not get_failed else "completed_with_errors"
+        report["run"]["status"] = (
+            "completed" if not get_failed and not report["errors"] else "completed_with_errors"
+        )
     except KeyboardInterrupt:
         report["run"]["status"] = "interrupted"
         report["errors"].append(
@@ -618,6 +725,14 @@ def scan_public(
                 report["errors"].append(
                     {"timestamp": utc_now(), "phase": "finalization", "category": "PROTOCOL_ERROR", "type": "CleanupWarning", "message": warning, "context": {}}
                 )
+            if isinstance(config.profile, SecureProfile) and report.get("profiles"):
+                report["profiles"][0]["association"]["next_client_invocation_counter"] = int(
+                    session.client.ciphering.invocationCounter
+                )
+        if counter_lease is not None:
+            counter_lease.close()
+        if report["run"]["status"] == "completed" and report["errors"]:
+            report["run"]["status"] = "completed_with_errors"
         matrix: list[dict[str, Any]] = []
         for profile in report.get("profiles", []):
             for obj in profile.get("objects", []):
@@ -640,3 +755,6 @@ def scan_public(
         report["capability_matrix"] = matrix
         report["run"]["finished_at"] = utc_now()
     return report
+
+
+scan = scan_public

@@ -12,16 +12,16 @@ from rich.console import Console
 from .catalogues import COMMON_OBIS, catalogue_names
 from .config import ConfigError, load_config
 from .reporter import load_report, summary_lines, write_report
-from .scanner import scan_public
+from .scanner import scan
 from .traffic_logger import TrafficLogger
 from .tui import ScanUI, interactive_config
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="dlms-enum", description="Enumerate a smart meter through a public DLMS/COSEM serial-HDLC association")
+    parser = argparse.ArgumentParser(prog="dlms-enum", description="Read-only public or HLS-GMAC DLMS/COSEM serial-HDLC enumeration")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    scan = subparsers.add_parser("scan", help="run a public GET-only scan")
-    scan.add_argument("--config", type=Path, help="YAML configuration; omit for guided setup")
+    scan_parser = subparsers.add_parser("scan", help="run a public or secure GET-only scan")
+    scan_parser.add_argument("--config", type=Path, help="YAML configuration; omit for guided setup")
     validate = subparsers.add_parser("validate-config", help="validate a YAML configuration")
     validate.add_argument("config", type=Path)
     subparsers.add_parser("list-catalogues", help="list built-in catalogue data")
@@ -44,13 +44,15 @@ def _run_directory(base: str) -> Path:
 
 def _scan(args: argparse.Namespace, console: Console) -> int:
     config = load_config(args.config) if args.config else interactive_config(console)
+    for warning in config.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {warning}")
     run_directory = _run_directory(config.output.directory)
     traffic_path = run_directory / config.output.traffic_file
     report_path = run_directory / config.output.report_file
     ui = ScanUI(console)
     logger = TrafficLogger(traffic_path)
     try:
-        report = scan_public(config, logger, progress=ui.progress)
+        report = scan(config, logger, progress=ui.progress)
     finally:
         logger.close()
     write_report(report, report_path, traffic_path)
@@ -71,6 +73,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "validate-config":
             config = load_config(args.config)
             console.print(f"[green]Valid[/green]: {args.config}")
+            for warning in config.warnings:
+                console.print(f"[yellow]Warning:[/yellow] {warning}")
             console.print_json(json.dumps(config.redacted_dict()))
             return 0
         if args.command == "list-catalogues":

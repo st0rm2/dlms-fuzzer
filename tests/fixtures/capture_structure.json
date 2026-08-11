@@ -1,0 +1,32 @@
+{
+  "positive_secure_reference": {
+    "public_bootstrap": {
+      "snrm_line": 1,
+      "aarq_line": 3,
+      "meter_identity_get_line": 5,
+      "invocation_counter_get_line": 7,
+      "meter_counter": 2286331227,
+      "disconnect_line": 9
+    },
+    "secure": {
+      "snrm_line": 11,
+      "ciphered_aarq_line": 13,
+      "ciphered_aarq_command": "21",
+      "ciphered_aarq_counter": 2286331228,
+      "hls_action_line": 15,
+      "hls_action_command": "CB",
+      "hls_outer_counter": 2286331230,
+      "first_get_line": 17,
+      "get_request_command": "C8",
+      "get_response_command": "CC",
+      "first_get_counter": 2286331231,
+      "disconnect_line": 73
+    }
+  },
+  "negative_plaintext_reference": {
+    "first_plaintext_get_line": 7,
+    "plaintext_get_command": "C0",
+    "exception_response_command": "D8",
+    "exception_state_error": "D80101"
+  }
+}

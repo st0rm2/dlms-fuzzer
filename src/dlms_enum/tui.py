@@ -51,7 +51,7 @@ def _serial_candidates() -> list[str]:
 
 def interactive_config(console: Console | None = None) -> AppConfig:
     console = console or Console()
-    console.rule("DLMS public-profile scan setup")
+    console.rule("DLMS read-only scan setup")
     candidates = _serial_candidates()
     if candidates:
         console.print("Detected serial devices: " + ", ".join(candidates))
@@ -65,23 +65,55 @@ def interactive_config(console: Console | None = None) -> AppConfig:
     if strategy == "fixed":
         baudrate = IntPrompt.ask("Baud rate", default=9600, console=console)
     console.print("Scan mode: [bold]Mode 1 — GET only[/bold]")
-    client_address = IntPrompt.ask("Public client address", default=16, console=console)
-    logical_address = IntPrompt.ask("Server logical address", default=1, console=console)
+    profile_name = Prompt.ask(
+        "Profile", choices=("public", "hls_gmac_suite0"), default="public", console=console
+    )
+    secure = profile_name == "hls_gmac_suite0"
+    client_address = IntPrompt.ask(
+        "Authenticated client address" if secure else "Public client address",
+        default=1 if secure else 16,
+        console=console,
+    )
+    logical_address = IntPrompt.ask("Server logical address", default=0 if secure else 1, console=console)
     physical_address = IntPrompt.ask("Server physical address", default=1, console=console)
+    profile: dict[str, Any] = {
+        "name": profile_name,
+        "client_address": client_address,
+        "server": {"logical_address": logical_address, "physical_address": physical_address},
+    }
+    if secure:
+        profile.update(
+            {
+                "client_system_title": Prompt.ask(
+                    "Eight-byte client system title (hex: + 16 hex characters)", console=console
+                ),
+                "secrets": {
+                    "gak": {
+                        "inline": Prompt.ask(
+                            "GAK (32 hexadecimal characters)", password=True, console=console
+                        )
+                    },
+                    "guek": {
+                        "inline": Prompt.ask(
+                            "GUEK (32 hexadecimal characters)", password=True, console=console
+                        )
+                    },
+                },
+            }
+        )
+    else:
+        profile.update(
+            {
+                "authentication": {"mechanism": "none"},
+                "security": {"policy": "none"},
+            }
+        )
     config = parse_config(
         {
             "version": 1,
             "transport": {"type": "serial_hdlc", "device": device, "baudrate": baudrate},
             "scan": {"mode": "get", "total_get_attempts": 2, "association_view_first": True, "common_catalogue": True},
-            "profiles": [
-                {
-                    "name": "public",
-                    "client_address": client_address,
-                    "server": {"logical_address": logical_address, "physical_address": physical_address},
-                    "authentication": {"mechanism": "none"},
-                    "security": {"policy": "none"},
-                }
-            ],
+            "profiles": [profile],
             "output": {"directory": "./runs", "report_file": "report.json", "traffic_file": "traffic.jsonl", "redact_secrets": True},
         }
     )

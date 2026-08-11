@@ -10,9 +10,12 @@ from typing import Any, TextIO
 
 from .result_model import normalize_value, utc_now
 
-_SENSITIVE_KEY = re.compile(r"(?:password|secret|private|key|challenge|dedicated)", re.IGNORECASE)
+_SENSITIVE_KEY = re.compile(
+    r"(?:password|secret|private|key|challenge|dedicated|gak|guek|global.?authentication|global.?unicast)",
+    re.IGNORECASE,
+)
 _SENSITIVE_XML = re.compile(
-    r"(<(?:CallingAuthenticationValue|RespondingAuthenticationValue|StoCChallenge|CtoSChallenge)\b[^>]*)(?:Value=\"[^\"]*\")([^>]*/?>)",
+    r"(<(?:CallingAuthentication(?:Value)?|RespondingAuthentication(?:Value)?|StoCChallenge|CtoSChallenge)\b[^>]*)(?:Value=\"[^\"]*\")([^>]*/?>)",
     re.IGNORECASE,
 )
 
@@ -66,6 +69,7 @@ class TrafficLogger:
         elapsed_ms: float,
         result: str,
     ) -> None:
+        context_clean, context_redactions = redact(object_context or {})
         tx_clean, tx_redactions = redact(tx_decoded)
         rx_clean, rx_redactions = redact(rx_decoded)
         with self._lock:
@@ -76,7 +80,7 @@ class TrafficLogger:
                 "profile": profile,
                 "scan_phase": phase,
                 "purpose": purpose,
-                "object_context": object_context,
+                "object_context": context_clean,
                 "operation": operation,
                 "attempt_number": attempt,
                 "tx": {
@@ -89,7 +93,10 @@ class TrafficLogger:
                 },
                 "timing": {"elapsed_ms": round(elapsed_ms, 3)},
                 "result": result,
-                "redaction_indicators": sorted(set(tx_redactions + rx_redactions)),
+                "failure_category": None if result == "SUCCESS" else result,
+                "redaction_indicators": sorted(
+                    set(context_redactions + tx_redactions + rx_redactions)
+                ),
             }
             self._stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
             self._stream.flush()

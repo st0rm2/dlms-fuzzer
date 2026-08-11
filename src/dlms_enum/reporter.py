@@ -43,8 +43,9 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
     profiles = report.get("profiles", [])
     profile = profiles[0] if profiles else {}
     summary = profile.get("summary", {})
-    return [
+    lines = [
         f"Run: {run.get('id', 'unknown')} ({run.get('status', 'unknown')})",
+        f"Profile: {profile.get('name', 'not established')}",
         f"Baud rate: {report.get('transport', {}).get('selected_baudrate', 'not found')}",
         f"HDLC server address: {report.get('transport', {}).get('selected_server_address', 'not found')}",
         f"Server Addressing Type: {report.get('transport', {}).get('server_addressing_type', 'not found')}",
@@ -52,3 +53,8 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
         f"GET: {summary.get('get_success', 0)} success, {summary.get('get_failed', 0)} failed",
         f"Errors: {len(report.get('errors', []))}",
     ]
+    association = profile.get("association", {})
+    if profile.get("name") == "hls_gmac_suite0":
+        lines.insert(2, f"HLS-GMAC validated: {association.get('hls_validated', False)}")
+        lines.insert(3, f"Security: Suite 0 / {association.get('security', 'not established')}")
+    return lines

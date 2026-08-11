@@ -22,10 +22,14 @@ class ResultAndTrafficTests(unittest.TestCase):
         clean, indicators = redact(
             {
                 "authentication_key": "not-safe",
-                "xml": '<CallingAuthenticationValue Value="AABB" />',
+                "gak": "00112233445566778899AABBCCDDEEFF",
+                "guek": "FFEEDDCCBBAA99887766554433221100",
+                "xml": '<CallingAuthentication Value="AABB" />',
             }
         )
         self.assertEqual(clean["authentication_key"], "<redacted>")
+        self.assertEqual(clean["gak"], "<redacted>")
+        self.assertEqual(clean["guek"], "<redacted>")
         self.assertIn("<redacted>", clean["xml"])
         self.assertTrue(indicators)
 
