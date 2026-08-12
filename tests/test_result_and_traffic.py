@@ -128,8 +128,7 @@ class ResultAndTrafficTests(unittest.TestCase):
 
         self.assertIn("## Profile: hls_gmac_suite0", rendered)
         self.assertIn("First 1 objects (short test)", rendered)
-        self.assertIn("| 0.0.96.1.0.255 | 1 | 2 | Value | 12345 | 3132333435 | SUCCESS |", rendered)
-        self.assertNotIn("| 0.0.96.1.0.255 | 1 | 1 |", rendered)
+        self.assertIn("| 0.0.96.1.0.255 | 1 | 2 | Value | 12345 | 3132333435 | — | SUCCESS |", rendered)
 
     def test_write_report_links_compact_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -196,10 +195,10 @@ class ResultAndTrafficTests(unittest.TestCase):
 
         rendered = render_summary_report(report)
 
-        self.assertIn("### Advertised write and action capabilities", rendered)
-        self.assertIn("| 1.0.0.1.0.255 | 1 | 2 | Value | read_write | SET | No |", rendered)
-        self.assertIn("| 1.0.0.1.0.255 | 1 | 1 | Reset | access | ACTION | No |", rendered)
-        self.assertIn("No modifying SET or ACTION request was sent", rendered)
+        self.assertIn("### Operation capability matrix", rendered)
+        self.assertIn("| SET | 1.0.0.1.0.255 | 1 | 2 | Value | read_write | NOT_TESTED |", rendered)
+        self.assertIn("| ACTION | 1.0.0.1.0.255 | 1 | 1 | Reset | access | NOT_TESTED |", rendered)
+        self.assertIn("SET and ACTION are mapped passively", rendered)
 
     def test_written_summary_includes_ciphertext_without_full_hdlc_frame(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -211,6 +210,11 @@ class ResultAndTrafficTests(unittest.TestCase):
                         "sequence_number": 7,
                         "operation": "GET",
                         "result": "SUCCESS",
+                        "object_context": {
+                            "class_id": 1,
+                            "logical_name": "1.0.1.8.0.255",
+                            "attribute_id": 2,
+                        },
                         "tx": {
                             "encoded_frames": ["7EA02C0309540911DEADBEEF7E"],
                             "decoded": {
@@ -226,7 +230,20 @@ class ResultAndTrafficTests(unittest.TestCase):
                                 "authentication_tag_complete": True,
                             },
                         },
-                        "rx": {"decoded": {"protected": False}},
+                        "rx": {
+                            "decoded": {
+                                "protected": True,
+                                "protected_command": "glo-get-response",
+                                "security_control": "0x30",
+                                "invocation_counter": 99,
+                                "ciphertext_hex": "E5F6A7B8",
+                                "ciphertext_captured_length": 4,
+                                "ciphertext_declared_length": 4,
+                                "ciphertext_complete": True,
+                                "authentication_tag_hex": "AABBCCDDEEFF001122334455",
+                                "authentication_tag_complete": True,
+                            }
+                        },
                     }
                 )
                 + "\n",
@@ -238,7 +255,36 @@ class ResultAndTrafficTests(unittest.TestCase):
                 "schema_version": 1,
                 "run": {"id": "test", "status": "completed"},
                 "transport": {},
-                "profiles": [],
+                "profiles": [
+                    {
+                        "name": "hls_gmac_suite0",
+                        "association": {},
+                        "summary": {"objects": 1, "get_success": 1},
+                        "objects": [
+                            {
+                                "class_id": 1,
+                                "logical_name": "1.0.1.8.0.255",
+                                "attributes": [
+                                    {
+                                        "attribute_id": 2,
+                                        "name": "Value",
+                                        "access_rights": {"read": True},
+                                        "advertised_access": "read",
+                                        "outcome": "SUCCESS",
+                                        "decoded": {
+                                            "value": 10,
+                                            "raw_value": {
+                                                "encoding": "octet-string",
+                                                "hex": "0A",
+                                            },
+                                        },
+                                    }
+                                ],
+                                "methods": [],
+                            }
+                        ],
+                    }
+                ],
                 "errors": [],
             }
 
@@ -252,6 +298,10 @@ class ResultAndTrafficTests(unittest.TestCase):
         )
         self.assertIn("00112233445566778899AABB", rendered)
         self.assertIn("| SUCCESS |", rendered)
+        self.assertIn(
+            "| 1.0.1.8.0.255 | 1 | 2 | Value | 10 | 0A | E5F6A7B8 | SUCCESS |",
+            rendered,
+        )
         self.assertNotIn("7EA02C0309540911DEADBEEF7E", rendered)
 
 

@@ -285,16 +285,67 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(profile["association_view_object_count"], 12)
         self.assertEqual(profile["scan_scope"]["selected_objects"], 10)
         self.assertTrue(profile["scan_scope"]["short_test"])
-        self.assertEqual(len(profile["objects"]), 10)
+        self.assertEqual(len(profile["objects"]), 12)
         self.assertEqual(
-            [item["logical_name"] for item in profile["objects"]],
-            [f"1.0.{index}.8.0.255" for index in range(1, 11)],
+            sorted(item["logical_name"] for item in profile["objects"]),
+            sorted(f"1.0.{index}.8.0.255" for index in range(1, 13)),
         )
         self.assertFalse(
             any(name in {"1.0.11.8.0.255", "1.0.12.8.0.255"} for name, _ in LimitedSession.read_objects)
         )
         short_event = next(item for item in events if item["phase"] == "short_test_selected")
         self.assertEqual(short_event["association_view_objects"], 12)
+        untested = [
+            attribute
+            for obj in profile["objects"]
+            if obj["logical_name"] in {"1.0.11.8.0.255", "1.0.12.8.0.255"}
+            for attribute in obj["attributes"]
+        ]
+        self.assertEqual({item["outcome"] for item in untested}, {"NOT_TESTED"})
+        get_rows = [
+            item for item in report["capability_matrix"] if item["operation"] == "GET"
+        ]
+        self.assertEqual(len(get_rows), 24)
+        self.assertEqual(
+            sum(
+                row["profiles"]["public"]["status"] == "NOT_TESTED"
+                for row in get_rows
+            ),
+            4,
+        )
+
+    def test_get_limit_tests_exact_budget_and_maps_remaining_gets(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {"common_catalogue": False, "get_limit": 5},
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = LimitedSession
+        LimitedSession.read_objects = []
+
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        profile = report["profiles"][0]
+        self.assertEqual(len(LimitedSession.read_objects), 5)
+        self.assertEqual(profile["summary"]["get_attempted"], 5)
+        self.assertEqual(profile["summary"]["get_not_tested"], 19)
+        self.assertEqual(profile["scan_scope"]["mapped_gets"], 24)
+        self.assertEqual(profile["scan_scope"]["selected_gets"], 5)
+        get_rows = [
+            item for item in report["capability_matrix"] if item["operation"] == "GET"
+        ]
+        self.assertEqual(len(get_rows), 24)
+        self.assertEqual(
+            sum(row["profiles"]["public"]["tested"] for row in get_rows),
+            5,
+        )
 
 
 if __name__ == "__main__":

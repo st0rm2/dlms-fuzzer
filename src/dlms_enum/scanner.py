@@ -626,32 +626,76 @@ def scan_public(
                         # the pre-existing, read-only common-catalogue probe.
                         rights["catalogue_probe"] = True
 
+        association_order_items = list(inventory.items())
+        all_items = sorted(inventory.items(), key=lambda pair: pair[0])
+        all_get_capabilities = [
+            (key, attribute_id)
+            for key, item in all_items
+            for attribute_id in _ordered_attribute_ids(
+                item["target"], item["attributes"]
+            )
+            if item["attributes"][attribute_id].get("read")
+            or item["attributes"][attribute_id].get("catalogue_probe")
+        ]
+        association_view_get = ((15, "0.0.40.0.0.255"), 2)
+        if association_view_get in all_get_capabilities:
+            all_get_capabilities.remove(association_view_get)
+            all_get_capabilities.insert(0, association_view_get)
+
         if config.scan.object_limit is not None:
-            scan_items = list(inventory.items())[: config.scan.object_limit]
+            selected_inventory_items = association_order_items[: config.scan.object_limit]
+            selected_object_keys = {key for key, _ in selected_inventory_items}
+            selected_get_capabilities = {
+                (key, attribute_id)
+                for key, item in selected_inventory_items
+                for attribute_id in _ordered_attribute_ids(
+                    item["target"], item["attributes"]
+                )
+                if item["attributes"][attribute_id].get("read")
+                or item["attributes"][attribute_id].get("catalogue_probe")
+            }
+            if association_view_get in all_get_capabilities:
+                selected_get_capabilities.add(association_view_get)
             progress(
                 {
                     "phase": "short_test_selected",
                     "profile": profile_name,
                     "object_limit": config.scan.object_limit,
                     "association_view_objects": len(objects),
-                    "selected_objects": len(scan_items),
+                    "selected_objects": len(selected_object_keys),
+                    "selected_gets": len(selected_get_capabilities),
                     "message": (
-                        f"Short test: scanning the first {len(scan_items)} of "
-                        f"{len(objects)} Association View objects"
+                        f"Short test: testing GET capabilities from the first "
+                        f"{len(selected_object_keys)} of {len(objects)} Association View objects"
+                    ),
+                }
+            )
+        elif config.scan.get_limit is not None:
+            selected_get_capabilities = set(
+                all_get_capabilities[: config.scan.get_limit]
+            )
+            selected_object_keys = {
+                key for key, _ in selected_get_capabilities
+            }
+            progress(
+                {
+                    "phase": "short_test_selected",
+                    "profile": profile_name,
+                    "get_limit": config.scan.get_limit,
+                    "association_view_objects": len(objects),
+                    "selected_objects": len(selected_object_keys),
+                    "selected_gets": len(selected_get_capabilities),
+                    "message": (
+                        f"Short test: testing {len(selected_get_capabilities)} of "
+                        f"{len(all_get_capabilities)} mapped GET capabilities"
                     ),
                 }
             )
         else:
-            scan_items = sorted(inventory.items(), key=lambda pair: pair[0])
+            selected_get_capabilities = set(all_get_capabilities)
+            selected_object_keys = {key for key, _ in all_items}
 
-        planned_attributes = sum(
-            sum(
-                bool(rights.get("read"))
-                or bool(rights.get("catalogue_probe"))
-                for rights in item["attributes"].values()
-            )
-            for _, item in scan_items
-        )
+        planned_attributes = len(selected_get_capabilities)
         progress(
             {
                 "phase": "get_plan",
@@ -671,28 +715,39 @@ def scan_public(
             "association_view_object_count": len(objects),
             "association_view_attempt_count": association_view_attempts,
             "scan_scope": {
-                "short_test": config.scan.object_limit is not None,
+                "short_test": (
+                    config.scan.object_limit is not None
+                    or config.scan.get_limit is not None
+                ),
                 "object_limit": config.scan.object_limit,
+                "get_limit": config.scan.get_limit,
                 "association_view_objects": len(objects),
                 "inventory_objects": len(inventory),
-                "selected_objects": len(scan_items),
+                "mapped_objects": len(all_items),
+                "selected_objects": len(selected_object_keys),
+                "mapped_gets": len(all_get_capabilities),
+                "selected_gets": len(selected_get_capabilities),
             },
             "objects": object_records,
             "summary": {
                 "objects": 0,
                 "association_view_objects": len(objects),
                 "inventory_objects": len(inventory),
-                "selected_objects": len(scan_items),
+                "selected_objects": len(selected_object_keys),
                 "object_limit": config.scan.object_limit,
+                "get_limit": config.scan.get_limit,
+                "mapped_gets": len(all_get_capabilities),
+                "selected_gets": len(selected_get_capabilities),
                 "get_attempted": 0,
                 "get_transmissions": 0,
                 "get_success": 0,
                 "get_failed": 0,
+                "get_not_tested": len(all_get_capabilities),
             },
         }
         report["profiles"].append(profile_result)
         get_transmissions = 0
-        for (class_id, logical_name), item in scan_items:
+        for (class_id, logical_name), item in all_items:
             target = item["target"]
             object_result = _object_record(target, item["sources"], version)
             object_records.append(object_result)
@@ -743,6 +798,15 @@ def scan_public(
                     or access_rights.get("catalogue_probe")
                 ):
                     attribute_result["lifecycle"] = "not_readable"
+                    continue
+
+                if ((class_id, logical_name), attribute_id) not in selected_get_capabilities:
+                    attribute_result.update(
+                        {
+                            "lifecycle": "not_tested",
+                            "outcome": Outcome.NOT_TESTED.value,
+                        }
+                    )
                     continue
 
                 # Attribute 2 of Association LN has already been read to build
@@ -891,6 +955,11 @@ def scan_public(
                 "get_transmissions": get_transmissions,
                 "get_success": get_success,
                 "get_failed": get_failed,
+                "get_not_tested": sum(
+                    attribute.get("outcome") == Outcome.NOT_TESTED.value
+                    for obj in object_records
+                    for attribute in obj.get("attributes", [])
+                ),
                 "advertised_set_attributes": sum(
                     bool(attribute.get("access_rights", {}).get("write"))
                     for obj in object_records
@@ -936,21 +1005,30 @@ def scan_public(
                 for attribute in obj.get("attributes", []):
                     rights = attribute.get("access_rights", {})
                     if rights.get("read", True) or rights.get("catalogue_probe"):
+                        outcome = attribute.get("outcome") or Outcome.NOT_TESTED.value
+                        tested = attribute.get("attempt_count", 0) > 0
                         matrix.append({
                             "operation": "GET",
                             "class_id": obj["class_id"],
                             "logical_name": obj["logical_name"],
                             "object_version": obj["object_version"],
                             "attribute_id": attribute["attribute_id"],
+                            "member_name": attribute.get("name"),
+                            "advertised_access": attribute.get("advertised_access"),
                             "profiles": {
                                 profile["name"]: {
-                                    "outcome": attribute.get("outcome"),
-                                    "success": attribute.get("outcome") == Outcome.SUCCESS.value,
+                                    "status": outcome,
+                                    "outcome": outcome,
+                                    "success": (
+                                        outcome == Outcome.SUCCESS.value
+                                        if tested
+                                        else None
+                                    ),
                                     "advertised": bool(
                                         rights.get("advertised", True)
                                         and rights.get("read", True)
                                     ),
-                                    "tested": attribute.get("attempt_count", 0) > 0,
+                                    "tested": tested,
                                 }
                             },
                         })
@@ -961,11 +1039,14 @@ def scan_public(
                             "logical_name": obj["logical_name"],
                             "object_version": obj["object_version"],
                             "attribute_id": attribute["attribute_id"],
+                            "member_name": attribute.get("name"),
+                            "advertised_access": attribute.get("advertised_access"),
                             "profiles": {
                                 profile["name"]: {
+                                    "status": Outcome.NOT_TESTED.value,
                                     "advertised": True,
                                     "tested": False,
-                                    "outcome": None,
+                                    "outcome": Outcome.NOT_TESTED.value,
                                     "success": None,
                                 }
                             },
@@ -978,11 +1059,14 @@ def scan_public(
                             "logical_name": obj["logical_name"],
                             "object_version": obj["object_version"],
                             "method_id": method["method_id"],
+                            "member_name": method.get("name"),
+                            "advertised_access": method.get("advertised_access"),
                             "profiles": {
                                 profile["name"]: {
+                                    "status": Outcome.NOT_TESTED.value,
                                     "advertised": True,
                                     "tested": False,
-                                    "outcome": None,
+                                    "outcome": Outcome.NOT_TESTED.value,
                                     "success": None,
                                 }
                             },

@@ -12,6 +12,7 @@ from typing import Any
 
 class Outcome(str, enum.Enum):
     SUCCESS = "SUCCESS"
+    NOT_TESTED = "NOT_TESTED"
     DLMS_ERROR = "DLMS_ERROR"
     TIMEOUT = "TIMEOUT"
     PROTOCOL_ERROR = "PROTOCOL_ERROR"

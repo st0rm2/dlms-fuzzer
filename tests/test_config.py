@@ -81,6 +81,34 @@ class ConfigTests(unittest.TestCase):
                     }
                 )
 
+    def test_exact_get_limit_is_validated_and_excludes_object_limit(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "scan": {"get_limit": 100},
+            }
+        )
+        self.assertEqual(config.scan.get_limit, 100)
+
+        for invalid in (0, True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ConfigError, "scan.get_limit"
+            ):
+                parse_config(
+                    {
+                        "transport": {"device": "/dev/null"},
+                        "scan": {"get_limit": invalid},
+                    }
+                )
+
+        with self.assertRaisesRegex(ConfigError, "mutually exclusive"):
+            parse_config(
+                {
+                    "transport": {"device": "/dev/null"},
+                    "scan": {"object_limit": 10, "get_limit": 100},
+                }
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

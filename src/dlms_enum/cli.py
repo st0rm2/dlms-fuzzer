@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from .catalogues import COMMON_OBIS, catalogue_names
-from .config import ConfigError, load_config, with_object_limit
+from .config import ConfigError, load_config, with_get_limit, with_object_limit
 from .reporter import load_report, summary_lines, write_report
 from .scanner import scan
 from .traffic_logger import TrafficLogger
@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--full",
         action="store_true",
         help="scan all discovered objects without asking about a short test",
+    )
+    scope.add_argument(
+        "--get-limit",
+        type=int,
+        metavar="N",
+        help="test at most N mapped GET operations; report all remaining operations as NOT_TESTED",
     )
     validate = subparsers.add_parser("validate-config", help="validate a YAML configuration")
     validate.add_argument("config", type=Path)
@@ -61,7 +67,15 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         config = with_object_limit(config, 10)
     elif args.full:
         config = with_object_limit(config, None)
-    elif args.config and config.scan.object_limit is None and console.is_terminal and sys.stdin.isatty():
+    elif args.get_limit is not None:
+        config = with_get_limit(config, args.get_limit)
+    elif (
+        args.config
+        and config.scan.object_limit is None
+        and config.scan.get_limit is None
+        and console.is_terminal
+        and sys.stdin.isatty()
+    ):
         short_test = Confirm.ask(
             "Run a short test (scan only the first 10 objects after reading the full Association View)",
             default=False,

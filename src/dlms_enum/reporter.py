@@ -8,6 +8,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .result_model import Outcome
+
 
 def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
@@ -75,6 +77,7 @@ def _protected_traffic_entries(path: str | Path) -> list[dict[str, Any]]:
                         "direction": direction.upper(),
                         "operation": record.get("operation", "—"),
                         "result": record.get("result", "—"),
+                        "object_context": record.get("object_context", {}),
                         "protected_command": decoded.get("protected_command", "—"),
                         "security_control": decoded.get("security_control", "—"),
                         "invocation_counter": decoded.get("invocation_counter", "—"),
@@ -97,6 +100,51 @@ def _protected_traffic_entries(path: str | Path) -> list[dict[str, Any]]:
     return entries
 
 
+def _encrypted_rx_by_attribute(
+    protected_traffic: list[dict[str, Any]] | None,
+) -> dict[tuple[int, str, int], list[str]]:
+    evidence: dict[tuple[int, str, int], list[str]] = {}
+    for entry in protected_traffic or []:
+        if entry.get("direction") != "RX" or entry.get("operation") != "GET":
+            continue
+        context = entry.get("object_context", {})
+        try:
+            key = (
+                int(context["class_id"]),
+                str(context["logical_name"]),
+                int(context["attribute_id"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        ciphertext = str(entry.get("ciphertext_hex") or "")
+        if not ciphertext:
+            continue
+        if not entry.get("ciphertext_complete"):
+            ciphertext += " (fragment)"
+        values = evidence.setdefault(key, [])
+        if ciphertext not in values:
+            values.append(ciphertext)
+    return evidence
+
+
+def _scan_scope_label(scan_scope: dict[str, Any]) -> str:
+    if not scan_scope.get("short_test"):
+        return "Full inventory"
+    if scan_scope.get("get_limit") is not None:
+        return "First {} of {} mapped GET operations".format(
+            scan_scope.get("selected_gets", 0),
+            scan_scope.get("mapped_gets", 0),
+        )
+    if "mapped_gets" not in scan_scope:
+        return "First {} objects (short test)".format(
+            scan_scope.get("selected_objects", 0)
+        )
+    return "GETs from first {} objects; {} total GETs mapped".format(
+        scan_scope.get("selected_objects", 0),
+        scan_scope.get("mapped_gets", 0),
+    )
+
+
 def render_summary_report(
     report: dict[str, Any],
     protected_traffic: list[dict[str, Any]] | None = None,
@@ -106,6 +154,7 @@ def render_summary_report(
     run = report.get("run", {})
     transport = report.get("transport", {})
     profiles = report.get("profiles", [])
+    encrypted_rx = _encrypted_rx_by_attribute(protected_traffic)
     lines = [
         "# DLMS scan report",
         "",
@@ -142,9 +191,10 @@ def render_summary_report(
                 f"| Client system title | {_markdown(association.get('client_system_title', '—'))} |",
                 f"| Server system title | {_markdown(association.get('server_system_title', '—'))} |",
                 f"| Objects | {_markdown(summary.get('objects', 0))} |",
-                f"| Scan scope | {_markdown('First ' + str(scan_scope.get('selected_objects', 0)) + ' objects (short test)' if scan_scope.get('short_test') else 'Full inventory')} |",
+                f"| Scan scope | {_markdown(_scan_scope_label(scan_scope))} |",
                 f"| Association View objects | {_markdown(scan_scope.get('association_view_objects', profile.get('association_view_object_count', '—')))} |",
                 f"| GET results | {_markdown(summary.get('get_success', 0))} successful / {_markdown(summary.get('get_failed', 0))} failed |",
+                f"| GET not tested | {_markdown(summary.get('get_not_tested', 0))} |",
                 f"| Advertised SET attributes | {_markdown(summary.get('advertised_set_attributes', 0))} (not tested) |",
                 f"| Advertised ACTION methods | {_markdown(summary.get('advertised_action_methods', 0))} (not tested) |",
             ]
@@ -171,10 +221,10 @@ def render_summary_report(
             [
                 "### Decoded OBIS values",
                 "",
-                "One compact row is shown for every scanned OBIS attribute except the redundant logical-name attribute when other attributes exist. Raw hexadecimal is shown when available; integers use numeric hexadecimal. Complex values are shortened here, while the complete value remains in `report.json`.",
+                "One compact row is shown for every mapped GET attribute except the redundant logical-name attribute when other attributes exist. Untested rows remain mapped as `NOT_TESTED`. The encrypted-response column contains ciphertext only, excluding HDLC framing, security control, invocation counter, authentication tag, and CRC.",
                 "",
-                "| OBIS | Class | Attribute | Name | Decoded value | Hex / numeric hex | Result |",
-                "|---|---:|---:|---|---|---|---|",
+                "| OBIS | Class | Attribute | Name | Decoded value | Encoded value (hex) | Encrypted response (hex) | Result |",
+                "|---|---:|---:|---|---|---|---|---|",
             ]
         )
         for obj in profile.get("objects", []):
@@ -193,75 +243,67 @@ def render_summary_report(
                 value = decoded.get("value") if isinstance(decoded, dict) else None
                 raw = decoded.get("raw_value") if isinstance(decoded, dict) else None
                 result = attribute.get("outcome") or attribute.get("lifecycle") or "not scanned"
+                encrypted = encrypted_rx.get(
+                    (
+                        int(obj.get("class_id", 0)),
+                        str(obj.get("logical_name", "")),
+                        int(attribute.get("attribute_id", 0)),
+                    ),
+                    [],
+                )
                 lines.append(
-                    "| {} | {} | {} | {} | {} | {} | {} |".format(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
                         _markdown(obj.get("logical_name", "—")),
                         _markdown(obj.get("class_id", "—")),
                         _markdown(attribute.get("attribute_id", "—")),
                         _markdown(attribute.get("name") or "—"),
                         _markdown(_compact_value(value)),
                         _markdown(_hex_value(raw)),
+                        _markdown("<br>".join(encrypted) if encrypted else "—"),
                         _markdown(result),
                     )
                 )
         lines.append("")
 
-        writable_attributes = [
-            (obj, attribute)
-            for obj in profile.get("objects", [])
-            for attribute in obj.get("attributes", [])
-            if attribute.get("access_rights", {}).get("write", False)
-        ]
-        actionable_methods = [
-            (obj, method)
-            for obj in profile.get("objects", [])
-            for method in obj.get("methods", [])
-            if method.get("access_rights", {}).get("action", False)
-        ]
         lines.extend(
             [
-                "### Advertised write and action capabilities",
+                "### Operation capability matrix",
                 "",
-                "These are passive access rights reported by this role's Association View. No modifying SET or ACTION request was sent, so the entries are advertised capabilities, not confirmed writes. This scan uses logical-name referencing, where attribute writes use SET; WRITE is the equivalent service for short-name referencing.",
+                "Every mapped operation is listed. GET contains its actual result when tested; operations outside a short-test budget are `NOT_TESTED`. SET and ACTION are mapped passively from this role's Association View and are never sent, so they remain `NOT_TESTED`. This scan uses logical-name referencing, where writes use SET; WRITE is the short-name equivalent.",
                 "",
-                "#### Writable attributes",
-                "",
+                "| Operation | OBIS | Class | Member | Name | Access mode | Status |",
+                "|---|---|---:|---:|---|---|---|",
             ]
         )
-        if not writable_attributes:
-            lines.extend(["None advertised for this role.", ""])
-        else:
-            lines.extend(
-                [
-                    "| OBIS | Class | Attribute | Name | Access mode | Service | Tested |",
-                    "|---|---:|---:|---|---|---|---|",
-                ]
-            )
-            for obj, attribute in writable_attributes:
-                lines.append(
-                    "| {} | {} | {} | {} | {} | SET | No |".format(
-                        _markdown(obj.get("logical_name", "—")),
-                        _markdown(obj.get("class_id", "—")),
-                        _markdown(attribute.get("attribute_id", "—")),
-                        _markdown(attribute.get("name") or "—"),
-                        _markdown(attribute.get("advertised_access", "—")),
+        for obj in profile.get("objects", []):
+            for attribute in obj.get("attributes", []):
+                rights = attribute.get("access_rights", {})
+                if rights.get("read", True) or rights.get("catalogue_probe", False):
+                    lines.append(
+                        "| GET | {} | {} | {} | {} | {} | {} |".format(
+                            _markdown(obj.get("logical_name", "—")),
+                            _markdown(obj.get("class_id", "—")),
+                            _markdown(attribute.get("attribute_id", "—")),
+                            _markdown(attribute.get("name") or "—"),
+                            _markdown(attribute.get("advertised_access", "—")),
+                            _markdown(attribute.get("outcome") or Outcome.NOT_TESTED.value),
+                        )
                     )
-                )
-            lines.append("")
-
-        lines.extend(["#### Callable methods", ""])
-        if not actionable_methods:
-            lines.extend(["None advertised for this role.", ""])
-        else:
-            lines.extend(
-                [
-                    "| OBIS | Class | Method | Name | Access mode | Service | Tested |",
-                    "|---|---:|---:|---|---|---|---|",
-                ]
-            )
-            for obj, method in actionable_methods:
+                if rights.get("write", False):
+                    lines.append(
+                        "| SET | {} | {} | {} | {} | {} | NOT_TESTED |".format(
+                            _markdown(obj.get("logical_name", "—")),
+                            _markdown(obj.get("class_id", "—")),
+                            _markdown(attribute.get("attribute_id", "—")),
+                            _markdown(attribute.get("name") or "—"),
+                            _markdown(attribute.get("advertised_access", "—")),
+                        )
+                    )
+            for method in obj.get("methods", []):
+                if not method.get("access_rights", {}).get("action", False):
+                    continue
                 lines.append(
-                    "| {} | {} | {} | {} | {} | ACTION | No |".format(
+                    "| ACTION | {} | {} | {} | {} | {} | NOT_TESTED |".format(
                         _markdown(obj.get("logical_name", "—")),
                         _markdown(obj.get("class_id", "—")),
                         _markdown(method.get("method_id", "—")),
@@ -269,7 +311,7 @@ def render_summary_report(
                         _markdown(method.get("advertised_access", "—")),
                     )
                 )
-            lines.append("")
+        lines.append("")
 
     if protected_traffic:
         lines.extend(
@@ -404,6 +446,7 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
         f"Server Addressing Type: {report.get('transport', {}).get('server_addressing_type', 'not found')}",
         f"Objects: {summary.get('objects', 0)}",
         f"GET: {summary.get('get_success', 0)} success, {summary.get('get_failed', 0)} failed",
+        f"GET not tested: {summary.get('get_not_tested', 0)}",
         f"Advertised SET attributes: {summary.get('advertised_set_attributes', 0)} (not tested)",
         f"Advertised ACTION methods: {summary.get('advertised_action_methods', 0)} (not tested)",
         f"Errors: {len(report.get('errors', []))}",
@@ -416,9 +459,6 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
     if scan_scope.get("short_test"):
         lines.insert(
             2,
-            "Scope: short test — first {} of {} Association View objects".format(
-                scan_scope.get("selected_objects", 0),
-                scan_scope.get("association_view_objects", 0),
-            ),
+            f"Scope: short test — {_scan_scope_label(scan_scope)}",
         )
     return lines

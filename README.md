@@ -27,9 +27,10 @@ At startup, interactive terminal runs ask whether this should be a short test. A
 ```shell
 python -m dlms_enum scan --config meter-public.yaml --short
 python -m dlms_enum scan --config meter-public.yaml --full
+python -m dlms_enum scan --config meter-public.yaml --get-limit 100
 ```
 
-For unattended configuration-driven runs, set `scan.object_limit: 10`. If no limit or command-line switch is supplied and standard input is not an interactive terminal, the default remains a full scan.
+`--get-limit 100` tests exactly the first 100 mapped GET capabilities while retaining every other GET, SET, and ACTION capability in the report as `NOT_TESTED`. For unattended configuration-driven runs, use `scan.get_limit: 100`; the older object-based short scope remains available as `scan.object_limit: 10`. The two limits are mutually exclusive. If neither limit nor a command-line switch is supplied and standard input is not an interactive terminal, the default remains a full scan.
 
 Secure scan:
 
@@ -174,8 +175,8 @@ Serial framing, response timeout, inter-request delay, and session guard remain 
 
 Each run gets a UTC-named directory under `./runs` unless overridden:
 
-- `report.json` contains the selected endpoint, addressing type, redacted effective configuration, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, passively advertised SET/ACTION rights, cleanup warnings, and a traffic-file hash.
-- `summary.md` is the compact human-readable report. It contains connection and role details followed by tables of readable OBIS values and the role's advertised writable attributes and callable methods. No modifying request is sent. For secure scans it also records the protected command, invocation counter, original ciphertext, and separate AES-GCM authentication tag without repeating the full HDLC frame. Large structured values are shortened only in the decoded-value view.
+- `report.json` contains the selected endpoint, addressing type, redacted effective configuration, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, a complete per-role GET/SET/ACTION capability matrix, cleanup warnings, and a traffic-file hash. Each matrix row is `SUCCESS`, a normalized failure category, or `NOT_TESTED`.
+- `summary.md` is the human-readable report. It contains connection and role details, a decoded OBIS table, and the complete operation capability matrix. In secure scans the decoded table places the encrypted RX payload immediately to the right of the encoded value; only ciphertext is shown, without HDLC framing, security control, invocation counter, authentication tag, or CRC. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent. The separate protected-APDU table retains command, counter, ciphertext, and authentication-tag evidence.
 - `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators.
 
 GET uses at most two attempts. Explicit DLMS errors such as access denied are not retried. Timeouts, transport failures, and malformed responses can receive one retry; each protected retry gets a new persisted invocation counter.
