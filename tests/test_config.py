@@ -14,6 +14,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.transport.baudrate, 9600)
         self.assertEqual(config.profile.server_logical_address, 0)
         self.assertEqual(config.profile.server_physical_address, 1)
+        self.assertEqual(config.output.summary_file, "summary.md")
         snapshot = config.redacted_dict()
         self.assertEqual(snapshot["profiles"][0]["authentication"], {"mechanism": "none"})
         self.assertNotIn("profile", snapshot)

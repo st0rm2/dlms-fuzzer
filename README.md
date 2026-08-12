@@ -166,9 +166,16 @@ Serial framing, response timeout, inter-request delay, and session guard remain 
 Each run gets a UTC-named directory under `./runs` unless overridden:
 
 - `report.json` contains the selected endpoint, addressing type, redacted effective configuration, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, cleanup warnings, and a traffic-file hash.
+- `summary.md` is the compact human-readable report. It contains connection and role details followed by a table of each scanned OBIS attribute, its decoded value, hexadecimal/raw numeric representation, and result. Large structured values are shortened only in this Markdown view.
 - `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, Gurux-decoded response values, result category, timing, and redaction indicators.
 
 GET uses at most two attempts. Explicit DLMS errors such as access denied are not retried. Timeouts, transport failures, and malformed responses can receive one retry; each protected retry gets a new persisted invocation counter.
+
+### Terminal progress and secure-status messages
+
+During a scan, the terminal uses one Rich progress display rather than printing every request on a new line. Once the Association View is known, it shows the completed/total readable attributes and replaces the current action in place, for example `GET 1.0.1.8.0.255 class 3 attribute 2 attempt 1`.
+
+Gurux internally labels Suite 0 security-control bit `0x20` as “Encryption is applied” and bit `0x10` as “Authentication is applied.” Together they form the configured `0x30` authentication-and-encryption policy. Those repeated low-level diagnostics are suppressed. They did not indicate two additional operations: encryption protects confidentiality, while authentication is the AES-GCM integrity/authenticity tag. A successfully decoded protected response means Gurux verified that tag; tag failure is reported as a scan error.
 
 ## Troubleshooting
 

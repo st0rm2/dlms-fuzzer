@@ -49,14 +49,21 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
     run_directory = _run_directory(config.output.directory)
     traffic_path = run_directory / config.output.traffic_file
     report_path = run_directory / config.output.report_file
+    summary_path = run_directory / config.output.summary_file
     ui = ScanUI(console)
     logger = TrafficLogger(traffic_path)
     try:
         report = scan(config, logger, progress=ui.progress)
     finally:
+        ui.close()
         logger.close()
-    write_report(report, report_path, traffic_path)
-    ui.summary(summary_lines(report), report_path.resolve(), traffic_path.resolve())
+    write_report(report, report_path, traffic_path, summary_path)
+    ui.summary(
+        summary_lines(report),
+        report_path.resolve(),
+        traffic_path.resolve(),
+        summary_path.resolve(),
+    )
     status = report.get("run", {}).get("status")
     if status == "interrupted":
         return 130

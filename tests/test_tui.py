@@ -42,6 +42,27 @@ class ScanUITests(unittest.TestCase):
         self.assertIn("HDLC server address: 1", lines)
         self.assertIn("Server Addressing Type: 1-byte addressing", lines)
 
+    def test_get_events_render_one_rich_progress_task_with_current_action(self):
+        output = io.StringIO()
+        ui = ScanUI(Console(file=output, color_system=None, width=180))
+
+        ui.progress({"phase": "get_plan", "total": 2, "message": "Scanning 2 readable attributes"})
+        ui.progress(
+            {
+                "phase": "get_scan",
+                "logical_name": "1.0.1.8.0.255",
+                "class_id": 3,
+                "attribute_id": 2,
+                "attempt": 1,
+            }
+        )
+        ui.progress({"phase": "get_complete"})
+        ui.close()
+
+        rendered = output.getvalue()
+        self.assertIn("GET 1.0.1.8.0.255  class 3  attribute 2  attempt 1", rendered)
+        self.assertIn("1/2", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

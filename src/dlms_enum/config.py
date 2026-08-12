@@ -107,6 +107,7 @@ ProfileConfig = PublicProfile | SecureProfile
 class OutputConfig:
     directory: str = "./runs"
     report_file: str = "report.json"
+    summary_file: str = "summary.md"
     traffic_file: str = "traffic.jsonl"
     redact_secrets: bool = True
 
@@ -460,10 +461,17 @@ def _parse_profile(raw: Any, base_directory: Path | None) -> tuple[ProfileConfig
 
 def _parse_output(raw: Any) -> OutputConfig:
     data = _mapping(raw, "output")
-    _only_keys(data, {"directory", "report_file", "traffic_file", "redact_secrets"}, "output")
+    _only_keys(
+        data,
+        {"directory", "report_file", "summary_file", "traffic_file", "redact_secrets"},
+        "output",
+    )
     values: dict[str, Any] = {}
     for key, default in (
-        ("directory", "./runs"), ("report_file", "report.json"), ("traffic_file", "traffic.jsonl")
+        ("directory", "./runs"),
+        ("report_file", "report.json"),
+        ("summary_file", "summary.md"),
+        ("traffic_file", "traffic.jsonl"),
     ):
         value = data.get(key, default)
         if not isinstance(value, str) or not value.strip():
@@ -471,6 +479,8 @@ def _parse_output(raw: Any) -> OutputConfig:
         values[key] = value.strip()
     if Path(values["report_file"]).name != values["report_file"]:
         raise ConfigError("output.report_file must be a file name, not a path")
+    if Path(values["summary_file"]).name != values["summary_file"]:
+        raise ConfigError("output.summary_file must be a file name, not a path")
     if Path(values["traffic_file"]).name != values["traffic_file"]:
         raise ConfigError("output.traffic_file must be a file name, not a path")
     if data.get("redact_secrets", True) is not True:

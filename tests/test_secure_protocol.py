@@ -9,7 +9,11 @@ from gurux_dlms import GXReplyData
 from gurux_dlms.enums import Command
 
 from dlms_enum.config import parse_config
-from dlms_enum.gurux_adapter import GuruxSecureSession, protected_apdu_metadata
+from dlms_enum.gurux_adapter import (
+    GuruxSecureSession,
+    _quiet_gurux,
+    protected_apdu_metadata,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +64,23 @@ class NullTraffic:
 
 
 class SecureProtocolTests(unittest.TestCase):
+    def test_gurux_cipher_status_diagnostics_are_suppressed(self):
+        import io
+        from contextlib import redirect_stdout
+
+        captured = io.StringIO()
+
+        def noisy_call():
+            print("Encryption is applied.")
+            print("Authentication is applied.")
+            return 42
+
+        with redirect_stdout(captured):
+            result = _quiet_gurux(noisy_call)
+
+        self.assertEqual(result, 42)
+        self.assertEqual(captured.getvalue(), "")
+
     def test_real_gurux_get_generation_uses_c8_not_c0(self):
         lease = StubLease()
         session = GuruxSecureSession(

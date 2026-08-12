@@ -522,6 +522,19 @@ def scan_public(
                 for attribute_id in entry.attributes:
                     inventory[key]["attributes"].setdefault(attribute_id, "catalogue_probe")
 
+        planned_attributes = sum(
+            len(_ordered_attribute_ids(item["target"], item["attributes"]))
+            for item in inventory.values()
+        )
+        progress(
+            {
+                "phase": "get_plan",
+                "profile": profile_name,
+                "total": planned_attributes,
+                "message": f"Scanning {planned_attributes} readable attributes",
+            }
+        )
+
         object_records: list[dict[str, Any]] = []
         get_success = 0
         get_failed = 0
@@ -604,6 +617,16 @@ def scan_public(
                             "get_failed": get_failed,
                         }
                     )
+                    progress(
+                        {
+                            "phase": "get_complete",
+                            "profile": profile_name,
+                            "logical_name": logical_name,
+                            "class_id": class_id,
+                            "attribute_id": attribute_id,
+                            "outcome": Outcome.SUCCESS.value,
+                        }
+                    )
                     continue
 
                 last_exception: BaseException | None = None
@@ -664,6 +687,16 @@ def scan_public(
                         "get_transmissions": get_transmissions,
                         "get_success": get_success,
                         "get_failed": get_failed,
+                    }
+                )
+                progress(
+                    {
+                        "phase": "get_complete",
+                        "profile": profile_name,
+                        "logical_name": logical_name,
+                        "class_id": class_id,
+                        "attribute_id": attribute_id,
+                        "outcome": attribute_result["outcome"],
                     }
                 )
 

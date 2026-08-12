@@ -36,5 +36,6 @@ profiles:
 output:
   directory: ./runs
   report_file: report.json
+  summary_file: summary.md
   traffic_file: traffic.jsonl
   redact_secrets: true

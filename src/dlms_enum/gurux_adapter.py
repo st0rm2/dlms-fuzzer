@@ -38,6 +38,13 @@ _PROTECTED_COMMANDS = {
 _COMMAND_VALUES = {int(item) for item in Command}
 
 
+def _quiet_gurux(call: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call Gurux without its unconditional cipher-status stdout diagnostics."""
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        return call(*args, **kwargs)
+
+
 def protected_apdu_metadata(frame: bytes, *, outgoing: bool) -> dict[str, Any]:
     """Describe the outer protected APDU without decrypting or exposing challenges."""
 
@@ -261,7 +268,9 @@ class GuruxSession:
                         raw_tx, operation=operation, purpose=purpose
                     )
                     self.media.send(bytearray(raw_tx))
-                while not self.client.getData(frame_data, reply, notification):
+                while not _quiet_gurux(
+                    self.client.getData, frame_data, reply, notification
+                ):
                     if notification.data.size:
                         raise RuntimeError("unsolicited notification received during request")
                     if not self.media.receive(receive):
@@ -348,7 +357,11 @@ class GuruxSession:
         block_number = 0
         while reply.isMoreData():
             block_number += 1
-            packet = None if reply.isStreaming() else self.client.receiverReady(reply)
+            packet = (
+                None
+                if reply.isStreaming()
+                else _quiet_gurux(self.client.receiverReady, reply)
+            )
             context = dict(tx_context or {})
             context["continuation_block"] = block_number
             self._exchange_packet(
@@ -366,7 +379,7 @@ class GuruxSession:
         self.media.open()
         self._open = True
         reply = GXReplyData()
-        snrm = self.client.snrmRequest()
+        snrm = _quiet_gurux(self.client.snrmRequest)
         if snrm:
             self._exchange_packet(
                 snrm,
@@ -377,12 +390,12 @@ class GuruxSession:
                 attempt=1,
                 tx_context={"message": "set-normal-response-mode"},
             )
-            self.client.parseUAResponse(reply.data)
+            _quiet_gurux(self.client.parseUAResponse, reply.data)
             self._linked = True
 
         reply.clear()
         self._read_blocks(
-            self.client.aarqRequest(),
+            _quiet_gurux(self.client.aarqRequest),
             reply,
             phase="endpoint_discovery",
             purpose="public_association",
@@ -394,7 +407,7 @@ class GuruxSession:
                 "referencing": "logical-name",
             },
         )
-        self.client.parseAareResponse(reply.data)
+        _quiet_gurux(self.client.parseAareResponse, reply.data)
         self._associated = True
         return self.association_details()
 
@@ -431,7 +444,7 @@ class GuruxSession:
     def discover_objects(self, attempt: int) -> Any:
         reply = GXReplyData()
         self._read_blocks(
-            self.client.getObjectsRequest(),
+            _quiet_gurux(self.client.getObjectsRequest),
             reply,
             phase=f"{self.profile_name}_reconnaissance",
             purpose="association_view_scan",
@@ -440,8 +453,11 @@ class GuruxSession:
             object_context={"class_id": 15, "logical_name": "0.0.40.0.0.255", "attribute_id": 2},
             tx_context={"service": "get-request", "attribute": "object-list"},
         )
-        return self.client.parseObjects(
-            reply.data, onlyKnownObjects=False, ignoreInactiveObjects=False
+        return _quiet_gurux(
+            self.client.parseObjects,
+            reply.data,
+            onlyKnownObjects=False,
+            ignoreInactiveObjects=False,
         )
 
     def create_object(self, class_id: int, logical_name: str) -> Any:
@@ -461,7 +477,7 @@ class GuruxSession:
         }
         reply = GXReplyData()
         self._read_blocks(
-            self.client.read(target, attribute_id),
+            _quiet_gurux(self.client.read, target, attribute_id),
             reply,
             phase="get_scan",
             purpose="object_attribute_read",
@@ -473,7 +489,9 @@ class GuruxSession:
         raw_value = reply.value
         class_decode_error = None
         try:
-            decoded = self.client.updateValue(target, attribute_id, raw_value)
+            decoded = _quiet_gurux(
+                self.client.updateValue, target, attribute_id, raw_value
+            )
         except (AttributeError, NotImplementedError, ValueError) as exc:
             # Unknown/new interface classes can still carry a completely valid
             # xDLMS value. Preserve Gurux's APDU-level decoding even when no
@@ -510,7 +528,7 @@ class GuruxSession:
         target = self.create_object(class_id, logical_name)
         reply = GXReplyData()
         self._read_blocks(
-            self.client.read(target, attribute_id),
+            _quiet_gurux(self.client.read, target, attribute_id),
             reply,
             phase="invocation_counter_bootstrap",
             purpose=purpose,
@@ -526,7 +544,9 @@ class GuruxSession:
         )
         value = reply.value
         try:
-            return self.client.updateValue(target, attribute_id, value)
+            return _quiet_gurux(
+                self.client.updateValue, target, attribute_id, value
+            )
         except (AttributeError, NotImplementedError, ValueError):
             return value
 
@@ -567,7 +587,7 @@ class GuruxSession:
             return warnings
         if self._associated:
             try:
-                release = self.client.releaseRequest()
+                release = _quiet_gurux(self.client.releaseRequest)
                 if release:
                     reply = GXReplyData()
                     self._read_blocks(
@@ -584,7 +604,7 @@ class GuruxSession:
             self._associated = False
         if self._linked:
             try:
-                disconnect = self.client.disconnectRequest()
+                disconnect = _quiet_gurux(self.client.disconnectRequest)
                 if disconnect:
                     reply = GXReplyData()
                     self._exchange_packet(
@@ -728,7 +748,7 @@ class GuruxSecureSession(GuruxSession):
         self.media.open()
         self._open = True
         reply = GXReplyData()
-        snrm = self.client.snrmRequest()
+        snrm = _quiet_gurux(self.client.snrmRequest)
         if snrm:
             self._exchange_packet(
                 snrm,
@@ -739,12 +759,12 @@ class GuruxSecureSession(GuruxSession):
                 attempt=1,
                 tx_context={"message": "set-normal-response-mode"},
             )
-            self.client.parseUAResponse(reply.data)
+            _quiet_gurux(self.client.parseUAResponse, reply.data)
             self._linked = True
 
         reply.clear()
         self._read_blocks(
-            self.client.aarqRequest(),
+            _quiet_gurux(self.client.aarqRequest),
             reply,
             phase="secure_association",
             purpose="ciphered_association",
@@ -758,7 +778,7 @@ class GuruxSecureSession(GuruxSession):
                 "referencing": "logical-name",
             },
         )
-        self.client.parseAareResponse(reply.data)
+        _quiet_gurux(self.client.parseAareResponse, reply.data)
         if not self.client.isAuthenticationRequired:
             raise RuntimeError("HLS-GMAC AARE did not require the HLS authentication exchange")
         server_title = self.client.settings.sourceSystemTitle
@@ -767,7 +787,7 @@ class GuruxSecureSession(GuruxSession):
 
         reply.clear()
         self._read_blocks(
-            self.client.getApplicationAssociationRequest(),
+            _quiet_gurux(self.client.getApplicationAssociationRequest),
             reply,
             phase="hls_authentication",
             purpose="association_ln_authentication",
@@ -784,8 +804,9 @@ class GuruxSecureSession(GuruxSession):
         try:
             # Gurux 1.0.201 prints both challenge values on validation failure.
             # Suppress that upstream diagnostic and expose only a sanitized error.
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.client.parseApplicationAssociationResponse(reply.data)
+            _quiet_gurux(
+                self.client.parseApplicationAssociationResponse, reply.data
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"HLS-GMAC server response validation failed ({type(exc).__name__})"
