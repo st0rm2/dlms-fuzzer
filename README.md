@@ -2,7 +2,7 @@
 
 `dlms-enum` performs authorized, read-only DLMS/COSEM discovery over direct serial HDLC. It supports either an unauthenticated public association or an HLS-GMAC Security Suite 0 association with authenticated-and-encrypted xDLMS traffic. Both profiles use logical-name referencing, read the Association LN object list, supplement it with a conservative OBIS catalogue, perform GET operations only, and write a canonical JSON report plus side-by-side JSONL traffic.
 
-The secure profile uses Gurux DLMS 1.0.201 for HLS-GMAC and AES-GCM. It does not implement cryptography itself. No SET, arbitrary ACTION, key transfer, key rotation, password authentication, manufacturer catalogue, or fuzzing is available. The sole ACTION allowed is Association LN method 1, which is required to complete HLS authentication.
+The secure profile uses Gurux DLMS 1.0.201 for HLS-GMAC and AES-GCM. It does not implement cryptography itself. Association View access rights for SET and ACTION are reported passively, but no modifying SET, arbitrary ACTION, key transfer, key rotation, password authentication, manufacturer catalogue, or fuzzing is performed. The sole ACTION sent is Association LN method 1, which is required to complete HLS authentication.
 
 ## Install and run
 
@@ -21,6 +21,15 @@ cp examples/public-meter.yaml meter-public.yaml
 python -m dlms_enum validate-config meter-public.yaml
 python -m dlms_enum scan --config meter-public.yaml
 ```
+
+At startup, interactive terminal runs ask whether this should be a short test. A short test still downloads and parses the complete Association View, then scans only the first 10 objects listed by the meter before performing the normal clean teardown. The same choice can be made without a prompt:
+
+```shell
+python -m dlms_enum scan --config meter-public.yaml --short
+python -m dlms_enum scan --config meter-public.yaml --full
+```
+
+For unattended configuration-driven runs, set `scan.object_limit: 10`. If no limit or command-line switch is supplied and standard input is not an interactive terminal, the default remains a full scan.
 
 Secure scan:
 
@@ -165,9 +174,9 @@ Serial framing, response timeout, inter-request delay, and session guard remain 
 
 Each run gets a UTC-named directory under `./runs` unless overridden:
 
-- `report.json` contains the selected endpoint, addressing type, redacted effective configuration, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, cleanup warnings, and a traffic-file hash.
-- `summary.md` is the compact human-readable report. It contains connection and role details followed by a table of each scanned OBIS attribute, its decoded value, hexadecimal/raw numeric representation, and result. Large structured values are shortened only in this Markdown view.
-- `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, Gurux-decoded response values, result category, timing, and redaction indicators.
+- `report.json` contains the selected endpoint, addressing type, redacted effective configuration, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, passively advertised SET/ACTION rights, cleanup warnings, and a traffic-file hash.
+- `summary.md` is the compact human-readable report. It contains connection and role details followed by tables of readable OBIS values and the role's advertised writable attributes and callable methods. No modifying request is sent. For secure scans it also records the protected command, invocation counter, original ciphertext, and separate AES-GCM authentication tag without repeating the full HDLC frame. Large structured values are shortened only in the decoded-value view.
+- `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators.
 
 GET uses at most two attempts. Explicit DLMS errors such as access denied are not retried. Timeouts, transport failures, and malformed responses can receive one retry; each protected retry gets a new persisted invocation counter.
 
@@ -197,4 +206,4 @@ python -m dlms_enum validate-config examples/hls-gmac-suite0-meter.yaml
 
 Protocol tests use fakes, the real Gurux request generator, and sanitized structural expectations derived from the supplied captures; they need no physical meter and embed no keys. Live validation is still required for the target meter, particularly its role provisioning, counter object access, server system title, association-view size, and protected-release behavior.
 
-This release accepts exactly one scan profile per run: either `public` or `hls_gmac_suite0`. Running both profiles together without duplicate public discovery is deferred. Security Suites 1/2, dedicated keys, signing, key agreement, key management, and arbitrary ACTION/SET services are intentionally unsupported.
+This release accepts exactly one scan profile (role) per run: either `public` or `hls_gmac_suite0`. Run each role separately to obtain its role-specific Association View rights, then compare the reports. Running both profiles together without duplicate public discovery is deferred. Security Suites 1/2, dedicated keys, signing, key agreement, key management, and arbitrary ACTION/SET execution are intentionally unsupported.

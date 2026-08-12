@@ -91,6 +91,11 @@ class ResultAndTrafficTests(unittest.TestCase):
                         "hls_validated": True,
                     },
                     "summary": {"objects": 1, "get_success": 2, "get_failed": 0},
+                    "scan_scope": {
+                        "short_test": True,
+                        "selected_objects": 1,
+                        "association_view_objects": 20,
+                    },
                     "identification": {"serial_number": "12345"},
                     "objects": [
                         {
@@ -122,6 +127,7 @@ class ResultAndTrafficTests(unittest.TestCase):
         rendered = render_summary_report(report)
 
         self.assertIn("## Profile: hls_gmac_suite0", rendered)
+        self.assertIn("First 1 objects (short test)", rendered)
         self.assertIn("| 0.0.96.1.0.255 | 1 | 2 | Value | 12345 | 3132333435 | SUCCESS |", rendered)
         self.assertNotIn("| 0.0.96.1.0.255 | 1 | 1 |", rendered)
 
@@ -144,6 +150,109 @@ class ResultAndTrafficTests(unittest.TestCase):
 
         self.assertEqual(loaded["related_logs"]["summary_file"], "summary.md")
         self.assertEqual(len(loaded["related_logs"]["summary_sha256"]), 64)
+
+    def test_summary_lists_passive_set_and_action_capabilities(self):
+        report = {
+            "schema_version": 1,
+            "run": {"id": "test", "status": "completed"},
+            "transport": {},
+            "profiles": [
+                {
+                    "name": "role_4",
+                    "association": {"client_address": 4},
+                    "summary": {
+                        "objects": 1,
+                        "advertised_set_attributes": 1,
+                        "advertised_action_methods": 1,
+                    },
+                    "objects": [
+                        {
+                            "logical_name": "1.0.0.1.0.255",
+                            "class_id": 1,
+                            "attributes": [
+                                {
+                                    "attribute_id": 2,
+                                    "name": "Value",
+                                    "advertised_access": "read_write",
+                                    "access_rights": {"read": True, "write": True},
+                                    "outcome": "SUCCESS",
+                                    "decoded": {"value": 7},
+                                }
+                            ],
+                            "methods": [
+                                {
+                                    "method_id": 1,
+                                    "name": "Reset",
+                                    "advertised_access": "access",
+                                    "access_rights": {"action": True},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "errors": [],
+        }
+
+        rendered = render_summary_report(report)
+
+        self.assertIn("### Advertised write and action capabilities", rendered)
+        self.assertIn("| 1.0.0.1.0.255 | 1 | 2 | Value | read_write | SET | No |", rendered)
+        self.assertIn("| 1.0.0.1.0.255 | 1 | 1 | Reset | access | ACTION | No |", rendered)
+        self.assertIn("No modifying SET or ACTION request was sent", rendered)
+
+    def test_written_summary_includes_ciphertext_without_full_hdlc_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traffic = root / "traffic.jsonl"
+            traffic.write_text(
+                json.dumps(
+                    {
+                        "sequence_number": 7,
+                        "operation": "GET",
+                        "result": "SUCCESS",
+                        "tx": {
+                            "encoded_frames": ["7EA02C0309540911DEADBEEF7E"],
+                            "decoded": {
+                                "protected": True,
+                                "protected_command": "glo-get-request",
+                                "security_control": "0x30",
+                                "invocation_counter": 42,
+                                "ciphertext_hex": "A1B2C3D4",
+                                "ciphertext_captured_length": 4,
+                                "ciphertext_declared_length": 4,
+                                "ciphertext_complete": True,
+                                "authentication_tag_hex": "00112233445566778899AABB",
+                                "authentication_tag_complete": True,
+                            },
+                        },
+                        "rx": {"decoded": {"protected": False}},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report_path = root / "report.json"
+            summary_path = root / "summary.md"
+            report = {
+                "schema_version": 1,
+                "run": {"id": "test", "status": "completed"},
+                "transport": {},
+                "profiles": [],
+                "errors": [],
+            }
+
+            write_report(report, report_path, traffic, summary_path)
+            rendered = summary_path.read_text(encoding="utf-8")
+
+        self.assertIn("## Protected APDU evidence", rendered)
+        self.assertIn(
+            "| 7 | TX | GET | glo-get-request | 0x30 | 42 | A1B2C3D4 |",
+            rendered,
+        )
+        self.assertIn("00112233445566778899AABB", rendered)
+        self.assertIn("| SUCCESS |", rendered)
+        self.assertNotIn("7EA02C0309540911DEADBEEF7E", rendered)
 
 
 if __name__ == "__main__":

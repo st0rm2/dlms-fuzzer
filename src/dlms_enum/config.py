@@ -5,7 +5,7 @@ from __future__ import annotations
 import getpass
 import os
 import stat
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -41,6 +41,7 @@ class ScanConfig:
     total_get_attempts: int = 2
     association_view_first: bool = True
     common_catalogue: bool = True
+    object_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -255,7 +256,7 @@ def _parse_scan(raw: Any) -> ScanConfig:
         data,
         {
             "mode", "total_get_attempts", "association_view_first", "common_catalogue",
-            "manufacturer_catalogue", "union_profile_test",
+            "manufacturer_catalogue", "union_profile_test", "object_limit",
         },
         "scan",
     )
@@ -272,11 +273,23 @@ def _parse_scan(raw: Any) -> ScanConfig:
             raise ConfigError(f"scan.{key} must be boolean")
     if not data.get("association_view_first", True):
         raise ConfigError("association_view_first must remain true in this release")
+    object_limit = data.get("object_limit")
+    if object_limit is not None:
+        object_limit = _integer(object_limit, "scan.object_limit", 1, 100_000)
     return ScanConfig(
         total_get_attempts=attempts,
         association_view_first=True,
         common_catalogue=bool(data.get("common_catalogue", True)),
+        object_limit=object_limit,
     )
+
+
+def with_object_limit(config: AppConfig, limit: int | None) -> AppConfig:
+    """Return a runtime copy with a bounded post-association object scan."""
+
+    if limit is not None and (isinstance(limit, bool) or not 1 <= limit <= 100_000):
+        raise ConfigError("scan.object_limit must be an integer from 1 to 100000")
+    return replace(config, scan=replace(config.scan, object_limit=limit))
 
 
 def _parse_server_and_hdlc(data: Mapping[str, Any], *, secure: bool) -> tuple[int, int, int | str]:

@@ -12,6 +12,13 @@ class Attribute:
         self.index = index
 
 
+class Method:
+    def __init__(self, index, access):
+        self.index = index
+        self.methodAccess = access
+        self.methodAccess3 = access
+
+
 class FakeObject:
     objectType = 1
     logicalName = "0.0.96.1.0.255"
@@ -86,6 +93,48 @@ class TwoByteOnlySession(FakeSession):
         return super().connect()
 
 
+class ManyObject(FakeObject):
+    def __init__(self, index):
+        self.logicalName = f"1.0.{index}.8.0.255"
+
+
+class LimitedSession(FakeSession):
+    read_objects = []
+
+    def discover_objects(self, attempt):
+        return [ManyObject(index) for index in range(1, 13)]
+
+    def read_attribute(self, target, attribute_id, attempt):
+        self.read_objects.append((target.logicalName, attribute_id))
+        return {"value": target.logicalName, "dlms_data_type": "visible_string"}
+
+
+class WritableObject(FakeObject):
+    attributes = [Attribute(2), Attribute(3)]
+    methodAttributes = [Method(1, 1)]
+
+    def getAccess(self, index):
+        return {1: 1, 2: 3, 3: 2}[index]
+
+    def getAttributeCount(self):
+        return 3
+
+    def getNames(self):
+        return ("Logical name", "Value", "Configuration")
+
+    def getMethodNames(self):
+        return ("Reset",)
+
+
+class WritableSession(FakeSession):
+    def discover_objects(self, attempt):
+        return [WritableObject()]
+
+    def read_attribute(self, target, attribute_id, attempt):
+        self.read_attempts.append((attribute_id, attempt))
+        return {"value": "decoded", "dlms_data_type": "visible_string"}
+
+
 class ScannerTests(unittest.TestCase):
     def test_serial_permission_message_recommends_device_group(self):
         device_stat = types.SimpleNamespace(st_mode=0o20660, st_uid=0, st_gid=986)
@@ -153,6 +202,34 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(value_attribute["attempt_count"], 2)
         self.assertEqual(value_attribute["outcome"], "SUCCESS")
 
+    def test_association_write_and_action_rights_are_reported_but_not_executed(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null", "baudrate": 9600, "inter_request_delay_ms": 0},
+                "scan": {"common_catalogue": False},
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = WritableSession
+        WritableSession.read_attempts = []
+
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        profile = report["profiles"][0]
+        attributes = profile["objects"][0]["attributes"]
+        self.assertEqual(WritableSession.read_attempts, [(1, 1), (2, 1)])
+        self.assertEqual(attributes[1]["advertised_operations"], ["GET", "SET"])
+        self.assertEqual(attributes[2]["advertised_operations"], ["SET"])
+        self.assertEqual(attributes[2]["lifecycle"], "not_readable")
+        self.assertFalse(attributes[2]["write_tested"])
+        self.assertEqual(profile["summary"]["advertised_set_attributes"], 2)
+        self.assertEqual(profile["summary"]["advertised_action_methods"], 1)
+        operations = [item["operation"] for item in report["capability_matrix"]]
+        self.assertEqual(operations.count("GET"), 2)
+        self.assertEqual(operations.count("SET"), 2)
+        self.assertEqual(operations.count("ACTION"), 1)
+
     def test_two_byte_server_address_is_discovered_after_one_byte_timeout(self):
         config = parse_config(
             {
@@ -184,6 +261,40 @@ class ScannerTests(unittest.TestCase):
             [item["valid"] for item in report["transport"]["endpoint_findings"]],
             [False, True],
         )
+
+    def test_short_scan_reads_full_association_then_only_first_ten_objects(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {"common_catalogue": False, "object_limit": 10},
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = LimitedSession
+        LimitedSession.read_objects = []
+        events = []
+
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object(), progress=events.append)
+
+        profile = report["profiles"][0]
+        self.assertEqual(profile["association_view_object_count"], 12)
+        self.assertEqual(profile["scan_scope"]["selected_objects"], 10)
+        self.assertTrue(profile["scan_scope"]["short_test"])
+        self.assertEqual(len(profile["objects"]), 10)
+        self.assertEqual(
+            [item["logical_name"] for item in profile["objects"]],
+            [f"1.0.{index}.8.0.255" for index in range(1, 11)],
+        )
+        self.assertFalse(
+            any(name in {"1.0.11.8.0.255", "1.0.12.8.0.255"} for name, _ in LimitedSession.read_objects)
+        )
+        short_event = next(item for item in events if item["phase"] == "short_test_selected")
+        self.assertEqual(short_event["association_view_objects"], 12)
 
 
 if __name__ == "__main__":

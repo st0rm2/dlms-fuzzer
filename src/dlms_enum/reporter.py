@@ -56,7 +56,51 @@ def _hex_value(raw_value: Any) -> str:
     return "—"
 
 
-def render_summary_report(report: dict[str, Any]) -> str:
+def _protected_traffic_entries(path: str | Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            for direction in ("tx", "rx"):
+                decoded = record.get(direction, {}).get("decoded", {})
+                if not isinstance(decoded, dict) or not decoded.get("protected"):
+                    continue
+                if "ciphertext_hex" not in decoded:
+                    continue
+                entries.append(
+                    {
+                        "sequence_number": record.get("sequence_number", "—"),
+                        "direction": direction.upper(),
+                        "operation": record.get("operation", "—"),
+                        "result": record.get("result", "—"),
+                        "protected_command": decoded.get("protected_command", "—"),
+                        "security_control": decoded.get("security_control", "—"),
+                        "invocation_counter": decoded.get("invocation_counter", "—"),
+                        "ciphertext_hex": decoded.get("ciphertext_hex", ""),
+                        "ciphertext_captured_length": decoded.get(
+                            "ciphertext_captured_length", 0
+                        ),
+                        "ciphertext_declared_length": decoded.get(
+                            "ciphertext_declared_length", 0
+                        ),
+                        "ciphertext_complete": decoded.get("ciphertext_complete", False),
+                        "authentication_tag_hex": decoded.get(
+                            "authentication_tag_hex", ""
+                        ),
+                        "authentication_tag_complete": decoded.get(
+                            "authentication_tag_complete", False
+                        ),
+                    }
+                )
+    return entries
+
+
+def render_summary_report(
+    report: dict[str, Any],
+    protected_traffic: list[dict[str, Any]] | None = None,
+) -> str:
     """Create a compact Markdown view while retaining report.json as evidence."""
 
     run = report.get("run", {})
@@ -82,6 +126,7 @@ def render_summary_report(report: dict[str, Any]) -> str:
     for profile in profiles:
         association = profile.get("association", {})
         summary = profile.get("summary", {})
+        scan_scope = profile.get("scan_scope", {})
         profile_name = str(profile.get("name", "unknown"))
         lines.extend(
             [
@@ -97,7 +142,11 @@ def render_summary_report(report: dict[str, Any]) -> str:
                 f"| Client system title | {_markdown(association.get('client_system_title', '—'))} |",
                 f"| Server system title | {_markdown(association.get('server_system_title', '—'))} |",
                 f"| Objects | {_markdown(summary.get('objects', 0))} |",
+                f"| Scan scope | {_markdown('First ' + str(scan_scope.get('selected_objects', 0)) + ' objects (short test)' if scan_scope.get('short_test') else 'Full inventory')} |",
+                f"| Association View objects | {_markdown(scan_scope.get('association_view_objects', profile.get('association_view_object_count', '—')))} |",
                 f"| GET results | {_markdown(summary.get('get_success', 0))} successful / {_markdown(summary.get('get_failed', 0))} failed |",
+                f"| Advertised SET attributes | {_markdown(summary.get('advertised_set_attributes', 0))} (not tested) |",
+                f"| Advertised ACTION methods | {_markdown(summary.get('advertised_action_methods', 0))} (not tested) |",
             ]
         )
         bootstrap = association.get("invocation_counter_bootstrap")
@@ -130,6 +179,12 @@ def render_summary_report(report: dict[str, Any]) -> str:
         )
         for obj in profile.get("objects", []):
             attributes = list(obj.get("attributes", []))
+            attributes = [
+                item
+                for item in attributes
+                if item.get("access_rights", {}).get("read", True)
+                or item.get("access_rights", {}).get("catalogue_probe", False)
+            ]
             display_attributes = [item for item in attributes if item.get("attribute_id") != 1]
             if not display_attributes:
                 display_attributes = attributes or [{}]
@@ -149,6 +204,109 @@ def render_summary_report(report: dict[str, Any]) -> str:
                         _markdown(result),
                     )
                 )
+        lines.append("")
+
+        writable_attributes = [
+            (obj, attribute)
+            for obj in profile.get("objects", [])
+            for attribute in obj.get("attributes", [])
+            if attribute.get("access_rights", {}).get("write", False)
+        ]
+        actionable_methods = [
+            (obj, method)
+            for obj in profile.get("objects", [])
+            for method in obj.get("methods", [])
+            if method.get("access_rights", {}).get("action", False)
+        ]
+        lines.extend(
+            [
+                "### Advertised write and action capabilities",
+                "",
+                "These are passive access rights reported by this role's Association View. No modifying SET or ACTION request was sent, so the entries are advertised capabilities, not confirmed writes. This scan uses logical-name referencing, where attribute writes use SET; WRITE is the equivalent service for short-name referencing.",
+                "",
+                "#### Writable attributes",
+                "",
+            ]
+        )
+        if not writable_attributes:
+            lines.extend(["None advertised for this role.", ""])
+        else:
+            lines.extend(
+                [
+                    "| OBIS | Class | Attribute | Name | Access mode | Service | Tested |",
+                    "|---|---:|---:|---|---|---|---|",
+                ]
+            )
+            for obj, attribute in writable_attributes:
+                lines.append(
+                    "| {} | {} | {} | {} | {} | SET | No |".format(
+                        _markdown(obj.get("logical_name", "—")),
+                        _markdown(obj.get("class_id", "—")),
+                        _markdown(attribute.get("attribute_id", "—")),
+                        _markdown(attribute.get("name") or "—"),
+                        _markdown(attribute.get("advertised_access", "—")),
+                    )
+                )
+            lines.append("")
+
+        lines.extend(["#### Callable methods", ""])
+        if not actionable_methods:
+            lines.extend(["None advertised for this role.", ""])
+        else:
+            lines.extend(
+                [
+                    "| OBIS | Class | Method | Name | Access mode | Service | Tested |",
+                    "|---|---:|---:|---|---|---|---|",
+                ]
+            )
+            for obj, method in actionable_methods:
+                lines.append(
+                    "| {} | {} | {} | {} | {} | ACTION | No |".format(
+                        _markdown(obj.get("logical_name", "—")),
+                        _markdown(obj.get("class_id", "—")),
+                        _markdown(method.get("method_id", "—")),
+                        _markdown(method.get("name") or "—"),
+                        _markdown(method.get("advertised_access", "—")),
+                    )
+                )
+            lines.append("")
+
+    if protected_traffic:
+        lines.extend(
+            [
+                "## Protected APDU evidence",
+                "",
+                "Security-control `0x30` denotes Suite 0 authentication and encryption. Ciphertext below excludes the security-control byte, invocation counter, and 12-byte AES-GCM authentication tag. A complete successfully decoded response also means its authentication tag was verified; `fragment` means only the ciphertext bytes present in that HDLC segment are shown.",
+                "",
+                "| Seq. | Direction | Operation | Protected command | Security control | Invocation counter | Ciphertext (hex) | Capture | AES-GCM tag (hex) | Result |",
+                "|---:|---|---|---|---|---:|---|---|---|---|",
+            ]
+        )
+        for entry in protected_traffic:
+            captured_length = entry.get("ciphertext_captured_length", 0)
+            declared_length = entry.get("ciphertext_declared_length", 0)
+            capture = (
+                f"complete ({captured_length} bytes)"
+                if entry.get("ciphertext_complete")
+                else f"fragment ({captured_length}/{declared_length} bytes)"
+            )
+            tag = entry.get("authentication_tag_hex") or "—"
+            if tag != "—" and not entry.get("authentication_tag_complete"):
+                tag = f"{tag} (fragment)"
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                    _markdown(entry.get("sequence_number", "—")),
+                    _markdown(entry.get("direction", "—")),
+                    _markdown(entry.get("operation", "—")),
+                    _markdown(entry.get("protected_command", "—")),
+                    _markdown(entry.get("security_control", "—")),
+                    _markdown(entry.get("invocation_counter", "—")),
+                    _markdown(entry.get("ciphertext_hex") or "—"),
+                    _markdown(capture),
+                    _markdown(tag),
+                    _markdown(entry.get("result", "—")),
+                )
+            )
         lines.append("")
 
     errors = report.get("errors", [])
@@ -180,11 +338,20 @@ def render_summary_report(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def write_summary_report(report: dict[str, Any], path: str | Path) -> None:
+def write_summary_report(
+    report: dict[str, Any],
+    path: str | Path,
+    traffic_path: str | Path | None = None,
+) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(render_summary_report(report), encoding="utf-8")
+    protected_traffic = (
+        _protected_traffic_entries(traffic_path) if traffic_path is not None else None
+    )
+    temporary.write_text(
+        render_summary_report(report, protected_traffic), encoding="utf-8"
+    )
     temporary.replace(destination)
 
 
@@ -195,7 +362,7 @@ def write_report(
     summary_path: str | Path | None = None,
 ) -> None:
     if summary_path is not None:
-        write_summary_report(report, summary_path)
+        write_summary_report(report, summary_path, traffic_path)
     report["related_logs"] = {
         "traffic_file": str(Path(traffic_path).name),
         "traffic_sha256": sha256_file(traffic_path),
@@ -237,10 +404,21 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
         f"Server Addressing Type: {report.get('transport', {}).get('server_addressing_type', 'not found')}",
         f"Objects: {summary.get('objects', 0)}",
         f"GET: {summary.get('get_success', 0)} success, {summary.get('get_failed', 0)} failed",
+        f"Advertised SET attributes: {summary.get('advertised_set_attributes', 0)} (not tested)",
+        f"Advertised ACTION methods: {summary.get('advertised_action_methods', 0)} (not tested)",
         f"Errors: {len(report.get('errors', []))}",
     ]
     association = profile.get("association", {})
     if profile.get("name") == "hls_gmac_suite0":
         lines.insert(2, f"HLS-GMAC validated: {association.get('hls_validated', False)}")
         lines.insert(3, f"Security: Suite 0 / {association.get('security', 'not established')}")
+    scan_scope = profile.get("scan_scope", {})
+    if scan_scope.get("short_test"):
+        lines.insert(
+            2,
+            "Scope: short test — first {} of {} Association View objects".format(
+                scan_scope.get("selected_objects", 0),
+                scan_scope.get("association_view_objects", 0),
+            ),
+        )
     return lines

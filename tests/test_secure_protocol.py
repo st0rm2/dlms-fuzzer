@@ -81,6 +81,43 @@ class SecureProtocolTests(unittest.TestCase):
         self.assertEqual(result, 42)
         self.assertEqual(captured.getvalue(), "")
 
+    def test_protected_metadata_separates_ciphertext_and_authentication_tag(self):
+        ciphertext = bytes.fromhex("A1B2C3D4")
+        authentication_tag = bytes.fromhex("00112233445566778899AABB")
+        protected_content = b"\x30\x00\x00\x00\x2A" + ciphertext + authentication_tag
+        frame = (
+            b"\x7E\xE6\xE6\x00\xC8"
+            + bytes((len(protected_content),))
+            + protected_content
+            + b"\x7E"
+        )
+
+        metadata = protected_apdu_metadata(frame, outgoing=True)
+
+        self.assertTrue(metadata["protected"])
+        self.assertEqual(metadata["invocation_counter"], 42)
+        self.assertEqual(metadata["ciphertext_hex"], "A1B2C3D4")
+        self.assertEqual(metadata["ciphertext_declared_length"], 4)
+        self.assertTrue(metadata["ciphertext_complete"])
+        self.assertEqual(metadata["authentication_tag_hex"], authentication_tag.hex().upper())
+        self.assertTrue(metadata["authentication_tag_complete"])
+
+    def test_nested_aarq_uses_actual_glo_command_not_ber_length_octet(self):
+        ciphertext = b"\xAA\xBB"
+        authentication_tag = bytes.fromhex("102132435465768798A9BACB")
+        protected_content = b"\x30\x00\x00\x00\x09" + ciphertext + authentication_tag
+        # The first 0x21 is the BER octet-string length. The second is the
+        # actual glo-initiate-request command.
+        payload = b"\x60\x20\x04\x21\x21" + bytes((len(protected_content),)) + protected_content
+        frame = b"\x7E\xE6\xE6\x00" + payload + b"\x7E"
+
+        metadata = protected_apdu_metadata(frame, outgoing=True)
+
+        self.assertEqual(metadata["protected_command"], "glo-initiate-request")
+        self.assertEqual(metadata["invocation_counter"], 9)
+        self.assertEqual(metadata["ciphertext_hex"], "AABB")
+        self.assertEqual(metadata["authentication_tag_hex"], authentication_tag.hex().upper())
+
     def test_real_gurux_get_generation_uses_c8_not_c0(self):
         lease = StubLease()
         session = GuruxSecureSession(

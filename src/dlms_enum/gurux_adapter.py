@@ -45,14 +45,53 @@ def _quiet_gurux(call: Any, *args: Any, **kwargs: Any) -> Any:
         return call(*args, **kwargs)
 
 
+def _hdlc_information_end(frame: bytes) -> int:
+    """Return the end of the HDLC information field when framing is complete."""
+
+    if len(frame) < 4 or frame[0] != 0x7E or frame[1] & 0xF0 != 0xA0:
+        return len(frame)
+    frame_length = ((frame[1] & 0x07) << 8) | frame[2]
+    closing_flag = frame_length + 1
+    if closing_flag >= len(frame) or frame[closing_flag] != 0x7E:
+        return len(frame)
+    # The two octets immediately before the closing flag are the frame FCS.
+    return closing_flag - 2
+
+
+def _axdr_length(data: bytes, offset: int) -> tuple[int, int] | None:
+    """Decode an A-XDR definite length and return (length, content offset)."""
+
+    if offset >= len(data):
+        return None
+    first = data[offset]
+    if first < 0x80:
+        return first, offset + 1
+    octet_count = first & 0x7F
+    if octet_count == 0 or octet_count > 4 or offset + 1 + octet_count > len(data):
+        return None
+    start = offset + 1
+    return int.from_bytes(data[start:start + octet_count], "big"), start + octet_count
+
+
+def _protected_content(payload: bytes, command_offset: int) -> tuple[int, int] | None:
+    decoded_length = _axdr_length(payload, command_offset + 1)
+    if decoded_length is None:
+        return None
+    declared_length, content_offset = decoded_length
+    if content_offset >= len(payload) or payload[content_offset] != 0x30:
+        return None
+    return declared_length, content_offset
+
+
 def protected_apdu_metadata(frame: bytes, *, outgoing: bool) -> dict[str, Any]:
-    """Describe the outer protected APDU without decrypting or exposing challenges."""
+    """Describe a protected APDU and retain only its ciphered evidence bytes."""
 
     marker = b"\xE6\xE6\x00" if outgoing else b"\xE6\xE7\x00"
     offset = frame.find(marker)
     if offset < 0:
         return {"protected": False}
-    payload = frame[offset + len(marker):]
+    information_end = _hdlc_information_end(frame)
+    payload = frame[offset + len(marker):information_end]
     if not payload:
         return {"protected": False}
     indexes: list[tuple[int, int]] = []
@@ -69,10 +108,9 @@ def protected_apdu_metadata(frame: bytes, *, outgoing: bool) -> dict[str, Any]:
             found = payload.find(bytes((command,)), search_from)
             if found < 0:
                 break
-            # Select the APDU command followed by its short length and Suite 0
-            # security-control byte, not a coincidental byte in a challenge.
-            security = payload.find(b"\x30", found + 1, found + 6)
-            if security >= 0:
+            # Select the actual nested protected APDU, not a coincidental command
+            # octet or BER length in an authentication value.
+            if _protected_content(payload, found) is not None:
                 indexes.append((found, command))
                 break
             search_from = found + 1
@@ -83,18 +121,48 @@ def protected_apdu_metadata(frame: bytes, *, outgoing: bool) -> dict[str, Any]:
             "outer_command_code": payload[0],
         }
     command_offset, command = indexes[0]
+    protected_content = _protected_content(payload, command_offset)
     result: dict[str, Any] = {
         "protected": True,
         "protected_command": _PROTECTED_COMMANDS[command],
         "protected_command_code": command,
     }
-    # Suite 0 AUTHENTICATION_ENCRYPTION uses security-control byte 0x30.
-    security_offset = payload.find(b"\x30", command_offset + 1, command_offset + 6)
+    if protected_content is not None:
+        declared_length, security_offset = protected_content
+    else:
+        # Preserve the earlier best-effort metadata behavior for malformed or
+        # partial captures that still expose the Suite 0 security header.
+        declared_length = 0
+        security_offset = payload.find(b"\x30", command_offset + 1, command_offset + 6)
+
+    # Suite 0 AUTHENTICATION_ENCRYPTION uses security-control byte 0x30,
+    # a four-octet invocation counter, and a 12-octet AES-GCM tag.
     if security_offset >= 0 and len(payload) >= security_offset + 5:
         result["security_control"] = "0x30"
         result["invocation_counter"] = int.from_bytes(
             payload[security_offset + 1:security_offset + 5], "big"
         )
+        if declared_length >= 17:
+            captured_content = payload[
+                security_offset:min(security_offset + declared_length, len(payload))
+            ]
+            ciphertext_length = declared_length - 5 - 12
+            captured_ciphertext = captured_content[5:5 + ciphertext_length]
+            tag_offset = 5 + ciphertext_length
+            captured_tag = captured_content[tag_offset:tag_offset + 12]
+            result.update(
+                {
+                    "protected_payload_declared_length": declared_length,
+                    "protected_payload_captured_length": len(captured_content),
+                    "protected_payload_complete": len(captured_content) == declared_length,
+                    "ciphertext_hex": captured_ciphertext.hex().upper(),
+                    "ciphertext_declared_length": ciphertext_length,
+                    "ciphertext_captured_length": len(captured_ciphertext),
+                    "ciphertext_complete": len(captured_ciphertext) == ciphertext_length,
+                    "authentication_tag_hex": captured_tag.hex().upper(),
+                    "authentication_tag_complete": len(captured_tag) == 12,
+                }
+            )
     return result
 
 
@@ -227,6 +295,10 @@ class GuruxSession:
     def _after_receive(
         self, raw_rx: list[bytes], *, operation: str, purpose: str
     ) -> dict[str, Any]:
+        combined = b"".join(raw_rx)
+        metadata = protected_apdu_metadata(combined, outgoing=False)
+        if metadata.get("protected"):
+            return metadata
         for frame in raw_rx:
             metadata = protected_apdu_metadata(frame, outgoing=False)
             if metadata.get("protected"):

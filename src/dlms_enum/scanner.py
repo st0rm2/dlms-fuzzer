@@ -96,11 +96,33 @@ def _association_version(objects: list[Any]) -> int:
     return 2
 
 
-def _access_details(target: Any, attribute_id: int, association_version: int) -> tuple[bool, str]:
+def _attribute_access_rights(
+    target: Any, attribute_id: int, association_version: int
+) -> dict[str, Any]:
     if association_version >= 3:
         mode = int(target.getAccess3(attribute_id))
         base = mode & 0x03
-        return base in (1, 3), f"access3:0x{mode:02X}"
+        requirements = [
+            name
+            for bit, name in (
+                (0x04, "authenticated_request"),
+                (0x08, "encrypted_request"),
+                (0x10, "digitally_signed_request"),
+                (0x20, "authenticated_response"),
+                (0x40, "encrypted_response"),
+                (0x80, "digitally_signed_response"),
+            )
+            if mode & bit
+        ]
+        return {
+            "advertised": True,
+            "read": base in (1, 3),
+            "write": base in (2, 3),
+            "requires_authentication": bool(mode & 0x04),
+            "requirements": requirements,
+            "mode": f"access3:0x{mode:02X}",
+            "raw": mode,
+        }
     mode = int(target.getAccess(attribute_id))
     names = {
         0: "none",
@@ -111,10 +133,25 @@ def _access_details(target: Any, attribute_id: int, association_version: int) ->
         5: "authenticated_write",
         6: "authenticated_read_write",
     }
-    return mode in (1, 3, 4, 6), names.get(mode, f"mode_{mode}")
+    return {
+        "advertised": True,
+        "read": mode in (1, 3, 4, 6),
+        "write": mode in (2, 3, 5, 6),
+        "requires_authentication": mode in (4, 5, 6),
+        "requirements": ["authenticated_request"] if mode in (4, 5, 6) else [],
+        "mode": names.get(mode, f"mode_{mode}"),
+        "raw": mode,
+    }
 
 
-def _advertised_attributes(target: Any, association_version: int) -> dict[int, str]:
+def _access_details(target: Any, attribute_id: int, association_version: int) -> tuple[bool, str]:
+    """Retain the historical readable/mode helper for internal callers."""
+
+    rights = _attribute_access_rights(target, attribute_id, association_version)
+    return bool(rights["read"]), str(rights["mode"])
+
+
+def _advertised_attributes(target: Any, association_version: int) -> dict[int, dict[str, Any]]:
     explicit = {int(item.index) for item in getattr(target, "attributes", ())}
     explicit.add(1)  # the logical-name attribute is implicitly readable
     if len(explicit) == 1:
@@ -122,15 +159,15 @@ def _advertised_attributes(target: Any, association_version: int) -> dict[int, s
             explicit.update(range(1, int(target.getAttributeCount()) + 1))
         except Exception:
             pass
-    readable: dict[int, str] = {}
+    advertised: dict[int, dict[str, Any]] = {}
     for attribute_id in sorted(explicit):
-        allowed, access = _access_details(target, attribute_id, association_version)
-        if allowed:
-            readable[attribute_id] = access
-    return readable
+        advertised[attribute_id] = _attribute_access_rights(
+            target, attribute_id, association_version
+        )
+    return advertised
 
 
-def _ordered_attribute_ids(target: Any, attributes: dict[int, str]) -> list[int]:
+def _ordered_attribute_ids(target: Any, attributes: dict[int, Any]) -> list[int]:
     """Honor interface-class read order (notably scaler/unit before value)."""
 
     preferred: list[int] = []
@@ -143,7 +180,70 @@ def _ordered_attribute_ids(target: Any, attributes: dict[int, str]) -> list[int]
     return ordered
 
 
-def _object_record(target: Any, sources: set[str]) -> dict[str, Any]:
+def _method_name(target: Any, method_id: int) -> str | None:
+    try:
+        names = target.getMethodNames()
+    except Exception:
+        return None
+    if 0 < method_id <= len(names):
+        return str(names[method_id - 1])
+    return None
+
+
+def _method_access_rights(item: Any, association_version: int) -> dict[str, Any]:
+    if association_version >= 3:
+        mode = int(getattr(item, "methodAccess3", 0))
+        requirements = [
+            name
+            for bit, name in (
+                (0x04, "authenticated_request"),
+                (0x08, "encrypted_request"),
+                (0x10, "digitally_signed_request"),
+                (0x40, "encrypted_response"),
+                (0x80, "digitally_signed_response"),
+            )
+            if mode & bit
+        ]
+        return {
+            "action": bool(mode & 0x01),
+            "requires_authentication": bool(mode & 0x04),
+            "requirements": requirements,
+            "mode": f"method_access3:0x{mode:02X}",
+            "raw": mode,
+        }
+    mode = int(getattr(item, "methodAccess", 0))
+    return {
+        "action": mode in (1, 2),
+        "requires_authentication": mode == 2,
+        "requirements": ["authenticated_request"] if mode == 2 else [],
+        "mode": {
+            0: "none",
+            1: "access",
+            2: "authenticated_access",
+        }.get(mode, f"mode_{mode}"),
+        "raw": mode,
+    }
+
+
+def _object_record(
+    target: Any, sources: set[str], association_version: int
+) -> dict[str, Any]:
+    methods = []
+    for item in getattr(target, "methodAttributes", ()):
+        method_id = int(item.index)
+        rights = _method_access_rights(item, association_version)
+        methods.append(
+            {
+                "method_id": method_id,
+                "name": _method_name(target, method_id),
+                "advertised_access": rights["mode"],
+                "access_rights": rights,
+                "advertised_operations": ["ACTION"] if rights["action"] else [],
+                "status": "advertised" if rights["action"] else "not_advertised",
+                "tested": False,
+                "note": "Passive Association View evidence; ACTION was not sent",
+            }
+        )
     return {
         "class_id": int(target.objectType),
         "class_name": _class_name(target),
@@ -152,18 +252,7 @@ def _object_record(target: Any, sources: set[str]) -> dict[str, Any]:
         "description": str(getattr(target, "description", "") or ""),
         "discovery_sources": sorted(sources),
         "attributes": [],
-        "methods": [
-            {
-                "method_id": int(item.index),
-                "advertised_access": {
-                    "legacy": str(getattr(item, "methodAccess", "")),
-                    "version3": str(getattr(item, "methodAccess3", "")),
-                },
-                "status": "discovered",
-                "note": "ACTION testing is deferred",
-            }
-            for item in getattr(target, "methodAttributes", ())
-        ],
+        "methods": methods,
     }
 
 
@@ -520,11 +609,48 @@ def scan_public(
                 else:
                     inventory[key]["sources"].add("common_catalogue")
                 for attribute_id in entry.attributes:
-                    inventory[key]["attributes"].setdefault(attribute_id, "catalogue_probe")
+                    rights = inventory[key]["attributes"].get(attribute_id)
+                    if rights is None:
+                        inventory[key]["attributes"][attribute_id] = {
+                            "advertised": False,
+                            "read": True,
+                            "write": False,
+                            "requires_authentication": False,
+                            "requirements": [],
+                            "mode": "catalogue_probe",
+                            "raw": None,
+                            "catalogue_probe": True,
+                        }
+                    else:
+                        # Preserve the Association View rights while retaining
+                        # the pre-existing, read-only common-catalogue probe.
+                        rights["catalogue_probe"] = True
+
+        if config.scan.object_limit is not None:
+            scan_items = list(inventory.items())[: config.scan.object_limit]
+            progress(
+                {
+                    "phase": "short_test_selected",
+                    "profile": profile_name,
+                    "object_limit": config.scan.object_limit,
+                    "association_view_objects": len(objects),
+                    "selected_objects": len(scan_items),
+                    "message": (
+                        f"Short test: scanning the first {len(scan_items)} of "
+                        f"{len(objects)} Association View objects"
+                    ),
+                }
+            )
+        else:
+            scan_items = sorted(inventory.items(), key=lambda pair: pair[0])
 
         planned_attributes = sum(
-            len(_ordered_attribute_ids(item["target"], item["attributes"]))
-            for item in inventory.values()
+            sum(
+                bool(rights.get("read"))
+                or bool(rights.get("catalogue_probe"))
+                for rights in item["attributes"].values()
+            )
+            for _, item in scan_items
         )
         progress(
             {
@@ -544,10 +670,20 @@ def scan_public(
             "identification": {},
             "association_view_object_count": len(objects),
             "association_view_attempt_count": association_view_attempts,
+            "scan_scope": {
+                "short_test": config.scan.object_limit is not None,
+                "object_limit": config.scan.object_limit,
+                "association_view_objects": len(objects),
+                "inventory_objects": len(inventory),
+                "selected_objects": len(scan_items),
+            },
             "objects": object_records,
             "summary": {
                 "objects": 0,
                 "association_view_objects": len(objects),
+                "inventory_objects": len(inventory),
+                "selected_objects": len(scan_items),
+                "object_limit": config.scan.object_limit,
                 "get_attempted": 0,
                 "get_transmissions": 0,
                 "get_success": 0,
@@ -556,9 +692,9 @@ def scan_public(
         }
         report["profiles"].append(profile_result)
         get_transmissions = 0
-        for (class_id, logical_name), item in sorted(inventory.items(), key=lambda pair: pair[0]):
+        for (class_id, logical_name), item in scan_items:
             target = item["target"]
-            object_result = _object_record(target, item["sources"])
+            object_result = _object_record(target, item["sources"], version)
             object_records.append(object_result)
             profile_result["summary"]["objects"] = len(object_records)
             if object_result["class_name"] == "GXDLMSObject":
@@ -572,7 +708,12 @@ def scan_public(
                     }
                 )
             for attribute_id in _ordered_attribute_ids(target, item["attributes"]):
-                advertised_access = item["attributes"][attribute_id]
+                access_rights = item["attributes"][attribute_id]
+                advertised_operations = []
+                if access_rights.get("advertised", True) and access_rights.get("read"):
+                    advertised_operations.append("GET")
+                if access_rights.get("write"):
+                    advertised_operations.append("SET")
                 identity = {
                     "profile": profile_name,
                     "class_id": class_id,
@@ -583,13 +724,26 @@ def scan_public(
                 attribute_result: dict[str, Any] = {
                     "attribute_id": attribute_id,
                     "name": _attribute_name(target, attribute_id),
-                    "advertised_access": advertised_access,
+                    "advertised_access": access_rights.get("mode", "unknown"),
+                    "access_rights": access_rights,
+                    "advertised_operations": advertised_operations,
+                    "write_service": "SET" if access_rights.get("write") else None,
+                    "write_tested": False,
                     "lifecycle": "discovered",
                     "outcome": None,
                     "attempt_count": 0,
                     "attempts": [],
                 }
                 object_result["attributes"].append(attribute_result)
+
+                # Preserve write-only attributes as passive Association View
+                # capabilities, but never issue a modifying SET during enumeration.
+                if not (
+                    access_rights.get("read")
+                    or access_rights.get("catalogue_probe")
+                ):
+                    attribute_result["lifecycle"] = "not_readable"
+                    continue
 
                 # Attribute 2 of Association LN has already been read to build
                 # this inventory. Preserve it as a successful GET without
@@ -737,6 +891,16 @@ def scan_public(
                 "get_transmissions": get_transmissions,
                 "get_success": get_success,
                 "get_failed": get_failed,
+                "advertised_set_attributes": sum(
+                    bool(attribute.get("access_rights", {}).get("write"))
+                    for obj in object_records
+                    for attribute in obj.get("attributes", [])
+                ),
+                "advertised_action_methods": sum(
+                    bool(method.get("access_rights", {}).get("action"))
+                    for obj in object_records
+                    for method in obj.get("methods", [])
+                ),
             }
         )
         report["run"]["status"] = (
@@ -770,8 +934,9 @@ def scan_public(
         for profile in report.get("profiles", []):
             for obj in profile.get("objects", []):
                 for attribute in obj.get("attributes", []):
-                    matrix.append(
-                        {
+                    rights = attribute.get("access_rights", {})
+                    if rights.get("read", True) or rights.get("catalogue_probe"):
+                        matrix.append({
                             "operation": "GET",
                             "class_id": obj["class_id"],
                             "logical_name": obj["logical_name"],
@@ -781,10 +946,47 @@ def scan_public(
                                 profile["name"]: {
                                     "outcome": attribute.get("outcome"),
                                     "success": attribute.get("outcome") == Outcome.SUCCESS.value,
+                                    "advertised": bool(
+                                        rights.get("advertised", True)
+                                        and rights.get("read", True)
+                                    ),
+                                    "tested": attribute.get("attempt_count", 0) > 0,
                                 }
                             },
-                        }
-                    )
+                        })
+                    if rights.get("write"):
+                        matrix.append({
+                            "operation": "SET",
+                            "class_id": obj["class_id"],
+                            "logical_name": obj["logical_name"],
+                            "object_version": obj["object_version"],
+                            "attribute_id": attribute["attribute_id"],
+                            "profiles": {
+                                profile["name"]: {
+                                    "advertised": True,
+                                    "tested": False,
+                                    "outcome": None,
+                                    "success": None,
+                                }
+                            },
+                        })
+                for method in obj.get("methods", []):
+                    if method.get("access_rights", {}).get("action"):
+                        matrix.append({
+                            "operation": "ACTION",
+                            "class_id": obj["class_id"],
+                            "logical_name": obj["logical_name"],
+                            "object_version": obj["object_version"],
+                            "method_id": method["method_id"],
+                            "profiles": {
+                                profile["name"]: {
+                                    "advertised": True,
+                                    "tested": False,
+                                    "outcome": None,
+                                    "success": None,
+                                }
+                            },
+                        })
         report["capability_matrix"] = matrix
         report["run"]["finished_at"] = utc_now()
     return report

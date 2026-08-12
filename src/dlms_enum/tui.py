@@ -95,6 +95,7 @@ class ScanUI:
             "secure_association",
             "hls_authentication",
             "association_view",
+            "short_test_selected",
         }:
             labels = {
                 "server_address_detection": "Discovery",
@@ -104,6 +105,7 @@ class ScanUI:
                 "secure_association": "HLS-GMAC",
                 "hls_authentication": "HLS-GMAC",
                 "association_view": "Inventory",
+                "short_test_selected": "Short test",
             }
             self._update(stage=labels[phase], description=message)
             return
@@ -181,6 +183,11 @@ def interactive_config(console: Console | None = None) -> AppConfig:
     if strategy == "fixed":
         baudrate = IntPrompt.ask("Baud rate", default=9600, console=console)
     console.print("Scan mode: [bold]Mode 1 — GET only[/bold]")
+    short_test = Confirm.ask(
+        "Run a short test (first 10 objects after full Association View discovery)",
+        default=False,
+        console=console,
+    )
     profile_name = Prompt.ask(
         "Profile", choices=("public", "hls_gmac_suite0"), default="public", console=console
     )
@@ -228,7 +235,13 @@ def interactive_config(console: Console | None = None) -> AppConfig:
         {
             "version": 1,
             "transport": {"type": "serial_hdlc", "device": device, "baudrate": baudrate},
-            "scan": {"mode": "get", "total_get_attempts": 2, "association_view_first": True, "common_catalogue": True},
+            "scan": {
+                "mode": "get",
+                "total_get_attempts": 2,
+                "association_view_first": True,
+                "common_catalogue": True,
+                "object_limit": 10 if short_test else None,
+            },
             "profiles": [profile],
             "output": {
                 "directory": "./runs",

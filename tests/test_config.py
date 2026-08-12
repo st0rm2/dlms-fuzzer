@@ -61,6 +61,26 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
+    def test_short_scan_object_limit_is_validated(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "scan": {"object_limit": 10},
+            }
+        )
+        self.assertEqual(config.scan.object_limit, 10)
+
+        for invalid in (0, True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ConfigError, "scan.object_limit"
+            ):
+                parse_config(
+                    {
+                        "transport": {"device": "/dev/null"},
+                        "scan": {"object_limit": invalid},
+                    }
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

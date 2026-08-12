@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.console import Console
+from rich.prompt import Confirm
 
 from .catalogues import COMMON_OBIS, catalogue_names
-from .config import ConfigError, load_config
+from .config import ConfigError, load_config, with_object_limit
 from .reporter import load_report, summary_lines, write_report
 from .scanner import scan
 from .traffic_logger import TrafficLogger
@@ -22,6 +24,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     scan_parser = subparsers.add_parser("scan", help="run a public or secure GET-only scan")
     scan_parser.add_argument("--config", type=Path, help="YAML configuration; omit for guided setup")
+    scope = scan_parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--short",
+        action="store_true",
+        help="read the full Association View, then scan only its first 10 objects",
+    )
+    scope.add_argument(
+        "--full",
+        action="store_true",
+        help="scan all discovered objects without asking about a short test",
+    )
     validate = subparsers.add_parser("validate-config", help="validate a YAML configuration")
     validate.add_argument("config", type=Path)
     subparsers.add_parser("list-catalogues", help="list built-in catalogue data")
@@ -44,6 +57,18 @@ def _run_directory(base: str) -> Path:
 
 def _scan(args: argparse.Namespace, console: Console) -> int:
     config = load_config(args.config) if args.config else interactive_config(console)
+    if args.short:
+        config = with_object_limit(config, 10)
+    elif args.full:
+        config = with_object_limit(config, None)
+    elif args.config and config.scan.object_limit is None and console.is_terminal and sys.stdin.isatty():
+        short_test = Confirm.ask(
+            "Run a short test (scan only the first 10 objects after reading the full Association View)",
+            default=False,
+            console=console,
+        )
+        if short_test:
+            config = with_object_limit(config, 10)
     for warning in config.warnings:
         console.print(f"[yellow]Warning:[/yellow] {warning}")
     run_directory = _run_directory(config.output.directory)
