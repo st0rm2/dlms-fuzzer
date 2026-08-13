@@ -28,6 +28,32 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
+    def test_unimplemented_manufacturer_catalogue_is_rejected(self):
+        with self.assertRaisesRegex(ConfigError, "unsupported keys"):
+            parse_config(
+                {
+                    "transport": {"device": "/dev/null"},
+                    "scan": {"manufacturer_catalogue": "auto"},
+                }
+            )
+
+    def test_union_profile_test_requires_a_secure_profile(self):
+        with self.assertRaisesRegex(ConfigError, "requires an hls_gmac_suite0 profile"):
+            parse_config(
+                {
+                    "transport": {"device": "/dev/null"},
+                    "scan": {"union_profile_test": True},
+                }
+            )
+
+        with self.assertRaisesRegex(ConfigError, "scan.union_profile_test must be boolean"):
+            parse_config(
+                {
+                    "transport": {"device": "/dev/null"},
+                    "scan": {"union_profile_test": 1},
+                }
+            )
+
     def test_get_retry_budget_is_exactly_two_total_attempts(self):
         with self.assertRaisesRegex(ConfigError, "scan.total_get_attempts"):
             parse_config(

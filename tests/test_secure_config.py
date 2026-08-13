@@ -47,6 +47,14 @@ class SecureConfigTests(unittest.TestCase):
         self.assertEqual(snapshot["profiles"][0]["security"]["suite"], 0)
         self.assertEqual(snapshot["profiles"][0]["security"]["policy"], "authentication_encryption")
 
+    def test_secure_profile_can_enable_public_union_testing(self):
+        mapping = secure_mapping()
+        mapping["scan"] = {"union_profile_test": True}
+
+        config = parse_config(mapping)
+
+        self.assertTrue(config.scan.union_profile_test)
+
     def test_exact_system_title_and_key_lengths_are_required(self):
         for title in ("hex:0011", "hex:001122334455667788"):
             with self.subTest(title=title), self.assertRaisesRegex(ConfigError, "exactly 8 bytes"):

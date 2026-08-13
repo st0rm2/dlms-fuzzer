@@ -1,6 +1,6 @@
 # DLMS Smart Meter Enumeration Tool
 
-`dlms-enum` performs authorized, read-only DLMS/COSEM discovery over direct serial HDLC. It supports either an unauthenticated public association or an HLS-GMAC Security Suite 0 association with authenticated-and-encrypted xDLMS traffic. Both profiles use logical-name referencing, read the Association LN object list, supplement it with a conservative OBIS catalogue, perform GET operations only, and write a canonical JSON report plus side-by-side JSONL traffic.
+`dlms-enum` performs authorized, read-only DLMS/COSEM discovery over direct serial HDLC. It supports either an unauthenticated public association or an HLS-GMAC Security Suite 0 association with authenticated-and-encrypted xDLMS traffic. Both profiles use logical-name referencing, read the Association LN object list, supplement it with a conservative OBIS catalogue, perform GET operations only, and write a canonical JSON report plus side-by-side JSONL traffic. Secure scans can additionally retest authenticated-only targets through the public client to identify unadvertised public access.
 
 The secure profile uses Gurux DLMS 1.0.201 for HLS-GMAC and AES-GCM. It does not implement cryptography itself. Association View access rights for SET and ACTION are reported passively, but no modifying SET, arbitrary ACTION, key transfer, key rotation, password authentication, manufacturer catalogue, or fuzzing is performed. The sole ACTION sent is Association LN method 1, which is required to complete HLS authentication.
 
@@ -78,6 +78,19 @@ The secure profile name fixes the following behavior:
 - automatic baud and one-byte/two-byte HDLC server-address discovery;
 - protected GET requests and responses after HLS succeeds.
 
+### Public cross-profile access test
+
+Enable the additional read-only access-control check in a secure configuration:
+
+```yaml
+scan:
+  union_profile_test: true
+```
+
+The bootstrap public association first supplies its Association View. After the authenticated scan is complete and its protected association is closed, the tool opens a fresh public association and directly addresses each authenticated-readable `(class_id, logical_name, attribute_id)` target that was not advertised as publicly readable. Common-catalogue guesses are excluded: candidates must come from the authenticated Association View.
+
+A successful public GET is reported as `UNEXPECTED_PUBLIC_ACCESS`. An explicit DLMS error is `PUBLIC_ACCESS_REJECTED`; a timeout, transport failure, or malformed response is `INCONCLUSIVE`. SET and arbitrary ACTION are never attempted. These cross-profile probes have their own counts and are intentionally outside `object_limit` and `get_limit`, because those limits apply to the primary authenticated scan.
+
 Credential meanings:
 
 - `client_address` is the authenticated client SAP assigned by the meter's access-control configuration.
@@ -110,16 +123,19 @@ Raw wire logging contains ciphertext, protocol identifiers, system titles, and t
 The implementation performs endpoint discovery before constructing any ciphered client:
 
 1. Open HDLC with public client SAP 16 and establish a public association.
-2. Read the public logical-device identity and invocation-counter object.
-3. Release the public application association, disconnect HDLC, and close serial media.
-4. Lock the persistent counter record and choose a counter strictly greater than the meter value.
-5. Open a fresh HDLC link with the authenticated client SAP.
-6. Send an AARQ containing `glo-initiate-request` (`21`) using HIGH_GMAC, Suite 0, and authentication plus encryption.
-7. Parse AARE, authenticate/decrypt `glo-initiate-response` (`28`), and obtain the server system title.
-8. Generate the Association LN authentication ACTION with Gurux; transmit `glo-action-request` (`CB`).
-9. Authenticate/decrypt `glo-action-response` (`CF`) and validate it with `parseApplicationAssociationResponse`.
-10. Only after HLS validation, send `glo-get-request` (`C8`) and accept authenticated/decrypted `glo-get-response` (`CC`).
-11. Attempt protected `RLRQ → RLRE`, then `DISC → UA`, and close serial media.
+2. When `union_profile_test` is enabled, read and retain the public Association View.
+3. Read the public logical-device identity and invocation-counter object.
+4. Release the public application association, disconnect HDLC, and close serial media.
+5. Lock the persistent counter record and choose a counter strictly greater than the meter value.
+6. Open a fresh HDLC link with the authenticated client SAP.
+7. Send an AARQ containing `glo-initiate-request` (`21`) using HIGH_GMAC, Suite 0, and authentication plus encryption.
+8. Parse AARE, authenticate/decrypt `glo-initiate-response` (`28`), and obtain the server system title.
+9. Generate the Association LN authentication ACTION with Gurux; transmit `glo-action-request` (`CB`).
+10. Authenticate/decrypt `glo-action-response` (`CF`) and validate it with `parseApplicationAssociationResponse`.
+11. Only after HLS validation, send `glo-get-request` (`C8`) and accept authenticated/decrypted `glo-get-response` (`CC`).
+12. Attempt protected `RLRQ → RLRE`, then `DISC → UA`, and close the secure media.
+13. When enabled and additional targets exist, open a fresh public association and issue the cross-profile GET probes.
+14. Release the public association, disconnect HDLC, and close serial media.
 
 The secure session refuses an LLC-wrapped plaintext `C0` GET before it can be sent. This prevents the regression where a structurally successful HLS exchange is followed by plaintext GETs and meter exception `D8 01 01`.
 
@@ -175,8 +191,8 @@ Serial framing, response timeout, inter-request delay, and session guard remain 
 
 Each run gets a UTC-named directory under `./runs` unless overridden:
 
-- `report.json` contains the selected endpoint, addressing type, redacted effective configuration, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, a complete per-role GET/SET/ACTION capability matrix, cleanup warnings, and a traffic-file hash. Each matrix row is `SUCCESS`, a normalized failure category, or `NOT_TESTED`.
-- `summary.md` is the human-readable report. It contains connection and role details, a decoded OBIS table, and the complete operation capability matrix. In secure scans the decoded table places the encrypted RX payload immediately to the right of the encoded value; only ciphertext is shown, without HDLC framing, security control, invocation counter, authentication tag, or CRC. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent. The separate protected-APDU table retains command, counter, ciphertext, and authentication-tag evidence.
+- `report.json` contains the selected endpoint, addressing type, redacted effective configuration, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, optional public cross-profile findings, a complete per-role GET/SET/ACTION capability matrix, cleanup warnings, and a traffic-file hash. Each matrix row is `SUCCESS`, a normalized failure category, or `NOT_TESTED`.
+- `summary.md` is the human-readable report. It contains connection and role details, a decoded OBIS table, the public cross-profile access findings when enabled, and the complete operation capability matrix. In secure scans the decoded table places the encrypted RX payload immediately to the right of the encoded value; only ciphertext is shown, without HDLC framing, security control, invocation counter, authentication tag, or CRC. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent. The separate protected-APDU table retains command, counter, ciphertext, and authentication-tag evidence.
 - `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators.
 
 GET uses at most two attempts. Explicit DLMS errors such as access denied are not retried. Timeouts, transport failures, and malformed responses can receive one retry; each protected retry gets a new persisted invocation counter.
@@ -207,4 +223,4 @@ python -m dlms_enum validate-config examples/hls-gmac-suite0-meter.yaml
 
 Protocol tests use fakes, the real Gurux request generator, and sanitized structural expectations derived from the supplied captures; they need no physical meter and embed no keys. Live validation is still required for the target meter, particularly its role provisioning, counter object access, server system title, association-view size, and protected-release behavior.
 
-This release accepts exactly one scan profile (role) per run: either `public` or `hls_gmac_suite0`. Run each role separately to obtain its role-specific Association View rights, then compare the reports. Running both profiles together without duplicate public discovery is deferred. Security Suites 1/2, dedicated keys, signing, key agreement, key management, and arbitrary ACTION/SET execution are intentionally unsupported.
+This release accepts exactly one primary scan profile per run: either `public` or `hls_gmac_suite0`. A secure run can also perform the bounded public cross-profile test described above, but it does not perform a complete second public scan. Security Suites 1/2, dedicated keys, signing, key agreement, key management, and arbitrary ACTION/SET execution are intentionally unsupported.

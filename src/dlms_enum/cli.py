@@ -11,7 +11,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.prompt import Confirm
 
-from .catalogues import COMMON_OBIS, catalogue_names
+from .catalogues import COMMON_OBIS
 from .config import ConfigError, load_config, with_get_limit, with_object_limit
 from .reporter import load_report, summary_lines, write_report
 from .scanner import scan
@@ -52,10 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _run_directory(base: str) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
-    candidate = Path(base) / stamp
+    base_path = Path(base)
+    candidate = base_path / stamp
     suffix = 1
     while candidate.exists():
-        candidate = Path(base) / f"{stamp}-{suffix}"
+        candidate = base_path / f"{stamp}-{suffix}"
         suffix += 1
     candidate.mkdir(parents=True)
     return candidate
@@ -124,8 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             console.print_json(json.dumps(config.redacted_dict()))
             return 0
         if args.command == "list-catalogues":
-            for name in catalogue_names():
-                console.print(f"{name}: {len(COMMON_OBIS)} entries")
+            console.print(f"common: {len(COMMON_OBIS)} entries")
             return 0
         if args.command == "report":
             report = load_report(args.path)

@@ -12,7 +12,7 @@ from typing import Any
 
 from . import __version__
 from .catalogues import COMMON_OBIS
-from .config import AppConfig, SecureProfile, resolve_secure_keys
+from .config import AppConfig, SERVER_ADDRESSING_TYPES, SecureProfile, resolve_secure_keys
 from .counter_state import acquire_counter_lease, counter_identity
 from .result_model import Outcome, classify_exception, enum_name, error_record, utc_now
 
@@ -144,13 +144,6 @@ def _attribute_access_rights(
     }
 
 
-def _access_details(target: Any, attribute_id: int, association_version: int) -> tuple[bool, str]:
-    """Retain the historical readable/mode helper for internal callers."""
-
-    rights = _attribute_access_rights(target, attribute_id, association_version)
-    return bool(rights["read"]), str(rights["mode"])
-
-
 def _advertised_attributes(target: Any, association_version: int) -> dict[int, dict[str, Any]]:
     explicit = {int(item.index) for item in getattr(target, "attributes", ())}
     explicit.add(1)  # the logical-name attribute is implicitly readable
@@ -262,6 +255,248 @@ def _baud_rates(config: AppConfig) -> tuple[int, ...]:
     return (int(config.transport.baudrate),)
 
 
+def _record_cleanup_warnings(
+    report: dict[str, Any], warnings: list[str], *, phase: str
+) -> None:
+    for warning in warnings:
+        report["errors"].append(
+            {
+                "timestamp": utc_now(),
+                "phase": phase,
+                "category": Outcome.PROTOCOL_ERROR.value,
+                "type": "CleanupWarning",
+                "message": warning,
+                "context": {},
+            }
+        )
+
+
+def _discover_association_view(
+    session: Any,
+    config: AppConfig,
+    report: dict[str, Any],
+    progress: ProgressCallback,
+    *,
+    error_phase: str,
+) -> tuple[list[Any], int, BaseException | None]:
+    objects: list[Any] = []
+    last_error: BaseException | None = None
+    attempts = 0
+    for attempt in range(1, config.scan.total_get_attempts + 1):
+        attempts = attempt
+        try:
+            objects = list(session.discover_objects(attempt))
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+            report["errors"].append(
+                error_record(
+                    exc,
+                    phase=error_phase,
+                    context={
+                        "operation": "GET",
+                        "logical_name": "0.0.40.0.0.255",
+                        "attribute_id": 2,
+                        "attempt": attempt,
+                    },
+                )
+            )
+            progress(
+                {
+                    "phase": "association_view_error",
+                    "message": (
+                        f"Association-view attempt {attempt} failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+            )
+            if classify_exception(exc) == Outcome.DLMS_ERROR:
+                break
+    return objects, attempts, last_error
+
+
+def _public_access_rights(
+    objects: list[Any],
+) -> tuple[set[tuple[int, str]], dict[tuple[tuple[int, str], int], dict[str, Any]]]:
+    """Return objects and attribute rights advertised to the public role."""
+
+    version = _association_version(objects)
+    object_keys: set[tuple[int, str]] = set()
+    capabilities: dict[tuple[tuple[int, str], int], dict[str, Any]] = {}
+    for target in objects:
+        key = (int(target.objectType), str(target.logicalName))
+        object_keys.add(key)
+        for attribute_id, rights in _advertised_attributes(target, version).items():
+            capabilities[(key, attribute_id)] = rights
+    return object_keys, capabilities
+
+
+def _public_union_candidates(
+    inventory: dict[tuple[int, str], dict[str, Any]],
+    public_objects: set[tuple[int, str]],
+    public_capabilities: dict[tuple[tuple[int, str], int], dict[str, Any]],
+    *,
+    source_profile: str,
+) -> list[dict[str, Any]]:
+    """Map authenticated-readable attributes not advertised as publicly readable."""
+
+    candidates: list[dict[str, Any]] = []
+    for key, item in sorted(inventory.items(), key=lambda pair: pair[0]):
+        if "association_view" not in item["sources"]:
+            continue
+        target = item["target"]
+        for attribute_id in _ordered_attribute_ids(target, item["attributes"]):
+            rights = item["attributes"][attribute_id]
+            if not (rights.get("advertised") and rights.get("read")):
+                continue
+            public_rights = public_capabilities.get((key, attribute_id))
+            if (
+                public_rights is not None
+                and public_rights.get("read")
+                and not public_rights.get("requirements")
+            ):
+                continue
+            candidates.append(
+                {
+                    "class_id": key[0],
+                    "logical_name": key[1],
+                    "object_version": int(getattr(target, "version", 0)),
+                    "attribute_id": attribute_id,
+                    "name": _attribute_name(target, attribute_id),
+                    "source_profiles": [source_profile],
+                    "source_advertised_access": rights["mode"],
+                    "public_object_advertised": key in public_objects,
+                    "public_advertised_access": (
+                        public_rights.get("mode") if public_rights else None
+                    ),
+                    "public_advertised": public_rights is not None,
+                }
+            )
+    return candidates
+
+
+def _run_public_union_gets(
+    session: Any,
+    candidates: list[dict[str, Any]],
+    config: AppConfig,
+    report: dict[str, Any],
+    progress: ProgressCallback,
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    unexpected_access = rejected = inconclusive = transmissions = 0
+    progress(
+        {
+            "phase": "public_union_plan",
+            "total": len(candidates),
+            "message": f"Testing {len(candidates)} additional authenticated GET targets as public",
+        }
+    )
+    for candidate in candidates:
+        result = {**candidate, "attempt_count": 0, "attempts": []}
+        target = session.create_object(candidate["class_id"], candidate["logical_name"])
+        last_exception: BaseException | None = None
+        for attempt in range(1, config.scan.total_get_attempts + 1):
+            transmissions += 1
+            result["attempt_count"] = attempt
+            progress(
+                {
+                    "phase": "public_union_get",
+                    **candidate,
+                    "attempt": attempt,
+                    "message": (
+                        f"Public GET {candidate['logical_name']} class {candidate['class_id']} "
+                        f"attribute {candidate['attribute_id']} ({attempt}/{config.scan.total_get_attempts})"
+                    ),
+                }
+            )
+            try:
+                decoded = session.read_attribute(
+                    target,
+                    candidate["attribute_id"],
+                    attempt,
+                    phase="public_union_test",
+                    purpose="cross_profile_access_test",
+                )
+            except Exception as exc:
+                last_exception = exc
+                outcome = classify_exception(exc)
+                result["attempts"].append(
+                    {
+                        "attempt": attempt,
+                        "outcome": outcome.value,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                if outcome == Outcome.DLMS_ERROR:
+                    break
+                continue
+            result.update(
+                {
+                    "outcome": Outcome.SUCCESS.value,
+                    "access_assessment": "UNEXPECTED_PUBLIC_ACCESS",
+                    "unexpected_public_access": True,
+                    "decoded": decoded,
+                }
+            )
+            result["attempts"].append(
+                {"attempt": attempt, "outcome": Outcome.SUCCESS.value}
+            )
+            last_exception = None
+            unexpected_access += 1
+            break
+
+        if last_exception is not None:
+            outcome = classify_exception(last_exception)
+            result.update(
+                {
+                    "outcome": outcome.value,
+                    "access_assessment": (
+                        "PUBLIC_ACCESS_REJECTED"
+                        if outcome == Outcome.DLMS_ERROR
+                        else "INCONCLUSIVE"
+                    ),
+                    "unexpected_public_access": False,
+                    "error": f"{type(last_exception).__name__}: {last_exception}",
+                }
+            )
+            if outcome == Outcome.DLMS_ERROR:
+                rejected += 1
+            else:
+                inconclusive += 1
+                report["errors"].append(
+                    error_record(
+                        last_exception,
+                        phase="public_union_test",
+                        context={
+                            "operation": "GET",
+                            "class_id": candidate["class_id"],
+                            "logical_name": candidate["logical_name"],
+                            "attribute_id": candidate["attribute_id"],
+                        },
+                    )
+                )
+        results.append(result)
+        progress(
+            {
+                "phase": "public_union_complete",
+                **candidate,
+                "outcome": result["outcome"],
+            }
+        )
+
+    return {
+        "status": "inconclusive" if inconclusive else "completed",
+        "candidate_gets": len(candidates),
+        "attempted_gets": len(results),
+        "get_transmissions": transmissions,
+        "unexpected_public_access": unexpected_access,
+        "public_access_rejected": rejected,
+        "inconclusive": inconclusive,
+        "results": results,
+    }
+
+
 def _server_address_candidates(config: AppConfig) -> tuple[dict[str, Any], ...]:
     """Return bounded one- and two-byte server-address forms to probe."""
 
@@ -293,7 +528,6 @@ def _server_address_candidates(config: AppConfig) -> tuple[dict[str, Any], ...]:
 
     unique: list[dict[str, Any]] = []
     seen: set[tuple[int, int, int]] = set()
-    labels = {1: "1-byte addressing", 2: "2-Byte addressing", 4: "4-byte addressing"}
     for candidate_logical, candidate_physical, address_size in candidates:
         identity = (candidate_logical, candidate_physical, address_size)
         if identity in seen:
@@ -306,7 +540,7 @@ def _server_address_candidates(config: AppConfig) -> tuple[dict[str, Any], ...]:
                 "physical_address": candidate_physical,
                 "server_address": (candidate_logical << shift) | candidate_physical,
                 "address_size": address_size,
-                "server_addressing_type": labels[address_size],
+                "server_addressing_type": SERVER_ADDRESSING_TYPES[address_size],
             }
         )
     return tuple(unique)
@@ -343,13 +577,20 @@ def scan_public(
         },
         "profiles": [],
         "capability_matrix": [],
+        "public_union_test": {
+            "enabled": config.scan.union_profile_test,
+            "status": "pending" if config.scan.union_profile_test else "disabled",
+        },
         "unknown_objects": [],
         "errors": [],
     }
     session = None
+    secure_session = None
     counter_lease = None
     association: dict[str, Any] = {}
     objects: list[Any] = []
+    public_objects: set[tuple[int, str]] | None = None
+    public_capabilities: dict[tuple[tuple[int, str], int], dict[str, Any]] | None = None
 
     try:
         validate_serial_device(config.transport.device)
@@ -383,7 +624,7 @@ def scan_public(
                     candidate_arguments.update(
                         {
                             "client_address": config.profile.invocation_counter.public_client_address,
-                            "profile_name": config.profile.name,
+                            "profile_name": "public",
                         }
                     )
                 candidate = GuruxSession(config, baudrate, traffic, **candidate_arguments)
@@ -483,6 +724,42 @@ def scan_public(
                     "message": "Reading meter identity and invocation counter through the public association",
                 }
             )
+            if config.scan.union_profile_test:
+                progress(
+                    {
+                        "phase": "public_union_inventory",
+                        "message": "Reading the public Association View for cross-profile comparison",
+                    }
+                )
+                public_view_objects, public_view_attempts, public_view_error = (
+                    _discover_association_view(
+                        bootstrap_session,
+                        config,
+                        report,
+                        progress,
+                        error_phase="public_union_reconnaissance",
+                    )
+                )
+                if public_view_error is None:
+                    public_objects, public_capabilities = _public_access_rights(
+                        public_view_objects
+                    )
+                    report["public_union_test"].update(
+                        {
+                            "status": "inventory_complete",
+                            "public_association": association.copy(),
+                            "public_association_view_objects": len(public_view_objects),
+                            "public_association_view_attempts": public_view_attempts,
+                        }
+                    )
+                else:
+                    report["public_union_test"].update(
+                        {
+                            "status": "public_inventory_failed",
+                            "error": f"{type(public_view_error).__name__}: {public_view_error}",
+                            "results": [],
+                        }
+                    )
             meter_identity = config.profile.invocation_counter.meter_identity
             if meter_identity is None:
                 meter_identity = bootstrap_session.read_meter_identity()
@@ -509,17 +786,11 @@ def scan_public(
                         "message": "Public counter read failed; using the explicitly configured unsafe override",
                     }
                 )
-            for warning in bootstrap_session.close():
-                report["errors"].append(
-                    {
-                        "timestamp": utc_now(),
-                        "phase": "public_bootstrap_finalization",
-                        "category": "PROTOCOL_ERROR",
-                        "type": "CleanupWarning",
-                        "message": warning,
-                        "context": {},
-                    }
-                )
+            _record_cleanup_warnings(
+                report,
+                bootstrap_session.close(),
+                phase="public_bootstrap_finalization",
+            )
             session = None
 
             identity = counter_identity(
@@ -561,31 +832,13 @@ def scan_public(
             }
 
         progress({"phase": "association_view", "message": "Reading Association LN object list"})
-        discovery_error: BaseException | None = None
-        association_view_attempts = 0
-        for attempt in range(1, config.scan.total_get_attempts + 1):
-            association_view_attempts = attempt
-            try:
-                objects = list(session.discover_objects(attempt))
-                discovery_error = None
-                break
-            except Exception as exc:
-                discovery_error = exc
-                report["errors"].append(
-                    error_record(
-                        exc,
-                        phase=f"{profile_name}_reconnaissance",
-                        context={"operation": "GET", "logical_name": "0.0.40.0.0.255", "attribute_id": 2, "attempt": attempt},
-                    )
-                )
-                progress(
-                    {
-                        "phase": "association_view_error",
-                        "message": f"Association-view attempt {attempt} failed: {type(exc).__name__}: {exc}",
-                    }
-                )
-                if classify_exception(exc) == Outcome.DLMS_ERROR:
-                    break
+        objects, association_view_attempts, discovery_error = _discover_association_view(
+            session,
+            config,
+            report,
+            progress,
+            error_phase=f"{profile_name}_reconnaissance",
+        )
         if discovery_error is not None:
             raise RuntimeError(f"association-view discovery failed: {discovery_error}")
 
@@ -628,6 +881,15 @@ def scan_public(
 
         association_order_items = list(inventory.items())
         all_items = sorted(inventory.items(), key=lambda pair: pair[0])
+        union_candidates: list[dict[str, Any]] | None = None
+        if public_objects is not None and public_capabilities is not None:
+            union_candidates = _public_union_candidates(
+                inventory,
+                public_objects,
+                public_capabilities,
+                source_profile=profile_name,
+            )
+            report["public_union_test"]["candidate_gets"] = len(union_candidates)
         all_get_capabilities = [
             (key, attribute_id)
             for key, item in all_items
@@ -759,7 +1021,11 @@ def scan_public(
                         "class_id": class_id,
                         "logical_name": logical_name,
                         "object_version": object_result["object_version"],
-                        "source": "association_view",
+                        "source": (
+                            "association_view"
+                            if "association_view" in item["sources"]
+                            else object_result["discovery_sources"][0]
+                        ),
                     }
                 )
             for attribute_id in _ordered_attribute_ids(target, item["attributes"]):
@@ -972,6 +1238,71 @@ def scan_public(
                 ),
             }
         )
+        if config.scan.union_profile_test and union_candidates == []:
+            report["public_union_test"].update(
+                {
+                    "status": "no_additional_targets",
+                    "attempted_gets": 0,
+                    "get_transmissions": 0,
+                    "unexpected_public_access": 0,
+                    "public_access_rejected": 0,
+                    "inconclusive": 0,
+                    "results": [],
+                }
+            )
+        elif config.scan.union_profile_test and union_candidates is not None:
+            profile_result["association"]["next_client_invocation_counter"] = int(
+                secure_session.client.ciphering.invocationCounter
+            )
+            _record_cleanup_warnings(
+                report,
+                secure_session.close(),
+                phase="secure_profile_finalization",
+            )
+            session = None
+            progress(
+                {
+                    "phase": "public_union_connect",
+                    "message": "Reopening the public association for cross-profile GET tests",
+                }
+            )
+            try:
+                public_probe = GuruxSession(
+                    config,
+                    int(report["transport"]["selected_baudrate"]),
+                    traffic,
+                    server_logical_address=int(endpoint["logical_address"]),
+                    server_physical_address=int(endpoint["physical_address"]),
+                    server_address_size=int(endpoint["address_size"]),
+                    client_address=config.profile.invocation_counter.public_client_address,
+                    profile_name="public",
+                )
+                session = public_probe
+                probe_association = public_probe.connect()
+            except Exception as exc:
+                report["errors"].append(
+                    error_record(exc, phase="public_union_connection")
+                )
+                report["public_union_test"].update(
+                    {
+                        "status": "public_connection_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "results": [],
+                    }
+                )
+            else:
+                report["public_union_test"].update(
+                    {
+                        "public_probe_association": probe_association,
+                        **_run_public_union_gets(
+                            public_probe,
+                            union_candidates,
+                            config,
+                            report,
+                            progress,
+                        ),
+                    }
+                )
         report["run"]["status"] = (
             "completed" if not get_failed and not report["errors"] else "completed_with_errors"
         )
@@ -987,14 +1318,11 @@ def scan_public(
         progress({"phase": "scan_error", "level": "error", "message": error["message"]})
     finally:
         if session is not None:
-            for warning in session.close():
-                report["errors"].append(
-                    {"timestamp": utc_now(), "phase": "finalization", "category": "PROTOCOL_ERROR", "type": "CleanupWarning", "message": warning, "context": {}}
-                )
-            if isinstance(config.profile, SecureProfile) and report.get("profiles"):
-                report["profiles"][0]["association"]["next_client_invocation_counter"] = int(
-                    session.client.ciphering.invocationCounter
-                )
+            _record_cleanup_warnings(report, session.close(), phase="finalization")
+        if secure_session is not None and report.get("profiles"):
+            report["profiles"][0]["association"]["next_client_invocation_counter"] = int(
+                secure_session.client.ciphering.invocationCounter
+            )
         if counter_lease is not None:
             counter_lease.close()
         if report["run"]["status"] == "completed" and report["errors"]:
@@ -1071,6 +1399,31 @@ def scan_public(
                                 }
                             },
                         })
+        get_rows = {
+            (row["class_id"], row["logical_name"], row["attribute_id"]): row
+            for row in matrix
+            if row["operation"] == "GET"
+        }
+        for result in report.get("public_union_test", {}).get("results", []):
+            row = get_rows.get(
+                (
+                    result["class_id"],
+                    result["logical_name"],
+                    result["attribute_id"],
+                )
+            )
+            if row is None:
+                continue
+            row["profiles"]["public"] = {
+                "status": result["outcome"],
+                "outcome": result["outcome"],
+                "success": result["outcome"] == Outcome.SUCCESS.value,
+                "advertised": False,
+                "advertised_access": result.get("public_advertised_access"),
+                "tested": True,
+                "cross_profile_probe": True,
+                "access_assessment": result["access_assessment"],
+            }
         report["capability_matrix"] = matrix
         report["run"]["finished_at"] = utc_now()
     return report

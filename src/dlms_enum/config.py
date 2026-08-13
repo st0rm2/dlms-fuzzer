@@ -11,6 +11,11 @@ from typing import Any, Callable, Mapping
 
 DEFAULT_BAUD_RATES = (9600, 19200, 4800, 2400, 1200, 600, 300, 38400, 57600, 115200)
 SECURE_PROFILE_NAME = "hls_gmac_suite0"
+SERVER_ADDRESSING_TYPES = {
+    1: "1-byte addressing",
+    2: "2-byte addressing",
+    4: "4-byte addressing",
+}
 
 
 class ConfigError(ValueError):
@@ -41,6 +46,7 @@ class ScanConfig:
     total_get_attempts: int = 2
     association_view_first: bool = True
     common_catalogue: bool = True
+    union_profile_test: bool = False
     object_limit: int | None = None
     get_limit: int | None = None
 
@@ -257,22 +263,25 @@ def _parse_scan(raw: Any) -> ScanConfig:
         data,
         {
             "mode", "total_get_attempts", "association_view_first", "common_catalogue",
-            "manufacturer_catalogue", "union_profile_test", "object_limit", "get_limit",
+            "union_profile_test", "object_limit", "get_limit",
         },
         "scan",
     )
     if str(data.get("mode", "get")).lower() != "get":
         raise ConfigError("this release supports only scan.mode: get")
     attempts = _integer(data.get("total_get_attempts", 2), "scan.total_get_attempts", 2, 2)
-    manufacturer = data.get("manufacturer_catalogue", "auto")
-    if manufacturer not in (None, False, "auto"):
-        raise ConfigError("manufacturer catalogues are deferred; use auto, false, or omit the key")
-    if data.get("union_profile_test", True) not in (True, False):
-        raise ConfigError("scan.union_profile_test must be boolean")
-    for key in ("association_view_first", "common_catalogue"):
-        if data.get(key, True) not in (True, False):
+    boolean_defaults = {
+        "association_view_first": True,
+        "common_catalogue": True,
+        "union_profile_test": False,
+    }
+    boolean_values = {
+        key: data.get(key, default) for key, default in boolean_defaults.items()
+    }
+    for key, value in boolean_values.items():
+        if not isinstance(value, bool):
             raise ConfigError(f"scan.{key} must be boolean")
-    if not data.get("association_view_first", True):
+    if not boolean_values["association_view_first"]:
         raise ConfigError("association_view_first must remain true in this release")
     object_limit = data.get("object_limit")
     if object_limit is not None:
@@ -285,7 +294,8 @@ def _parse_scan(raw: Any) -> ScanConfig:
     return ScanConfig(
         total_get_attempts=attempts,
         association_view_first=True,
-        common_catalogue=bool(data.get("common_catalogue", True)),
+        common_catalogue=boolean_values["common_catalogue"],
+        union_profile_test=boolean_values["union_profile_test"],
         object_limit=object_limit,
         get_limit=get_limit,
     )
@@ -511,12 +521,9 @@ def _parse_output(raw: Any) -> OutputConfig:
         if not isinstance(value, str) or not value.strip():
             raise ConfigError(f"output.{key} must be a non-empty path")
         values[key] = value.strip()
-    if Path(values["report_file"]).name != values["report_file"]:
-        raise ConfigError("output.report_file must be a file name, not a path")
-    if Path(values["summary_file"]).name != values["summary_file"]:
-        raise ConfigError("output.summary_file must be a file name, not a path")
-    if Path(values["traffic_file"]).name != values["traffic_file"]:
-        raise ConfigError("output.traffic_file must be a file name, not a path")
+    for key in ("report_file", "summary_file", "traffic_file"):
+        if Path(values[key]).name != values[key]:
+            raise ConfigError(f"output.{key} must be a file name, not a path")
     if data.get("redact_secrets", True) is not True:
         raise ConfigError("output.redact_secrets must remain true")
     return OutputConfig(**values, redact_secrets=True)
@@ -528,10 +535,13 @@ def parse_config(data: Any, *, base_directory: str | Path | None = None) -> AppC
     profile, warnings = _parse_profile(
         root.get("profiles"), Path(base_directory) if base_directory is not None else None
     )
+    scan = _parse_scan(root.get("scan"))
+    if scan.union_profile_test and not isinstance(profile, SecureProfile):
+        raise ConfigError("scan.union_profile_test requires an hls_gmac_suite0 profile")
     return AppConfig(
         version=_integer(root.get("version", 1), "version", 1, 1),
         transport=_parse_transport(root.get("transport")),
-        scan=_parse_scan(root.get("scan")),
+        scan=scan,
         profile=profile,
         output=_parse_output(root.get("output")),
         warnings=warnings,
@@ -553,21 +563,6 @@ def load_config(path: str | Path) -> AppConfig:
         location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
         raise ConfigError(f"invalid YAML in {config_path}{location}") from None
     return parse_config(raw, base_directory=config_path.parent.resolve())
-
-
-def _decode_secret_text(value: str, label: str) -> bytes:
-    candidate = value.strip()
-    if candidate.lower().startswith("hex:"):
-        candidate = candidate[4:]
-    if len(candidate) != 32:
-        raise ConfigError(f"{label} must decode to exactly 16 bytes")
-    try:
-        result = bytes.fromhex(candidate)
-    except ValueError as exc:
-        raise ConfigError(f"{label} must contain exactly 32 hexadecimal characters") from exc
-    if len(result) != 16:
-        raise ConfigError(f"{label} must decode to exactly 16 bytes")
-    return result
 
 
 def resolve_secret(
@@ -598,7 +593,7 @@ def resolve_secret(
             value = reader(f"{label} (32 hexadecimal characters): ")
         else:
             raise ConfigError(f"{label} uses an unsupported secret source")
-        return _decode_secret_text(value, label)
+        return _parse_hex(value, label, 16)
     except ConfigError:
         raise
     except OSError as exc:

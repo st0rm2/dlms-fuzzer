@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -11,10 +11,6 @@ class CatalogueEntry:
     logical_name: str
     attributes: tuple[int, ...]
     description: str
-
-    def as_dict(self) -> dict[str, object]:
-        return asdict(self)
-
 
 # The catalogue deliberately contains common identity and instantaneous/billing
 # objects, not an exhaustive OBIS Cartesian product. An absent object normally
@@ -38,7 +34,3 @@ COMMON_OBIS: tuple[CatalogueEntry, ...] = (
     CatalogueEntry(3, "1.0.71.7.0.255", (2, 3), "Current L3"),
     CatalogueEntry(3, "1.0.14.7.0.255", (2, 3), "Frequency"),
 )
-
-
-def catalogue_names() -> tuple[str, ...]:
-    return ("common",)

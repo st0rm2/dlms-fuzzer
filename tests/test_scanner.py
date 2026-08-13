@@ -255,7 +255,7 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(report["transport"]["selected_server_address"], 129)
         self.assertEqual(report["transport"]["server_address_size"], 2)
         self.assertEqual(
-            report["transport"]["server_addressing_type"], "2-Byte addressing"
+            report["transport"]["server_addressing_type"], "2-byte addressing"
         )
         self.assertEqual(
             [item["valid"] for item in report["transport"]["endpoint_findings"]],

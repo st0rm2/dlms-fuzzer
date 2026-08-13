@@ -4,6 +4,11 @@ transport:
   device: /dev/ttyUSB0
   baudrate: auto
 
+scan:
+  # After the secure scan, directly test authenticated-only GET targets again
+  # through a fresh public association and flag any unexpected successful reads.
+  union_profile_test: true
+
 profiles:
   - name: hls_gmac_suite0
     client_address: 1

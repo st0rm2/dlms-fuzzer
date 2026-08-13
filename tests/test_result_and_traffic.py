@@ -200,6 +200,43 @@ class ResultAndTrafficTests(unittest.TestCase):
         self.assertIn("| ACTION | 1.0.0.1.0.255 | 1 | 1 | Reset | access | NOT_TESTED |", rendered)
         self.assertIn("SET and ACTION are mapped passively", rendered)
 
+    def test_summary_highlights_unexpected_public_cross_profile_access(self):
+        report = {
+            "schema_version": 1,
+            "run": {"id": "test", "status": "completed"},
+            "transport": {},
+            "profiles": [],
+            "public_union_test": {
+                "enabled": True,
+                "status": "completed",
+                "public_association_view_objects": 3,
+                "candidate_gets": 1,
+                "unexpected_public_access": 1,
+                "public_access_rejected": 0,
+                "inconclusive": 0,
+                "results": [
+                    {
+                        "class_id": 1,
+                        "logical_name": "1.0.99.1.0.255",
+                        "attribute_id": 2,
+                        "name": "Value",
+                        "public_object_advertised": False,
+                        "outcome": "SUCCESS",
+                        "access_assessment": "UNEXPECTED_PUBLIC_ACCESS",
+                        "decoded": {"value": "exposed"},
+                    }
+                ],
+            },
+            "errors": [],
+        }
+
+        rendered = render_summary_report(report)
+
+        self.assertIn("## Public cross-profile access test", rendered)
+        self.assertIn("| Unexpected public access | 1 |", rendered)
+        self.assertIn("UNEXPECTED_PUBLIC_ACCESS", rendered)
+        self.assertIn("exposed", rendered)
+
     def test_written_summary_includes_ciphertext_without_full_hdlc_frame(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

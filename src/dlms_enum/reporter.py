@@ -19,6 +19,14 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _atomic_write_text(path: str | Path, content: str) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(destination)
+
+
 def _markdown(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
 
@@ -313,6 +321,55 @@ def render_summary_report(
                 )
         lines.append("")
 
+    union_test = report.get("public_union_test", {})
+    if union_test.get("enabled"):
+        lines.extend(
+            [
+                "## Public cross-profile access test",
+                "",
+                "Authenticated-readable attributes absent from the public role's readable Association View were addressed directly through a fresh public association. A successful GET is flagged as unexpected public access; an explicit DLMS error is a rejection, while transport and protocol failures are inconclusive.",
+                "",
+                "| Field | Value |",
+                "|---|---|",
+                f"| Status | {_markdown(union_test.get('status', 'unknown'))} |",
+                f"| Public Association View objects | {_markdown(union_test.get('public_association_view_objects', '—'))} |",
+                f"| Candidate GETs | {_markdown(union_test.get('candidate_gets', 0))} |",
+                f"| Unexpected public access | {_markdown(union_test.get('unexpected_public_access', 0))} |",
+                f"| Public access rejected | {_markdown(union_test.get('public_access_rejected', 0))} |",
+                f"| Inconclusive | {_markdown(union_test.get('inconclusive', 0))} |",
+                "",
+            ]
+        )
+        results = union_test.get("results", [])
+        if results:
+            lines.extend(
+                [
+                    "| OBIS | Class | Attribute | Name | Public view | Result | Assessment | Decoded value |",
+                    "|---|---:|---:|---|---|---|---|---|",
+                ]
+            )
+            for result in results:
+                decoded = result.get("decoded", {})
+                value = decoded.get("value") if isinstance(decoded, dict) else None
+                public_view = result.get("public_advertised_access") or (
+                    "object advertised; attribute absent"
+                    if result.get("public_object_advertised")
+                    else "object absent"
+                )
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                        _markdown(result.get("logical_name", "—")),
+                        _markdown(result.get("class_id", "—")),
+                        _markdown(result.get("attribute_id", "—")),
+                        _markdown(result.get("name") or "—"),
+                        _markdown(public_view),
+                        _markdown(result.get("outcome", "—")),
+                        _markdown(result.get("access_assessment", "—")),
+                        _markdown(_compact_value(value)),
+                    )
+                )
+            lines.append("")
+
     if protected_traffic:
         lines.extend(
             [
@@ -385,16 +442,10 @@ def write_summary_report(
     path: str | Path,
     traffic_path: str | Path | None = None,
 ) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
     protected_traffic = (
         _protected_traffic_entries(traffic_path) if traffic_path is not None else None
     )
-    temporary.write_text(
-        render_summary_report(report, protected_traffic), encoding="utf-8"
-    )
-    temporary.replace(destination)
+    _atomic_write_text(path, render_summary_report(report, protected_traffic))
 
 
 def write_report(
@@ -416,11 +467,7 @@ def write_report(
                 "summary_sha256": sha256_file(summary_path),
             }
         )
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    temporary.replace(destination)
+    _atomic_write_text(path, json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
 
 def load_report(path: str | Path) -> dict[str, Any]:
@@ -460,5 +507,14 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
         lines.insert(
             2,
             f"Scope: short test — {_scan_scope_label(scan_scope)}",
+        )
+    union_test = report.get("public_union_test", {})
+    if union_test.get("enabled"):
+        lines.append(
+            "Public cross-profile GETs: {} unexpected access, {} rejected, {} inconclusive".format(
+                union_test.get("unexpected_public_access", 0),
+                union_test.get("public_access_rejected", 0),
+                union_test.get("inconclusive", 0),
+            )
         )
     return lines

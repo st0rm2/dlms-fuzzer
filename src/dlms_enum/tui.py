@@ -95,6 +95,8 @@ class ScanUI:
             "secure_association",
             "hls_authentication",
             "association_view",
+            "public_union_inventory",
+            "public_union_connect",
             "short_test_selected",
         }:
             labels = {
@@ -105,6 +107,8 @@ class ScanUI:
                 "secure_association": "HLS-GMAC",
                 "hls_authentication": "HLS-GMAC",
                 "association_view": "Inventory",
+                "public_union_inventory": "Public view",
+                "public_union_connect": "Public test",
                 "short_test_selected": "Short test",
             }
             self._update(stage=labels[phase], description=message)
@@ -126,6 +130,20 @@ class ScanUI:
             return
         if phase == "get_complete":
             self._update(stage="GET scan", description=self._last_action, advance=1)
+            return
+        if phase == "public_union_plan":
+            self._update(
+                stage="Public test",
+                description=message,
+                total=int(event.get("total", 0)),
+                completed=0,
+            )
+            return
+        if phase == "public_union_get":
+            self._update(stage="Public test", description=message)
+            return
+        if phase == "public_union_complete":
+            self._update(stage="Public test", description=self._last_action, advance=1)
             return
         if phase in {"get_error", "association_view_error"}:
             # Keep the single display stable. Detailed failures are available in
@@ -192,6 +210,11 @@ def interactive_config(console: Console | None = None) -> AppConfig:
         "Profile", choices=("public", "hls_gmac_suite0"), default="public", console=console
     )
     secure = profile_name == "hls_gmac_suite0"
+    union_profile_test = secure and Confirm.ask(
+        "Test authenticated-only GET targets through the public client",
+        default=False,
+        console=console,
+    )
     client_address = IntPrompt.ask(
         "Authenticated client address" if secure else "Public client address",
         default=1 if secure else 16,
@@ -224,32 +247,14 @@ def interactive_config(console: Console | None = None) -> AppConfig:
                 },
             }
         )
-    else:
-        profile.update(
-            {
-                "authentication": {"mechanism": "none"},
-                "security": {"policy": "none"},
-            }
-        )
     config = parse_config(
         {
-            "version": 1,
-            "transport": {"type": "serial_hdlc", "device": device, "baudrate": baudrate},
+            "transport": {"device": device, "baudrate": baudrate},
             "scan": {
-                "mode": "get",
-                "total_get_attempts": 2,
-                "association_view_first": True,
-                "common_catalogue": True,
                 "object_limit": 10 if short_test else None,
+                "union_profile_test": union_profile_test,
             },
             "profiles": [profile],
-            "output": {
-                "directory": "./runs",
-                "report_file": "report.json",
-                "summary_file": "summary.md",
-                "traffic_file": "traffic.jsonl",
-                "redact_secrets": True,
-            },
         }
     )
     console.print("\nEffective settings:")

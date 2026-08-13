@@ -21,9 +21,9 @@ from gurux_dlms.objects.enums import SecuritySuite
 from gurux_dlms.secure.GXDLMSSecureClient import GXDLMSSecureClient
 from gurux_serial import GXSerial
 
-from .config import AppConfig, SecureProfile
+from .config import AppConfig, SERVER_ADDRESSING_TYPES, SecureProfile
 from .counter_state import InvocationCounterLease
-from .result_model import Outcome, enum_name, normalize_value
+from .result_model import Outcome, classify_exception, enum_name, normalize_value
 from .traffic_logger import TrafficLogger
 
 
@@ -236,16 +236,14 @@ class GuruxSession:
         self._associated = False
 
     def _endpoint_context(self) -> dict[str, Any]:
-        labels = {1: "1-byte addressing", 2: "2-Byte addressing", 4: "4-byte addressing"}
+        address_size = self.server_address_size or int(self.client.serverAddressSize)
         return {
             "baudrate": self.baudrate,
             "server_address": int(self.client.serverAddress),
             "server_logical_address": self.server_logical_address,
             "server_physical_address": self.server_physical_address,
-            "server_address_size": self.server_address_size or int(self.client.serverAddressSize),
-            "server_addressing_type": labels.get(
-                self.server_address_size or int(self.client.serverAddressSize), "unknown"
-            ),
+            "server_address_size": address_size,
+            "server_addressing_type": SERVER_ADDRESSING_TYPES.get(address_size, "unknown"),
         }
 
     @staticmethod
@@ -358,15 +356,7 @@ class GuruxSession:
                 raise GXDLMSException(reply.error)
         except BaseException as exc:
             caught = exc
-            name = type(exc).__name__.lower()
-            if "timeout" in name:
-                outcome = Outcome.TIMEOUT
-            elif isinstance(exc, GXDLMSException):
-                outcome = Outcome.DLMS_ERROR
-            elif isinstance(exc, OSError):
-                outcome = Outcome.TRANSPORT_ERROR
-            else:
-                outcome = Outcome.PROTOCOL_ERROR
+            outcome = classify_exception(exc)
         finally:
             tx_decoded = dict(tx_context or {})
             tx_decoded.update(tx_protocol)
@@ -540,7 +530,15 @@ class GuruxSession:
         target.logicalName = logical_name
         return target
 
-    def read_attribute(self, target: Any, attribute_id: int, attempt: int) -> dict[str, Any]:
+    def read_attribute(
+        self,
+        target: Any,
+        attribute_id: int,
+        attempt: int,
+        *,
+        phase: str = "get_scan",
+        purpose: str = "object_attribute_read",
+    ) -> dict[str, Any]:
         context = {
             "class_id": int(target.objectType),
             "logical_name": str(target.logicalName),
@@ -551,8 +549,8 @@ class GuruxSession:
         self._read_blocks(
             _quiet_gurux(self.client.read, target, attribute_id),
             reply,
-            phase="get_scan",
-            purpose="object_attribute_read",
+            phase=phase,
+            purpose=purpose,
             operation="GET",
             attempt=attempt,
             object_context=context,
@@ -891,9 +889,6 @@ class GuruxSecureSession(GuruxSession):
         server_title = self.client.settings.sourceSystemTitle
         details.update(
             {
-                "profile": self.profile_name,
-                "authentication": "high_gmac",
-                "security": "authentication_encryption",
                 "security_suite": 0,
                 "cipher": "aes_gcm_128",
                 "hls_validated": self._associated,
