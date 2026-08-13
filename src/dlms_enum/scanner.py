@@ -17,6 +17,32 @@ from .counter_state import acquire_counter_lease, counter_identity
 from .result_model import Outcome, classify_exception, enum_name, error_record, utc_now
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+CONSECUTIVE_TIMEOUTS_BEFORE_RETRY_SUPPRESSION = 2
+
+
+class _GetRetryPolicy:
+    """Suppress redundant retries while a run of timeouts is in progress."""
+
+    def __init__(self) -> None:
+        self.consecutive_timeouts = 0
+        self.retries_suppressed = False
+
+    def attempts_for_next_get(self, configured_attempts: int) -> int:
+        if self.retries_suppressed:
+            return 1
+        return configured_attempts
+
+    def record(self, outcome: Outcome) -> None:
+        if self.retries_suppressed:
+            return
+        if outcome == Outcome.TIMEOUT:
+            self.consecutive_timeouts += 1
+            self.retries_suppressed = (
+                self.consecutive_timeouts
+                >= CONSECUTIVE_TIMEOUTS_BEFORE_RETRY_SUPPRESSION
+            )
+        else:
+            self.consecutive_timeouts = 0
 
 
 def _serial_permission_message(device_stat: os.stat_result, device: str) -> str:
@@ -382,21 +408,32 @@ def _run_public_union_gets(
     config: AppConfig,
     report: dict[str, Any],
     progress: ProgressCallback,
+    *,
+    candidate_count: int | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     unexpected_access = rejected = inconclusive = transmissions = 0
+    retry_policy = _GetRetryPolicy()
+    candidate_count = len(candidates) if candidate_count is None else candidate_count
     progress(
         {
             "phase": "public_union_plan",
             "total": len(candidates),
-            "message": f"Testing {len(candidates)} additional authenticated GET targets as public",
+            "message": (
+                f"Testing {len(candidates)} of {candidate_count} additional "
+                "authenticated GET targets as public"
+            ),
         }
     )
     for candidate in candidates:
         result = {**candidate, "attempt_count": 0, "attempts": []}
         target = session.create_object(candidate["class_id"], candidate["logical_name"])
         last_exception: BaseException | None = None
-        for attempt in range(1, config.scan.total_get_attempts + 1):
+        allowed_attempts = retry_policy.attempts_for_next_get(
+            config.scan.total_get_attempts
+        )
+        result["retry_suppressed"] = allowed_attempts == 1
+        for attempt in range(1, allowed_attempts + 1):
             transmissions += 1
             result["attempt_count"] = attempt
             progress(
@@ -406,7 +443,7 @@ def _run_public_union_gets(
                     "attempt": attempt,
                     "message": (
                         f"Public GET {candidate['logical_name']} class {candidate['class_id']} "
-                        f"attribute {candidate['attribute_id']} ({attempt}/{config.scan.total_get_attempts})"
+                        f"attribute {candidate['attribute_id']} ({attempt}/{allowed_attempts})"
                     ),
                 }
             )
@@ -421,6 +458,7 @@ def _run_public_union_gets(
             except Exception as exc:
                 last_exception = exc
                 outcome = classify_exception(exc)
+                retry_policy.record(outcome)
                 result["attempts"].append(
                     {
                         "attempt": attempt,
@@ -442,6 +480,7 @@ def _run_public_union_gets(
             result["attempts"].append(
                 {"attempt": attempt, "outcome": Outcome.SUCCESS.value}
             )
+            retry_policy.record(Outcome.SUCCESS)
             last_exception = None
             unexpected_access += 1
             break
@@ -487,7 +526,8 @@ def _run_public_union_gets(
 
     return {
         "status": "inconclusive" if inconclusive else "completed",
-        "candidate_gets": len(candidates),
+        "candidate_gets": candidate_count,
+        "selected_gets": len(candidates),
         "attempted_gets": len(results),
         "get_transmissions": transmissions,
         "unexpected_public_access": unexpected_access,
@@ -591,6 +631,7 @@ def scan_public(
     objects: list[Any] = []
     public_objects: set[tuple[int, str]] | None = None
     public_capabilities: dict[tuple[tuple[int, str], int], dict[str, Any]] | None = None
+    union_candidates: list[dict[str, Any]] | None = None
 
     try:
         validate_serial_device(config.transport.device)
@@ -881,7 +922,6 @@ def scan_public(
 
         association_order_items = list(inventory.items())
         all_items = sorted(inventory.items(), key=lambda pair: pair[0])
-        union_candidates: list[dict[str, Any]] | None = None
         if public_objects is not None and public_capabilities is not None:
             union_candidates = _public_union_candidates(
                 inventory,
@@ -890,6 +930,11 @@ def scan_public(
                 source_profile=profile_name,
             )
             report["public_union_test"]["candidate_gets"] = len(union_candidates)
+            report["public_union_test"]["selected_gets"] = (
+                min(len(union_candidates), config.scan.get_limit)
+                if config.scan.get_limit is not None
+                else len(union_candidates)
+            )
         all_get_capabilities = [
             (key, attribute_id)
             for key, item in all_items
@@ -1009,6 +1054,7 @@ def scan_public(
         }
         report["profiles"].append(profile_result)
         get_transmissions = 0
+        retry_policy = _GetRetryPolicy()
         for (class_id, logical_name), item in all_items:
             target = item["target"]
             object_result = _object_record(target, item["sources"], version)
@@ -1114,7 +1160,11 @@ def scan_public(
                     continue
 
                 last_exception: BaseException | None = None
-                for attempt in range(1, config.scan.total_get_attempts + 1):
+                allowed_attempts = retry_policy.attempts_for_next_get(
+                    config.scan.total_get_attempts
+                )
+                attribute_result["retry_suppressed"] = allowed_attempts == 1
+                for attempt in range(1, allowed_attempts + 1):
                     get_transmissions += 1
                     attribute_result["lifecycle"] = "attempted"
                     attribute_result["attempt_count"] = attempt
@@ -1126,7 +1176,7 @@ def scan_public(
                             "logical_name": logical_name,
                             "attribute_id": attribute_id,
                             "attempt": attempt,
-                            "message": f"GET {logical_name} class {class_id} attribute {attribute_id} ({attempt}/{config.scan.total_get_attempts})",
+                            "message": f"GET {logical_name} class {class_id} attribute {attribute_id} ({attempt}/{allowed_attempts})",
                         }
                     )
                     try:
@@ -1134,6 +1184,7 @@ def scan_public(
                     except Exception as exc:
                         last_exception = exc
                         outcome = classify_exception(exc)
+                        retry_policy.record(outcome)
                         attribute_result["attempts"].append(
                             {"attempt": attempt, "outcome": outcome.value, "error": f"{type(exc).__name__}: {exc}"}
                         )
@@ -1151,6 +1202,7 @@ def scan_public(
                         {"lifecycle": "success", "outcome": Outcome.SUCCESS.value, "decoded": decoded}
                     )
                     attribute_result["attempts"].append({"attempt": attempt, "outcome": Outcome.SUCCESS.value})
+                    retry_policy.record(Outcome.SUCCESS)
                     last_exception = None
                     break
 
@@ -1243,6 +1295,7 @@ def scan_public(
                 {
                     "status": "no_additional_targets",
                     "attempted_gets": 0,
+                    "selected_gets": 0,
                     "get_transmissions": 0,
                     "unexpected_public_access": 0,
                     "public_access_rejected": 0,
@@ -1296,10 +1349,15 @@ def scan_public(
                         "public_probe_association": probe_association,
                         **_run_public_union_gets(
                             public_probe,
-                            union_candidates,
+                            (
+                                union_candidates[: config.scan.get_limit]
+                                if config.scan.get_limit is not None
+                                else union_candidates
+                            ),
                             config,
                             report,
                             progress,
+                            candidate_count=len(union_candidates),
                         ),
                     }
                 )
@@ -1404,6 +1462,26 @@ def scan_public(
             for row in matrix
             if row["operation"] == "GET"
         }
+        for candidate in union_candidates or []:
+            row = get_rows.get(
+                (
+                    candidate["class_id"],
+                    candidate["logical_name"],
+                    candidate["attribute_id"],
+                )
+            )
+            if row is None:
+                continue
+            row["profiles"]["public"] = {
+                "status": Outcome.NOT_TESTED.value,
+                "outcome": Outcome.NOT_TESTED.value,
+                "success": None,
+                "advertised": candidate["public_advertised"],
+                "advertised_access": candidate.get("public_advertised_access"),
+                "tested": False,
+                "cross_profile_probe": True,
+                "access_assessment": None,
+            }
         for result in report.get("public_union_test", {}).get("results", []):
             row = get_rows.get(
                 (

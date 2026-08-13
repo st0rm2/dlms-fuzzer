@@ -135,7 +135,7 @@ class SecureSession:
         return []
 
 
-def secure_config(state_file, *, union_profile_test=False):
+def secure_config(state_file, *, union_profile_test=False, get_limit=None):
     return parse_config(
         {
             "transport": {
@@ -147,6 +147,7 @@ def secure_config(state_file, *, union_profile_test=False):
             "scan": {
                 "common_catalogue": False,
                 "union_profile_test": union_profile_test,
+                **({"get_limit": get_limit} if get_limit is not None else {}),
             },
             "profiles": [
                 {
@@ -282,6 +283,55 @@ class SecureScannerTests(unittest.TestCase):
                 item["access_assessment"] == "PUBLIC_ACCESS_REJECTED"
                 for item in union_test["results"]
             )
+        )
+
+    def test_get_limit_also_caps_public_cross_profile_test(self):
+        SecureSession.objects = [FakeObject(), SecureOnlyObject()]
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(
+                secure_config(
+                    Path(directory) / "counters.json",
+                    union_profile_test=True,
+                    get_limit=1,
+                )
+            )
+
+        union_test = report["public_union_test"]
+        self.assertEqual(union_test["candidate_gets"], 2)
+        self.assertEqual(union_test["selected_gets"], 1)
+        self.assertEqual(union_test["attempted_gets"], 1)
+        public_rows = [
+            row["profiles"]["public"]
+            for row in report["capability_matrix"]
+            if row["operation"] == "GET"
+            and row["logical_name"] == SecureOnlyObject.logicalName
+        ]
+        self.assertEqual(sum(item["tested"] for item in public_rows), 1)
+        self.assertEqual(
+            sum(item["status"] == "NOT_TESTED" for item in public_rows),
+            1,
+        )
+
+    def test_public_cross_profile_retries_are_suppressed_after_timeouts(self):
+        SecureSession.objects = [FakeObject(), SecureOnlyObject()]
+        BootstrapSession.public_read_error = TimeoutError("meter did not reply")
+        with tempfile.TemporaryDirectory() as directory:
+            report = self._run(
+                secure_config(
+                    Path(directory) / "counters.json",
+                    union_profile_test=True,
+                )
+            )
+
+        union_test = report["public_union_test"]
+        self.assertEqual(union_test["get_transmissions"], 3)
+        self.assertEqual(
+            [item["attempt_count"] for item in union_test["results"]],
+            [2, 1],
+        )
+        self.assertEqual(
+            [item["retry_suppressed"] for item in union_test["results"]],
+            [False, True],
         )
 
     def test_public_rights_requiring_authentication_are_still_probe_candidates(self):

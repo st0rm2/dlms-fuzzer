@@ -109,6 +109,17 @@ class LimitedSession(FakeSession):
         return {"value": target.logicalName, "dlms_data_type": "visible_string"}
 
 
+class TimeoutSession(FakeSession):
+    read_attempts = []
+
+    def discover_objects(self, attempt):
+        return [ManyObject(1), ManyObject(2)]
+
+    def read_attribute(self, target, attribute_id, attempt):
+        self.read_attempts.append((target.logicalName, attribute_id, attempt))
+        raise TimeoutError("meter did not reply")
+
+
 class WritableObject(FakeObject):
     attributes = [Attribute(2), Attribute(3)]
     methodAttributes = [Method(1, 1)]
@@ -201,6 +212,36 @@ class ScannerTests(unittest.TestCase):
         value_attribute = report["profiles"][0]["objects"][0]["attributes"][1]
         self.assertEqual(value_attribute["attempt_count"], 2)
         self.assertEqual(value_attribute["outcome"], "SUCCESS")
+
+    def test_retries_are_suppressed_after_consecutive_timeouts(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {"common_catalogue": False},
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = TimeoutSession
+        TimeoutSession.read_attempts = []
+
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        profile = report["profiles"][0]
+        self.assertEqual(profile["summary"]["get_attempted"], 4)
+        self.assertEqual(profile["summary"]["get_transmissions"], 5)
+        self.assertEqual([item[2] for item in TimeoutSession.read_attempts], [1, 2, 1, 1, 1])
+        attributes = [
+            attribute
+            for obj in profile["objects"]
+            for attribute in obj["attributes"]
+        ]
+        self.assertFalse(attributes[0]["retry_suppressed"])
+        self.assertTrue(all(item["retry_suppressed"] for item in attributes[1:]))
 
     def test_association_write_and_action_rights_are_reported_but_not_executed(self):
         config = parse_config(

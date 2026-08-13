@@ -9,7 +9,7 @@ transport:
     parity: none
     data_bits: 8
     stop_bits: 1
-  response_timeout_ms: 3000
+  response_timeout_ms: 1000
   inter_request_delay_ms: 100
   session_guard_ms: 500
 

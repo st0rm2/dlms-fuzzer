@@ -35,7 +35,7 @@ class TransportConfig:
     baudrate: int | str = "auto"
     baudrate_candidates: tuple[int, ...] = DEFAULT_BAUD_RATES
     serial: SerialSettings = SerialSettings()
-    response_timeout_ms: int = 3000
+    response_timeout_ms: int = 1000
     inter_request_delay_ms: int = 100
     session_guard_ms: int = 500
 
@@ -247,7 +247,7 @@ def _parse_transport(raw: Any) -> TransportConfig:
         baudrate=baudrate,
         baudrate_candidates=candidates,
         serial=SerialSettings(parity, data_bits, float(stop_bits)),
-        response_timeout_ms=_positive_ms(data.get("response_timeout_ms", 3000), "transport.response_timeout_ms"),
+        response_timeout_ms=_positive_ms(data.get("response_timeout_ms", 1000), "transport.response_timeout_ms"),
         inter_request_delay_ms=_positive_ms(
             data.get("inter_request_delay_ms", 100), "transport.inter_request_delay_ms", allow_zero=True
         ),

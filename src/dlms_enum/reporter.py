@@ -334,6 +334,7 @@ def render_summary_report(
                 f"| Status | {_markdown(union_test.get('status', 'unknown'))} |",
                 f"| Public Association View objects | {_markdown(union_test.get('public_association_view_objects', '—'))} |",
                 f"| Candidate GETs | {_markdown(union_test.get('candidate_gets', 0))} |",
+                f"| Selected GETs | {_markdown(union_test.get('selected_gets', union_test.get('candidate_gets', 0)))} |",
                 f"| Unexpected public access | {_markdown(union_test.get('unexpected_public_access', 0))} |",
                 f"| Public access rejected | {_markdown(union_test.get('public_access_rejected', 0))} |",
                 f"| Inconclusive | {_markdown(union_test.get('inconclusive', 0))} |",

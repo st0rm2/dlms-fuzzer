@@ -30,7 +30,7 @@ python -m dlms_enum scan --config meter-public.yaml --full
 python -m dlms_enum scan --config meter-public.yaml --get-limit 100
 ```
 
-`--get-limit 100` tests exactly the first 100 mapped GET capabilities while retaining every other GET, SET, and ACTION capability in the report as `NOT_TESTED`. For unattended configuration-driven runs, use `scan.get_limit: 100`; the older object-based short scope remains available as `scan.object_limit: 10`. The two limits are mutually exclusive. If neither limit nor a command-line switch is supplied and standard input is not an interactive terminal, the default remains a full scan.
+`--get-limit 100` tests exactly the first 100 mapped GET capabilities while retaining every other GET, SET, and ACTION capability in the report as `NOT_TESTED`. In a secure scan, the same limit also caps the optional cross-profile public GET test. For unattended configuration-driven runs, use `scan.get_limit: 100`; the older object-based short scope remains available as `scan.object_limit: 10`. The two limits are mutually exclusive. If neither limit nor a command-line switch is supplied and standard input is not an interactive terminal, the default remains a full scan.
 
 Secure scan:
 
@@ -89,7 +89,7 @@ scan:
 
 The bootstrap public association first supplies its Association View. After the authenticated scan is complete and its protected association is closed, the tool opens a fresh public association and directly addresses each authenticated-readable `(class_id, logical_name, attribute_id)` target that was not advertised as publicly readable. Common-catalogue guesses are excluded: candidates must come from the authenticated Association View.
 
-A successful public GET is reported as `UNEXPECTED_PUBLIC_ACCESS`. An explicit DLMS error is `PUBLIC_ACCESS_REJECTED`; a timeout, transport failure, or malformed response is `INCONCLUSIVE`. SET and arbitrary ACTION are never attempted. These cross-profile probes have their own counts and are intentionally outside `object_limit` and `get_limit`, because those limits apply to the primary authenticated scan.
+A successful public GET is reported as `UNEXPECTED_PUBLIC_ACCESS`. An explicit DLMS error is `PUBLIC_ACCESS_REJECTED`; a timeout, transport failure, or malformed response is `INCONCLUSIVE`. SET and arbitrary ACTION are never attempted. These cross-profile probes have their own counts. `object_limit` applies only to the primary authenticated scan, while `get_limit` also caps the number of cross-profile probes.
 
 Credential meanings:
 
@@ -195,7 +195,7 @@ Each run gets a UTC-named directory under `./runs` unless overridden:
 - `summary.md` is the human-readable report. It contains connection and role details, a decoded OBIS table, the public cross-profile access findings when enabled, and the complete operation capability matrix. In secure scans the decoded table places the encrypted RX payload immediately to the right of the encoded value; only ciphertext is shown, without HDLC framing, security control, invocation counter, authentication tag, or CRC. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent. The separate protected-APDU table retains command, counter, ciphertext, and authentication-tag evidence.
 - `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators.
 
-GET uses at most two attempts. Explicit DLMS errors such as access denied are not retried. Timeouts, transport failures, and malformed responses can receive one retry; each protected retry gets a new persisted invocation counter.
+GET uses at most two attempts. Explicit DLMS errors such as access denied are not retried. Timeouts, transport failures, and malformed responses can receive one retry; each protected retry gets a new persisted invocation counter. After two consecutive timeout responses, retries are suppressed for the remaining GETs in that scan phase. The default response timeout is 1000 ms and remains configurable with `transport.response_timeout_ms`.
 
 ### Terminal progress and secure-status messages
 

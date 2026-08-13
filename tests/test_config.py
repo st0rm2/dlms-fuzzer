@@ -28,6 +28,11 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
+    def test_default_response_timeout_is_one_second(self):
+        config = parse_config({"transport": {"device": "/dev/null"}})
+
+        self.assertEqual(config.transport.response_timeout_ms, 1000)
+
     def test_unimplemented_manufacturer_catalogue_is_rejected(self):
         with self.assertRaisesRegex(ConfigError, "unsupported keys"):
             parse_config(

@@ -211,6 +211,7 @@ class ResultAndTrafficTests(unittest.TestCase):
                 "status": "completed",
                 "public_association_view_objects": 3,
                 "candidate_gets": 1,
+                "selected_gets": 1,
                 "unexpected_public_access": 1,
                 "public_access_rejected": 0,
                 "inconclusive": 0,
@@ -233,6 +234,7 @@ class ResultAndTrafficTests(unittest.TestCase):
         rendered = render_summary_report(report)
 
         self.assertIn("## Public cross-profile access test", rendered)
+        self.assertIn("| Selected GETs | 1 |", rendered)
         self.assertIn("| Unexpected public access | 1 |", rendered)
         self.assertIn("UNEXPECTED_PUBLIC_ACCESS", rendered)
         self.assertIn("exposed", rendered)
