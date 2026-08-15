@@ -8,6 +8,12 @@ from dlms_enum.tui import ScanUI
 
 
 class ScanUITests(unittest.TestCase):
+    def test_progress_refreshes_independently_once_per_second(self):
+        ui = ScanUI(Console(file=io.StringIO(), color_system=None, width=200))
+
+        self.assertTrue(ui._progress.live.auto_refresh)
+        self.assertEqual(ui._progress.live.refresh_per_second, 1)
+
     def test_error_progress_event_is_rendered_as_an_error(self):
         output = io.StringIO()
         ui = ScanUI(Console(file=output, color_system=None, width=200))

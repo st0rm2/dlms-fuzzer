@@ -49,11 +49,15 @@ class ScanConfig:
     union_profile_test: bool = False
     object_limit: int | None = None
     get_limit: int | None = None
+    batch_size: int = 1
+    enumeration_timeout_ms: int = 1000
+    timeout_breaker_threshold: int = 4
 
 
 @dataclass(frozen=True)
 class PublicProfile:
     name: str = "public"
+    role: str = "public"
     client_address: int = 16
     server_logical_address: int = 1
     server_physical_address: int = 1
@@ -106,6 +110,7 @@ class SecureProfile:
     server_address_size: int | str = "auto"
     proposed_max_pdu_size: int = 0xFFFF
     invocation_counter: InvocationCounterConfig = InvocationCounterConfig()
+    role: str = SECURE_PROFILE_NAME
 
 
 ProfileConfig = PublicProfile | SecureProfile
@@ -125,7 +130,7 @@ class AppConfig:
     version: int
     transport: TransportConfig
     scan: ScanConfig
-    profile: ProfileConfig
+    profiles: tuple[ProfileConfig, ...]
     output: OutputConfig
     warnings: tuple[str, ...] = field(default=(), repr=False)
 
@@ -133,50 +138,68 @@ class AppConfig:
     def is_secure(self) -> bool:
         return isinstance(self.profile, SecureProfile)
 
+    @property
+    def profile(self) -> ProfileConfig:
+        """Return the sole role in a runtime scan configuration."""
+
+        if len(self.profiles) != 1:
+            raise ConfigError("select exactly one role before starting a scan")
+        return self.profiles[0]
+
+    def for_profile(self, profile: ProfileConfig) -> "AppConfig":
+        scan = self.scan
+        if not isinstance(profile, SecureProfile) and scan.union_profile_test:
+            scan = replace(scan, union_profile_test=False)
+        return replace(self, profiles=(profile,), scan=scan)
+
     def redacted_dict(self) -> dict[str, Any]:
         """Return an effective configuration that never materializes key values."""
 
         transport = asdict(self.transport)
         transport["baudrate_candidates"] = list(self.transport.baudrate_candidates)
-        profile: dict[str, Any] = {
-            "name": self.profile.name,
-            "client_address": self.profile.client_address,
-            "server": {
-                "logical_address": self.profile.server_logical_address,
-                "physical_address": self.profile.server_physical_address,
-            },
-            "hdlc": {"address_size": self.profile.server_address_size},
-            "proposed_max_pdu_size": self.profile.proposed_max_pdu_size,
-        }
-        if isinstance(self.profile, SecureProfile):
-            profile.update(
-                {
-                    "client_system_title": f"hex:{self.profile.client_system_title.hex().upper()}",
-                    "authentication": {"mechanism": "high_gmac"},
-                    "security": {
-                        "suite": 0,
-                        "policy": "authentication_encryption",
-                        "cipher": "aes_gcm_128",
-                    },
-                    "secrets": {
-                        "gak": self.profile.secrets.gak.descriptor(),
-                        "guek": self.profile.secrets.guek.descriptor(),
-                    },
-                    "invocation_counter": asdict(self.profile.invocation_counter),
-                }
-            )
-        else:
-            profile.update(
-                {
-                    "authentication": {"mechanism": "none"},
-                    "security": {"policy": "none"},
-                }
-            )
+        profiles: list[dict[str, Any]] = []
+        for configured_profile in self.profiles:
+            profile: dict[str, Any] = {
+                "name": configured_profile.name,
+                "role": configured_profile.role,
+                "client_address": configured_profile.client_address,
+                "server": {
+                    "logical_address": configured_profile.server_logical_address,
+                    "physical_address": configured_profile.server_physical_address,
+                },
+                "hdlc": {"address_size": configured_profile.server_address_size},
+                "proposed_max_pdu_size": configured_profile.proposed_max_pdu_size,
+            }
+            if isinstance(configured_profile, SecureProfile):
+                profile.update(
+                    {
+                        "client_system_title": f"hex:{configured_profile.client_system_title.hex().upper()}",
+                        "authentication": {"mechanism": "high_gmac"},
+                        "security": {
+                            "suite": 0,
+                            "policy": "authentication_encryption",
+                            "cipher": "aes_gcm_128",
+                        },
+                        "secrets": {
+                            "gak": configured_profile.secrets.gak.descriptor(),
+                            "guek": configured_profile.secrets.guek.descriptor(),
+                        },
+                        "invocation_counter": asdict(configured_profile.invocation_counter),
+                    }
+                )
+            else:
+                profile.update(
+                    {
+                        "authentication": {"mechanism": "none"},
+                        "security": {"policy": "none"},
+                    }
+                )
+            profiles.append(profile)
         return {
             "version": self.version,
             "transport": transport,
             "scan": asdict(self.scan),
-            "profiles": [profile],
+            "profiles": profiles,
             "output": asdict(self.output),
         }
 
@@ -264,6 +287,7 @@ def _parse_scan(raw: Any) -> ScanConfig:
         {
             "mode", "total_get_attempts", "association_view_first", "common_catalogue",
             "union_profile_test", "object_limit", "get_limit",
+            "batch_size", "enumeration_timeout_ms", "timeout_breaker_threshold",
         },
         "scan",
     )
@@ -291,6 +315,17 @@ def _parse_scan(raw: Any) -> ScanConfig:
         get_limit = _integer(get_limit, "scan.get_limit", 1, 1_000_000)
     if object_limit is not None and get_limit is not None:
         raise ConfigError("scan.object_limit and scan.get_limit are mutually exclusive")
+    batch_size = _integer(data.get("batch_size", 1), "scan.batch_size", 1, 10)
+    enumeration_timeout_ms = _positive_ms(
+        data.get("enumeration_timeout_ms", 1000),
+        "scan.enumeration_timeout_ms",
+    )
+    timeout_breaker_threshold = _integer(
+        data.get("timeout_breaker_threshold", 4),
+        "scan.timeout_breaker_threshold",
+        3,
+        10,
+    )
     return ScanConfig(
         total_get_attempts=attempts,
         association_view_first=True,
@@ -298,6 +333,9 @@ def _parse_scan(raw: Any) -> ScanConfig:
         union_profile_test=boolean_values["union_profile_test"],
         object_limit=object_limit,
         get_limit=get_limit,
+        batch_size=batch_size,
+        enumeration_timeout_ms=enumeration_timeout_ms,
+        timeout_breaker_threshold=timeout_breaker_threshold,
     )
 
 
@@ -323,16 +361,18 @@ def with_get_limit(config: AppConfig, limit: int | None) -> AppConfig:
     )
 
 
-def _parse_server_and_hdlc(data: Mapping[str, Any], *, secure: bool) -> tuple[int, int, int | str]:
-    server = _mapping(data.get("server"), "profiles[0].server")
-    _only_keys(server, {"logical_address", "physical_address"}, "profiles[0].server")
-    hdlc = _mapping(data.get("hdlc"), "profiles[0].hdlc")
-    _only_keys(hdlc, {"address_size"}, "profiles[0].hdlc")
+def _parse_server_and_hdlc(
+    data: Mapping[str, Any], *, secure: bool, label: str
+) -> tuple[int, int, int | str]:
+    server = _mapping(data.get("server"), f"{label}.server")
+    _only_keys(server, {"logical_address", "physical_address"}, f"{label}.server")
+    hdlc = _mapping(data.get("hdlc"), f"{label}.hdlc")
+    _only_keys(hdlc, {"address_size"}, f"{label}.hdlc")
     address_size = hdlc.get("address_size", "auto")
     if address_size not in ("auto", 1, 2, 4):
-        raise ConfigError("profiles[0].hdlc.address_size must be auto, 1, 2, or 4")
-    logical = _integer(server.get("logical_address", 0 if secure else 1), "server.logical_address", 0, 0x3FFF)
-    physical = _integer(server.get("physical_address", 1), "server.physical_address", 0, 0x3FFF)
+        raise ConfigError(f"{label}.hdlc.address_size must be auto, 1, 2, or 4")
+    logical = _integer(server.get("logical_address", 0 if secure else 1), f"{label}.server.logical_address", 0, 0x3FFF)
+    physical = _integer(server.get("physical_address", 1), f"{label}.server.physical_address", 0, 0x3FFF)
     if address_size == 1 and logical != 0:
         raise ConfigError("one-byte server addressing requires server.logical_address: 0")
     if address_size == 2 and (logical >= 0x80 or physical >= 0x80):
@@ -386,123 +426,143 @@ def _parse_secret_source(raw: Any, label: str, base_directory: Path | None) -> S
     return SecretSource(kind, locator)
 
 
-def _parse_invocation_counter(raw: Any, base_directory: Path | None) -> InvocationCounterConfig:
-    data = _mapping(raw, "profiles[0].invocation_counter")
+def _parse_invocation_counter(
+    raw: Any, base_directory: Path | None, *, label: str
+) -> InvocationCounterConfig:
+    counter_label = f"{label}.invocation_counter"
+    data = _mapping(raw, counter_label)
     _only_keys(
         data,
         {
             "public_client_address", "class_id", "logical_name", "attribute_id",
             "state_file", "meter_identity", "unsafe_override",
         },
-        "profiles[0].invocation_counter",
+        counter_label,
     )
     logical_name = data.get("logical_name", "0.0.43.1.0.255")
     if not isinstance(logical_name, str) or len(logical_name.split(".")) != 6:
-        raise ConfigError("profiles[0].invocation_counter.logical_name must be a six-part logical name")
+        raise ConfigError(f"{counter_label}.logical_name must be a six-part logical name")
     state_file = data.get("state_file", "~/.local/state/dlms-enum/invocation-counters.json")
     if not isinstance(state_file, str) or not state_file.strip():
-        raise ConfigError("profiles[0].invocation_counter.state_file must be a non-empty path")
+        raise ConfigError(f"{counter_label}.state_file must be a non-empty path")
     state_path = Path(state_file.strip()).expanduser()
     if base_directory is not None and not state_path.is_absolute() and state_file != "~/.local/state/dlms-enum/invocation-counters.json":
         state_path = (base_directory / state_path).resolve()
     meter_identity = data.get("meter_identity")
     if meter_identity is not None and (not isinstance(meter_identity, str) or not meter_identity.strip()):
-        raise ConfigError("profiles[0].invocation_counter.meter_identity must be a non-empty string")
+        raise ConfigError(f"{counter_label}.meter_identity must be a non-empty string")
     unsafe_override = data.get("unsafe_override")
     if unsafe_override is not None:
-        unsafe_override = _integer(unsafe_override, "profiles[0].invocation_counter.unsafe_override", 1, 0xFFFFFFFF)
+        unsafe_override = _integer(unsafe_override, f"{counter_label}.unsafe_override", 1, 0xFFFFFFFF)
     return InvocationCounterConfig(
         public_client_address=_integer(
-            data.get("public_client_address", 16), "profiles[0].invocation_counter.public_client_address", 1, 0x3FFF
+            data.get("public_client_address", 16), f"{counter_label}.public_client_address", 1, 0x3FFF
         ),
-        class_id=_integer(data.get("class_id", 1), "profiles[0].invocation_counter.class_id", 1, 0xFFFF),
+        class_id=_integer(data.get("class_id", 1), f"{counter_label}.class_id", 1, 0xFFFF),
         logical_name=logical_name,
-        attribute_id=_integer(data.get("attribute_id", 2), "profiles[0].invocation_counter.attribute_id", 1, 0xFF),
+        attribute_id=_integer(data.get("attribute_id", 2), f"{counter_label}.attribute_id", 1, 0xFF),
         state_file=str(state_path),
         meter_identity=meter_identity.strip() if meter_identity else None,
         unsafe_override=unsafe_override,
     )
 
 
-def _parse_profile(raw: Any, base_directory: Path | None) -> tuple[ProfileConfig, tuple[str, ...]]:
+def _parse_profiles(
+    raw: Any, base_directory: Path | None
+) -> tuple[tuple[ProfileConfig, ...], tuple[str, ...]]:
     if raw is None:
         profiles = [{}]
     elif isinstance(raw, list):
         profiles = raw
     else:
         raise ConfigError("profiles must be a list")
-    if len(profiles) != 1:
-        raise ConfigError("this release requires exactly one public profile or one hls_gmac_suite0 profile")
-    data = _mapping(profiles[0], "profiles[0]")
-    _only_keys(
-        data,
-        {
-            "name", "client_address", "client_system_title", "secrets", "server",
-            "authentication", "security", "proposed_max_pdu_size", "hdlc", "invocation_counter",
-        },
-        "profiles[0]",
-    )
-    name = data.get("name", "public")
-    if name not in ("public", SECURE_PROFILE_NAME):
-        raise ConfigError("profiles[0].name must be public or hls_gmac_suite0")
-    logical, physical, address_size = _parse_server_and_hdlc(data, secure=name == SECURE_PROFILE_NAME)
-    max_pdu = _integer(
-        data.get("proposed_max_pdu_size", 0xFFFF), "profiles[0].proposed_max_pdu_size", 64, 0xFFFF
-    )
-    if name == "public":
-        auth = _mapping(data.get("authentication"), "profiles[0].authentication")
-        if auth.get("mechanism", "none") != "none" or set(auth) - {"mechanism"}:
-            raise ConfigError("the public profile must use authentication.mechanism: none")
-        security = _mapping(data.get("security"), "profiles[0].security")
-        if security.get("policy", "none") != "none" or set(security) - {"policy"}:
-            raise ConfigError("the public profile must use security.policy: none")
-        if "client_system_title" in data or "secrets" in data or "invocation_counter" in data:
-            raise ConfigError("secure credentials and invocation-counter settings require hls_gmac_suite0")
-        return (
-            PublicProfile(
-                client_address=_integer(data.get("client_address", 16), "profiles[0].client_address", 1, 0x3FFF),
+    if not profiles:
+        raise ConfigError("profiles must contain at least one role")
+    parsed: list[ProfileConfig] = []
+    warnings: list[str] = []
+    roles: set[str] = set()
+    for index, raw_profile in enumerate(profiles):
+        label = f"profiles[{index}]"
+        data = _mapping(raw_profile, label)
+        _only_keys(
+            data,
+            {
+                "name", "role", "client_address", "client_system_title", "secrets", "server",
+                "authentication", "security", "proposed_max_pdu_size", "hdlc", "invocation_counter",
+            },
+            label,
+        )
+        name = data.get("name", "public")
+        if name not in ("public", SECURE_PROFILE_NAME):
+            raise ConfigError(f"{label}.name must be public or hls_gmac_suite0")
+        role = data.get("role", name)
+        if not isinstance(role, str) or not role.strip():
+            raise ConfigError(f"{label}.role must be a non-empty string")
+        role = role.strip()
+        if role in roles:
+            raise ConfigError(f"profile role names must be unique: {role}")
+        roles.add(role)
+        logical, physical, address_size = _parse_server_and_hdlc(
+            data, secure=name == SECURE_PROFILE_NAME, label=label
+        )
+        max_pdu = _integer(
+            data.get("proposed_max_pdu_size", 0xFFFF), f"{label}.proposed_max_pdu_size", 64, 0xFFFF
+        )
+        if name == "public":
+            auth = _mapping(data.get("authentication"), f"{label}.authentication")
+            if auth.get("mechanism", "none") != "none" or set(auth) - {"mechanism"}:
+                raise ConfigError("the public profile must use authentication.mechanism: none")
+            security = _mapping(data.get("security"), f"{label}.security")
+            if security.get("policy", "none") != "none" or set(security) - {"policy"}:
+                raise ConfigError("the public profile must use security.policy: none")
+            if "client_system_title" in data or "secrets" in data or "invocation_counter" in data:
+                raise ConfigError("secure credentials and invocation-counter settings require hls_gmac_suite0")
+            parsed.append(
+                PublicProfile(
+                    role=role,
+                    client_address=_integer(data.get("client_address", 16), f"{label}.client_address", 1, 0x3FFF),
+                    server_logical_address=logical,
+                    server_physical_address=physical,
+                    server_address_size=address_size,
+                    proposed_max_pdu_size=max_pdu,
+                )
+            )
+            continue
+
+        auth = _mapping(data.get("authentication"), f"{label}.authentication")
+        if auth and (auth.get("mechanism") != "high_gmac" or set(auth) - {"mechanism"}):
+            raise ConfigError("hls_gmac_suite0 implies authentication.mechanism: high_gmac")
+        security = _mapping(data.get("security"), f"{label}.security")
+        if security:
+            _only_keys(security, {"suite", "policy"}, f"{label}.security")
+            if security.get("suite", 0) != 0 or security.get("policy", "authentication_encryption") != "authentication_encryption":
+                raise ConfigError("hls_gmac_suite0 requires suite 0 and authentication_encryption")
+        system_title = _parse_hex(data.get("client_system_title"), f"{label}.client_system_title", 8)
+        secrets = _mapping(data.get("secrets"), f"{label}.secrets")
+        _only_keys(secrets, {"gak", "guek"}, f"{label}.secrets")
+        if "gak" not in secrets or "guek" not in secrets:
+            raise ConfigError(f"{label}.secrets must define both gak and guek")
+        gak = _parse_secret_source(secrets["gak"], f"{label}.secrets.gak", base_directory)
+        guek = _parse_secret_source(secrets["guek"], f"{label}.secrets.guek", base_directory)
+        if gak.kind == "inline" or guek.kind == "inline":
+            warnings.append(f"Role {role}: inline GAK/GUEK values are for laboratory use only and will be redacted from all output.")
+        parsed.append(
+            SecureProfile(
+                name=SECURE_PROFILE_NAME,
+                role=role,
+                client_address=_integer(data.get("client_address", 1), f"{label}.client_address", 1, 0x3FFF),
+                client_system_title=system_title,
+                secrets=SecureSecrets(gak=gak, guek=guek),
                 server_logical_address=logical,
                 server_physical_address=physical,
                 server_address_size=address_size,
                 proposed_max_pdu_size=max_pdu,
-            ),
-            (),
+                invocation_counter=_parse_invocation_counter(
+                    data.get("invocation_counter"), base_directory, label=label
+                ),
+            )
         )
-
-    auth = _mapping(data.get("authentication"), "profiles[0].authentication")
-    if auth and (auth.get("mechanism") != "high_gmac" or set(auth) - {"mechanism"}):
-        raise ConfigError("hls_gmac_suite0 implies authentication.mechanism: high_gmac")
-    security = _mapping(data.get("security"), "profiles[0].security")
-    if security:
-        _only_keys(security, {"suite", "policy"}, "profiles[0].security")
-        if security.get("suite", 0) != 0 or security.get("policy", "authentication_encryption") != "authentication_encryption":
-            raise ConfigError("hls_gmac_suite0 requires suite 0 and authentication_encryption")
-    system_title = _parse_hex(data.get("client_system_title"), "profiles[0].client_system_title", 8)
-    secrets = _mapping(data.get("secrets"), "profiles[0].secrets")
-    _only_keys(secrets, {"gak", "guek"}, "profiles[0].secrets")
-    if "gak" not in secrets or "guek" not in secrets:
-        raise ConfigError("profiles[0].secrets must define both gak and guek")
-    gak = _parse_secret_source(secrets["gak"], "profiles[0].secrets.gak", base_directory)
-    guek = _parse_secret_source(secrets["guek"], "profiles[0].secrets.guek", base_directory)
-    warnings: list[str] = []
-    if gak.kind == "inline" or guek.kind == "inline":
-        warnings.append("Inline GAK/GUEK values are for laboratory use only and will be redacted from all output.")
-    return (
-        SecureProfile(
-            name=SECURE_PROFILE_NAME,
-            client_address=_integer(data.get("client_address", 1), "profiles[0].client_address", 1, 0x3FFF),
-            client_system_title=system_title,
-            secrets=SecureSecrets(gak=gak, guek=guek),
-            server_logical_address=logical,
-            server_physical_address=physical,
-            server_address_size=address_size,
-            proposed_max_pdu_size=max_pdu,
-            invocation_counter=_parse_invocation_counter(data.get("invocation_counter"), base_directory),
-        ),
-        tuple(warnings),
-    )
-
-
+    return tuple(parsed), tuple(warnings)
 def _parse_output(raw: Any) -> OutputConfig:
     data = _mapping(raw, "output")
     _only_keys(
@@ -532,17 +592,19 @@ def _parse_output(raw: Any) -> OutputConfig:
 def parse_config(data: Any, *, base_directory: str | Path | None = None) -> AppConfig:
     root = _mapping(data, "configuration")
     _only_keys(root, {"version", "transport", "scan", "profiles", "output"}, "configuration")
-    profile, warnings = _parse_profile(
+    profiles, warnings = _parse_profiles(
         root.get("profiles"), Path(base_directory) if base_directory is not None else None
     )
     scan = _parse_scan(root.get("scan"))
-    if scan.union_profile_test and not isinstance(profile, SecureProfile):
+    if scan.union_profile_test and not any(
+        isinstance(profile, SecureProfile) for profile in profiles
+    ):
         raise ConfigError("scan.union_profile_test requires an hls_gmac_suite0 profile")
     return AppConfig(
         version=_integer(root.get("version", 1), "version", 1, 1),
         transport=_parse_transport(root.get("transport")),
         scan=scan,
-        profile=profile,
+        profiles=profiles,
         output=_parse_output(root.get("output")),
         warnings=warnings,
     )
@@ -615,18 +677,19 @@ def dump_config(config: AppConfig, path: str | Path) -> None:
     except ModuleNotFoundError as exc:
         raise RuntimeError("PyYAML is required to save configuration files") from exc
     data = config.redacted_dict()
-    if isinstance(config.profile, SecureProfile):
-        def serializable_source(source: SecretSource) -> dict[str, Any]:
-            if source.kind == "env":
-                return {"env": source.locator}
-            if source.kind == "file":
-                return {"file": source.locator}
-            # Never write inline key material back to disk. A subsequently
-            # loaded saved configuration will ask for it with masked input.
-            return {"prompt": True}
+    def serializable_source(source: SecretSource) -> dict[str, Any]:
+        if source.kind == "env":
+            return {"env": source.locator}
+        if source.kind == "file":
+            return {"file": source.locator}
+        # Never write inline key material back to disk. A subsequently
+        # loaded saved configuration will ask for it with masked input.
+        return {"prompt": True}
 
-        data["profiles"][0]["secrets"] = {
-            "gak": serializable_source(config.profile.secrets.gak),
-            "guek": serializable_source(config.profile.secrets.guek),
-        }
+    for index, profile in enumerate(config.profiles):
+        if isinstance(profile, SecureProfile):
+            data["profiles"][index]["secrets"] = {
+                "gak": serializable_source(profile.secrets.gak),
+                "guek": serializable_source(profile.secrets.guek),
+            }
     Path(path).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")

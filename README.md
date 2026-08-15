@@ -24,29 +24,69 @@ python -m dlms_enum validate-config meter-public.yaml
 python -m dlms_enum scan --config meter-public.yaml
 ```
 
-At startup, interactive terminal runs ask whether this should be a short test. A short test still downloads and parses the complete Association View, then scans only the first 10 objects listed by the meter before performing the normal clean teardown. The same choice can be made without a prompt:
+At startup, interactive runs list all configured roles and select all of them by default. A mandatory public preflight then discovers the working serial interface, baud rate, server address, public Association View and meter identity, reports negotiated capabilities, and validates readable invocation-counter candidates before the final READ-only plan is confirmed. The same role and scope choices can be supplied without prompts:
 
 ```shell
 python -m dlms_enum scan --config meter-public.yaml --short
 python -m dlms_enum scan --config meter-public.yaml --full
 python -m dlms_enum scan --config meter-public.yaml --get-limit 100
+python -m dlms_enum scan --config meter-profiles.yaml --roles public,client1 --get-limit 100
 ```
 
 `--get-limit 100` tests exactly the first 100 mapped GET capabilities while retaining every other GET, SET, and ACTION capability in the report as `NOT_TESTED`. In a secure scan, the same limit also caps the optional cross-profile public GET test. For unattended configuration-driven runs, use `scan.get_limit: 100`; the older object-based short scope remains available as `scan.object_limit: 10`. The two limits are mutually exclusive. If neither limit nor a command-line switch is supplied and standard input is not an interactive terminal, the default remains a full scan.
+
+When the public preflight reports the negotiated `multiple_references` conformance bit, an interactive run offers GET-with-list batching. The operator chooses a maximum from 1 through 10 attributes; the effective size is additionally reduced to fit the negotiated PDU. Scaler and unit attributes remain ahead of their value attribute. If a list request is rejected, malformed, or contains an item error, the whole list is retried as individual GETs so every attribute keeps an independent outcome. For unattended runs, set `scan.batch_size`; its safe default is `1` (disabled).
 
 Secure scan:
 
 ```shell
 cp examples/hls-gmac-suite0-meter.yaml meter-secure.yaml
-export DLMS_GAK='hex:00000000000000000000000000000000'   # replace with provisioned GAK
-export DLMS_GUEK='hex:00000000000000000000000000000000'  # replace with provisioned GUEK
+export C4_GAK='hex:00000000000000000000000000000000'   # replace with provisioned GAK
+export C4_GUEK='hex:00000000000000000000000000000000'  # replace with provisioned GUEK
 python -m dlms_enum validate-config meter-secure.yaml
 python -m dlms_enum scan --config meter-secure.yaml
 ```
 
-Do not use the placeholder keys shown above. The client system title in the example is also a placeholder and must be replaced with the eight-byte value provisioned for that client.
+This example configures the mandatory public preflight role plus secure role `c4` at client SAP 4. Do not use the placeholder keys shown above. The client system title in the example is also a placeholder and must be replaced with the eight-byte value provisioned for that client.
 
 Guided setup is available with `python -m dlms_enum scan`. Secure keys entered there are masked. If that configuration is saved, inline key values are replaced with masked interactive prompts rather than written to disk.
+
+## Multiple roles and public preflight
+
+Use `role` to give each configured client a unique operator-facing name. `name` continues to select the implemented protocol profile:
+
+```yaml
+version: 1
+
+transport:
+  device: /dev/ttyUSB0
+
+profiles:
+  - name: public
+    role: public
+
+  - name: hls_gmac_suite0
+    role: client1
+    client_address: 1
+    client_system_title: "hex:0011223344556677"
+    secrets:
+      gak: {env: CLIENT1_GAK}
+      guek: {env: CLIENT1_GUEK}
+
+  - name: hls_gmac_suite0
+    role: client2
+    client_address: 4
+    client_system_title: "hex:1122334455667788"
+    secrets:
+      gak: {env: CLIENT2_GAK}
+      guek: {env: CLIENT2_GUEK}
+    invocation_counter:
+      logical_name: 0.0.43.1.1.255
+```
+
+The public preflight always runs, even when the public role is not selected for a full scan. For every selected secure role, the operator sees its SAP and system title together with the configured counter object and decoded current value. The operator can accept it, select another validated public-readable unsigned Data value, enter an OBIS from that list, or abort. The chosen mapping affects only the runtime configuration; the source YAML is not rewritten. Immediately before the secure association, the counter is read again and combined with crash-safe local state as described below.
+
+With multiple selected roles, each role receives its own subdirectory and canonical report. The parent directory contains `workflow.json` and the public `preflight-traffic.jsonl`. A single selected role retains the existing flat output layout.
 
 ## Minimal HLS-GMAC Security Suite 0 configuration
 
@@ -187,7 +227,7 @@ profiles:
       meter_identity: null  # optional explicit identity if public identity GET is unavailable
 ```
 
-Serial framing, response timeout, inter-request delay, and session guard remain transport-level overrides; see `examples/public-meter.yaml` for their complete form.
+Serial framing, validation response timeout, inter-request delay, and session guard remain transport-level overrides; see `examples/public-meter.yaml` for their complete form. `transport.response_timeout_ms` applies while establishing and validating the association, including the Association View. Once that succeeds, enumeration switches to `scan.enumeration_timeout_ms`, which defaults to 1000 ms. This allows a more tolerant connection timeout such as 3000 ms without paying that delay for every unanswered attribute.
 
 ## Outputs
 
@@ -197,7 +237,7 @@ Each run gets a UTC-named directory under `./runs` unless overridden:
 - `summary.md` is the human-readable report. It contains connection and role details, a decoded OBIS table, the public cross-profile access findings when enabled, and the complete operation capability matrix. In secure scans the decoded table places the encrypted RX payload immediately to the right of the encoded value; only ciphertext is shown, without HDLC framing, security control, invocation counter, authentication tag, or CRC. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent. The separate protected-APDU table retains command, counter, ciphertext, and authentication-tag evidence.
 - `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators.
 
-GET uses at most two attempts. Explicit DLMS errors such as access denied are not retried. Timeouts, transport failures, and malformed responses can receive one retry; each protected retry gets a new persisted invocation counter. After two consecutive timeout responses, retries are suppressed for the remaining GETs in that scan phase. The default response timeout is 1000 ms and remains configurable with `transport.response_timeout_ms`.
+GET uses at most two attempts. Explicit DLMS errors such as access denied are not retried. Timeouts, transport failures, and malformed responses can receive one retry; each protected retry gets a new persisted invocation counter. After two consecutive timeout responses, retries are suppressed while that timeout run continues. After four consecutive timeouts by default, a circuit breaker reads the last successfully read attribute (or the proven Association View if no smaller GET has succeeded). If the health check fails, the scanner drops the link, reconnects once, and checks again. A successful check resets the breaker and resumes scanning; another failure stops that GET phase without sending the remaining requests and reports those operations as `INCONCLUSIVE`. Configure the threshold from 3 through 10 with `scan.timeout_breaker_threshold`.
 
 ### Terminal progress and secure-status messages
 
@@ -221,8 +261,9 @@ Gurux internally labels Suite 0 security-control bit `0x20` as “Encryption is 
 python -m unittest discover -s tests -v
 python -m dlms_enum validate-config examples/public-meter.yaml
 python -m dlms_enum validate-config examples/hls-gmac-suite0-meter.yaml
+python -m dlms_enum validate-config examples/multi-role-meter.yaml
 ```
 
 Protocol tests use fakes, the real Gurux request generator, and sanitized structural expectations derived from the supplied captures; they need no physical meter and embed no keys. Live validation is still required for the target meter, particularly its role provisioning, counter object access, server system title, association-view size, and protected-release behavior.
 
-This release accepts exactly one primary scan profile per run: either `public` or `hls_gmac_suite0`. A secure run can also perform the bounded public cross-profile test described above, but it does not perform a complete second public scan. Security Suites 1/2, dedicated keys, signing, key agreement, key management, and arbitrary ACTION/SET execution are intentionally unsupported.
+This release accepts multiple named `public` and `hls_gmac_suite0` roles and scans each selected role independently after one public planning preflight. A secure role can also perform the bounded public cross-profile test described above. Negotiated GET-with-list batching is available for Association View-advertised reads, with bounded groups and individual fallback. Security Suites 1/2, dedicated keys, signing, key agreement, key management, and arbitrary ACTION/SET execution are intentionally unsupported.

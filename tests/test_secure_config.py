@@ -33,6 +33,30 @@ def secure_mapping(**profile_overrides):
 
 
 class SecureConfigTests(unittest.TestCase):
+    def test_multiple_secure_roles_have_independent_labels_and_counter_sources(self):
+        first = secure_mapping()["profiles"][0]
+        first["role"] = "client1"
+        second = {
+            **secure_mapping(client_address=4)["profiles"][0],
+            "role": "client2",
+            "client_system_title": "hex:4D45544552303032",
+            "invocation_counter": {"logical_name": "0.0.43.1.1.255"},
+        }
+
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "profiles": [first, second],
+            }
+        )
+
+        self.assertEqual([item.role for item in config.profiles], ["client1", "client2"])
+        self.assertEqual(config.profiles[1].invocation_counter.logical_name, "0.0.43.1.1.255")
+        self.assertEqual(
+            [item["role"] for item in config.redacted_dict()["profiles"]],
+            ["client1", "client2"],
+        )
+
     def test_secure_profile_parsing_and_implied_defaults(self):
         config = parse_config(secure_mapping())
 

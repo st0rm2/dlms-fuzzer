@@ -1,0 +1,109 @@
+import argparse
+import io
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from rich.console import Console
+
+from dlms_enum.cli import _scan
+from dlms_enum.config import parse_config
+from dlms_enum.workflow import CounterCandidate, PublicPreflight
+
+
+class NullLogger:
+    def __init__(self, path):
+        self.path = path
+
+    def close(self):
+        pass
+
+
+class CliWorkflowTests(unittest.TestCase):
+    def test_unselected_public_role_still_drives_preflight_and_pins_secure_scan(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "profiles": [
+                    {"name": "public", "role": "public"},
+                    {
+                        "name": "hls_gmac_suite0",
+                        "role": "client1",
+                        "client_address": 1,
+                        "client_system_title": "hex:0011223344556677",
+                        "secrets": {
+                            "gak": {"inline": "00" * 16},
+                            "guek": {"inline": "11" * 16},
+                        },
+                    },
+                ],
+            }
+        )
+        preflight = PublicPreflight(
+            transport={
+                "device": "/dev/null",
+                "selected_baudrate": 19200,
+                "selected_server_address": 131,
+                "selected_server_logical_address": 1,
+                "selected_server_physical_address": 3,
+                "server_address_size": 2,
+                "server_addressing_type": "2-byte addressing",
+            },
+            association={"negotiated_conformance": ["get"]},
+            meter_identity="METER-1",
+            association_view_objects=1,
+            counter_candidates=(
+                CounterCandidate(1, "0.0.43.1.0.255", 2, 100),
+            ),
+        )
+        args = argparse.Namespace(
+            config=Path("meter.yaml"),
+            roles="client1",
+            short=False,
+            full=True,
+            get_limit=None,
+        )
+        captured = {}
+
+        def fake_preflight(runtime_config, *_args, **_kwargs):
+            captured["preflight_role"] = runtime_config.profile.role
+            return preflight
+
+        def fake_scan(runtime_config, *_args, **_kwargs):
+            captured["scan_config"] = runtime_config
+            return {
+                "run": {"id": "test", "status": "completed"},
+                "transport": {},
+                "profiles": [],
+                "errors": [],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_directory = Path(directory) / "run"
+            run_directory.mkdir()
+            with (
+                patch("dlms_enum.cli.load_config", return_value=config),
+                patch("dlms_enum.cli._run_directory", return_value=run_directory),
+                patch("dlms_enum.cli.TrafficLogger", NullLogger),
+                patch("dlms_enum.cli.run_public_preflight", side_effect=fake_preflight),
+                patch("dlms_enum.cli.scan", side_effect=fake_scan),
+                patch("dlms_enum.cli.write_report"),
+            ):
+                status = _scan(
+                    args,
+                    Console(file=io.StringIO(), color_system=None),
+                )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(captured["preflight_role"], "public")
+        runtime = captured["scan_config"]
+        self.assertEqual(runtime.profile.role, "client1")
+        self.assertEqual(runtime.transport.baudrate, 19200)
+        self.assertEqual(runtime.profile.server_logical_address, 1)
+        self.assertEqual(runtime.profile.server_physical_address, 3)
+        self.assertEqual(runtime.profile.server_address_size, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

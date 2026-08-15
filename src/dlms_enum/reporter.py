@@ -184,6 +184,15 @@ def render_summary_report(
         association = profile.get("association", {})
         summary = profile.get("summary", {})
         scan_scope = profile.get("scan_scope", {})
+        list_scope = scan_scope.get("get_with_list", {})
+        timeout_policy = scan_scope.get("timeout_policy", {})
+        list_label = "disabled"
+        if list_scope.get("effective_batch_size", 1) > 1:
+            list_label = (
+                f"up to {list_scope['effective_batch_size']} attributes; "
+                f"{list_scope.get('successful_batches', 0)} successful list requests, "
+                f"{list_scope.get('fallback_batches', 0)} fallbacks"
+            )
         profile_name = str(profile.get("name", "unknown"))
         lines.extend(
             [
@@ -201,7 +210,11 @@ def render_summary_report(
                 f"| Objects | {_markdown(summary.get('objects', 0))} |",
                 f"| Scan scope | {_markdown(_scan_scope_label(scan_scope))} |",
                 f"| Association View objects | {_markdown(scan_scope.get('association_view_objects', profile.get('association_view_object_count', '—')))} |",
-                f"| GET results | {_markdown(summary.get('get_success', 0))} successful / {_markdown(summary.get('get_failed', 0))} failed |",
+                f"| GET results | {_markdown(summary.get('get_success', 0))} successful / {_markdown(summary.get('get_failed', 0))} failed / {_markdown(summary.get('get_inconclusive', 0))} inconclusive |",
+                f"| GET transmissions | {_markdown(summary.get('get_transmissions', 0))} |",
+                f"| GET-with-list | {_markdown(list_label)} |",
+                f"| Enumeration timeout | {_markdown(timeout_policy.get('enumeration_timeout_ms', '—'))} ms |",
+                f"| Timeout circuit breaker | {_markdown(timeout_policy.get('trips', 0))} trips / {_markdown(timeout_policy.get('successful_reconnects', 0))} successful reconnects / stopped: {_markdown(timeout_policy.get('stopped', False))} |",
                 f"| GET not tested | {_markdown(summary.get('get_not_tested', 0))} |",
                 f"| Advertised SET attributes | {_markdown(summary.get('advertised_set_attributes', 0))} (not tested) |",
                 f"| Advertised ACTION methods | {_markdown(summary.get('advertised_action_methods', 0))} (not tested) |",
@@ -493,17 +506,38 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
         f"HDLC server address: {report.get('transport', {}).get('selected_server_address', 'not found')}",
         f"Server Addressing Type: {report.get('transport', {}).get('server_addressing_type', 'not found')}",
         f"Objects: {summary.get('objects', 0)}",
-        f"GET: {summary.get('get_success', 0)} success, {summary.get('get_failed', 0)} failed",
+        f"GET: {summary.get('get_success', 0)} success, {summary.get('get_failed', 0)} failed, {summary.get('get_inconclusive', 0)} inconclusive",
         f"GET not tested: {summary.get('get_not_tested', 0)}",
         f"Advertised SET attributes: {summary.get('advertised_set_attributes', 0)} (not tested)",
         f"Advertised ACTION methods: {summary.get('advertised_action_methods', 0)} (not tested)",
         f"Errors: {len(report.get('errors', []))}",
     ]
     association = profile.get("association", {})
-    if profile.get("name") == "hls_gmac_suite0":
+    if profile.get("type", profile.get("name")) == "hls_gmac_suite0":
         lines.insert(2, f"HLS-GMAC validated: {association.get('hls_validated', False)}")
         lines.insert(3, f"Security: Suite 0 / {association.get('security', 'not established')}")
     scan_scope = profile.get("scan_scope", {})
+    list_scope = scan_scope.get("get_with_list", {})
+    timeout_policy = scan_scope.get("timeout_policy", {})
+    if timeout_policy:
+        lines.append(
+            "Timeout policy: {} ms enumeration timeout, breaker after {}, {} trips, "
+            "{} successful reconnects, stopped={}".format(
+                timeout_policy.get("enumeration_timeout_ms", "unknown"),
+                timeout_policy.get("circuit_breaker_threshold", "unknown"),
+                timeout_policy.get("trips", 0),
+                timeout_policy.get("successful_reconnects", 0),
+                timeout_policy.get("stopped", False),
+            )
+        )
+    if list_scope.get("effective_batch_size", 1) > 1:
+        lines.append(
+            "GET-with-list: up to {} attributes, {} successful batches, {} fallbacks".format(
+                list_scope["effective_batch_size"],
+                list_scope.get("successful_batches", 0),
+                list_scope.get("fallback_batches", 0),
+            )
+        )
     if scan_scope.get("short_test"):
         lines.insert(
             2,

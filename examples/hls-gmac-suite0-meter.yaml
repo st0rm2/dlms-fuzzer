@@ -5,20 +5,27 @@ transport:
   baudrate: auto
 
 scan:
+  enumeration_timeout_ms: 1000
+  timeout_breaker_threshold: 4
   # After the secure scan, directly test authenticated-only GET targets again
   # through a fresh public association and flag any unexpected successful reads.
   union_profile_test: true
 
 profiles:
+  - name: public
+    role: public
+
   - name: hls_gmac_suite0
-    client_address: 1
+    role: c4
+    client_address: 4
     client_system_title: "hex:0011223344556677"
     secrets:
       gak:
-        env: DLMS_GAK
+        env: C4_GAK
       guek:
-        env: DLMS_GUEK
+        env: C4_GUEK
 
-# Secure defaults provide logical-name referencing, public client SAP 16 for
-# counter bootstrap, server address discovery, Security Suite 0,
+# The public role is used for the mandatory preflight and may also be selected
+# for a full scan. Secure defaults provide logical-name referencing, public
+# client SAP 16 for counter bootstrap, server address discovery, Security Suite 0,
 # AUTHENTICATION_ENCRYPTION, and invocation-counter object 0.0.43.1.0.255/2.

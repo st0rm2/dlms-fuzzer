@@ -185,7 +185,7 @@ class GuruxSession:
         self.baudrate = baudrate
         self.traffic = traffic
         profile = config.profile
-        self.profile_name = profile_name or profile.name
+        self.profile_name = profile_name or profile.role
         self.authentication_name = "none"
         self.security_name = "none"
         self.server_logical_address = (
@@ -234,6 +234,14 @@ class GuruxSession:
         self._open = False
         self._linked = False
         self._associated = False
+        self._response_timeout_ms = config.transport.response_timeout_ms
+
+    def set_response_timeout(self, timeout_ms: int) -> None:
+        """Set the timeout used by subsequent exchanges in this session."""
+
+        if timeout_ms <= 0:
+            raise ValueError("response timeout must be positive")
+        self._response_timeout_ms = int(timeout_ms)
 
     def _endpoint_context(self) -> dict[str, Any]:
         address_size = self.server_address_size or int(self.client.serverAddressSize)
@@ -323,7 +331,9 @@ class GuruxSession:
         receive = ReceiveParameters()
         receive.eop = 0x7E
         receive.allData = True
-        receive.waitTime = self.config.transport.response_timeout_ms
+        receive.waitTime = getattr(
+            self, "_response_timeout_ms", self.config.transport.response_timeout_ms
+        )
         receive.count = 5
         self.media.eop = receive.eop
         frame_data = GXByteBuffer()
@@ -557,6 +567,21 @@ class GuruxSession:
             tx_context={"service": "get-request", "attribute_id": attribute_id},
         )
         raw_value = reply.value
+        return self._decode_attribute_value(
+            target,
+            attribute_id,
+            raw_value,
+            dlms_data_type=enum_name(getattr(reply, "valueType", None)),
+        )
+
+    def _decode_attribute_value(
+        self,
+        target: Any,
+        attribute_id: int,
+        raw_value: Any,
+        *,
+        dlms_data_type: str | None,
+    ) -> dict[str, Any]:
         class_decode_error = None
         try:
             decoded = _quiet_gurux(
@@ -579,13 +604,61 @@ class GuruxSession:
         result = {
             "value": normalize_value(decoded),
             "raw_value": normalize_value(raw_value),
-            "dlms_data_type": enum_name(getattr(reply, "valueType", None)),
+            "dlms_data_type": dlms_data_type,
             "interface_data_type": interface_data_type,
             "ui_data_type": ui_data_type,
         }
         if class_decode_error:
             result["class_decode_note"] = class_decode_error
         return result
+
+    def read_attributes(
+        self,
+        requests: list[tuple[Any, int]],
+        attempt: int,
+    ) -> list[dict[str, Any]]:
+        """Read an ordered list of attributes in one GET-with-list service."""
+
+        if not 2 <= len(requests) <= 10:
+            raise ValueError("GET-with-list requires from 2 to 10 attributes")
+        generated = _quiet_gurux(self.client.readList, requests)
+        if len(generated) != 1:
+            raise RuntimeError("Gurux split one bounded GET list unexpectedly")
+        packets = generated[0]
+        reply = GXReplyData()
+        targets = [
+            {
+                "class_id": int(target.objectType),
+                "logical_name": str(target.logicalName),
+                "object_version": int(getattr(target, "version", 0)),
+                "attribute_id": attribute_id,
+            }
+            for target, attribute_id in requests
+        ]
+        self._read_blocks(
+            packets,
+            reply,
+            phase="get_scan",
+            purpose="object_attribute_list_read",
+            operation="GET",
+            attempt=attempt,
+            object_context={"batch_size": len(requests), "targets": targets},
+            tx_context={"service": "get-request-with-list", "targets": targets},
+        )
+        values = reply.value
+        if not isinstance(values, list) or len(values) != len(requests):
+            raise RuntimeError("GET-with-list response count does not match its request")
+        results: list[dict[str, Any]] = []
+        for (target, attribute_id), raw_value in zip(requests, values, strict=True):
+            results.append(
+                self._decode_attribute_value(
+                    target,
+                    attribute_id,
+                    raw_value,
+                    dlms_data_type=None,
+                )
+            )
+        return results
 
     def read_bootstrap_value(
         self,
@@ -699,6 +772,32 @@ class GuruxSession:
             time.sleep(self.config.transport.session_guard_ms / 1000)
         return warnings
 
+    def reconnect(self) -> dict[str, Any]:
+        """Drop a potentially wedged link and establish a fresh association."""
+
+        try:
+            self.media.resetSynchronousBuffer()
+        except Exception:
+            pass
+        try:
+            self.media.close()
+        finally:
+            self._open = False
+            self._linked = False
+            self._associated = False
+        if self.config.transport.session_guard_ms:
+            time.sleep(self.config.transport.session_guard_ms / 1000)
+        try:
+            return self.connect()
+        except Exception:
+            try:
+                self.media.close()
+            finally:
+                self._open = False
+                self._linked = False
+                self._associated = False
+            raise
+
 
 class GuruxSecureSession(GuruxSession):
     """HLS-GMAC Security Suite 0 association with protected xDLMS services."""
@@ -727,7 +826,7 @@ class GuruxSecureSession(GuruxSession):
             server_physical_address=server_physical_address,
             server_address_size=server_address_size,
             client_address=profile.client_address,
-            profile_name=profile.name,
+            profile_name=profile.role,
         )
         self.counter_lease = counter_lease
         self.authentication_name = "high_gmac"

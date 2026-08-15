@@ -109,6 +109,37 @@ class LimitedSession(FakeSession):
         return {"value": target.logicalName, "dlms_data_type": "visible_string"}
 
 
+class BatchSession(LimitedSession):
+    batches = []
+
+    def connect(self):
+        return {
+            "authentication": "none",
+            "negotiated_conformance": ["get", "multiple_references"],
+            "max_receive_pdu_size": 62,
+        }
+
+    def read_attributes(self, requests, attempt):
+        self.batches.append(
+            [(target.logicalName, attribute_id) for target, attribute_id in requests]
+        )
+        return [
+            {"value": target.logicalName, "dlms_data_type": "visible_string"}
+            for target, _ in requests
+        ]
+
+
+class FailingBatchSession(BatchSession):
+    def discover_objects(self, attempt):
+        return [ManyObject(1), ManyObject(2)]
+
+    def read_attributes(self, requests, attempt):
+        self.batches.append(
+            [(target.logicalName, attribute_id) for target, attribute_id in requests]
+        )
+        raise RuntimeError("list service rejected")
+
+
 class TimeoutSession(FakeSession):
     read_attempts = []
 
@@ -117,6 +148,60 @@ class TimeoutSession(FakeSession):
 
     def read_attribute(self, target, attribute_id, attempt):
         self.read_attempts.append((target.logicalName, attribute_id, attempt))
+        raise TimeoutError("meter did not reply")
+
+
+class CircuitBreakerSession(FakeSession):
+    read_attempts = []
+    timeout_changes = []
+    reconnects = 0
+
+    def discover_objects(self, attempt):
+        return [ManyObject(index) for index in range(1, 9)]
+
+    def set_response_timeout(self, timeout_ms):
+        self.timeout_changes.append(timeout_ms)
+
+    def read_attribute(
+        self,
+        target,
+        attribute_id,
+        attempt,
+        *,
+        phase="get_scan",
+        purpose="object_attribute_read",
+    ):
+        self.read_attempts.append(
+            (target.logicalName, attribute_id, attempt, phase, purpose)
+        )
+        if target.logicalName == "1.0.1.8.0.255" and phase == "get_scan":
+            return {"value": "known-good", "dlms_data_type": "visible_string"}
+        raise TimeoutError("meter did not reply")
+
+    def reconnect(self):
+        self.__class__.reconnects += 1
+        return self.connect()
+
+
+class RecoveringCircuitSession(CircuitBreakerSession):
+    def discover_objects(self, attempt):
+        return [ManyObject(index) for index in range(1, 7)]
+
+    def read_attribute(
+        self,
+        target,
+        attribute_id,
+        attempt,
+        *,
+        phase="get_scan",
+        purpose="object_attribute_read",
+    ):
+        self.read_attempts.append(
+            (target.logicalName, attribute_id, attempt, phase, purpose)
+        )
+        index = int(target.logicalName.split(".")[2])
+        if phase == "get_health_check" or index in {1, 5, 6}:
+            return {"value": "known-good", "dlms_data_type": "visible_string"}
         raise TimeoutError("meter did not reply")
 
 
@@ -250,6 +335,110 @@ class ScannerTests(unittest.TestCase):
         ]
         self.assertFalse(attributes[0]["retry_suppressed"])
         self.assertTrue(all(item["retry_suppressed"] for item in attributes[1:]))
+
+    def test_timeout_circuit_reconnects_once_then_marks_remainder_inconclusive(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "response_timeout_ms": 3000,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {
+                    "common_catalogue": False,
+                    "enumeration_timeout_ms": 800,
+                    "timeout_breaker_threshold": 4,
+                },
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = CircuitBreakerSession
+        CircuitBreakerSession.read_attempts = []
+        CircuitBreakerSession.timeout_changes = []
+        CircuitBreakerSession.reconnects = 0
+        events = []
+
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object(), progress=events.append)
+
+        profile = report["profiles"][0]
+        policy = profile["scan_scope"]["timeout_policy"]
+        self.assertEqual(profile["summary"]["get_success"], 1)
+        self.assertEqual(profile["summary"]["get_failed"], 3)
+        self.assertEqual(profile["summary"]["get_inconclusive"], 4)
+        self.assertEqual(profile["summary"]["get_transmissions"], 7)
+        self.assertEqual(CircuitBreakerSession.reconnects, 1)
+        self.assertEqual(CircuitBreakerSession.timeout_changes, [800, 3000, 800])
+        self.assertEqual(policy["trips"], 1)
+        self.assertEqual(policy["health_check_transmissions"], 2)
+        self.assertEqual(policy["reconnect_attempts"], 1)
+        self.assertEqual(policy["successful_reconnects"], 1)
+        self.assertTrue(policy["stopped"])
+        self.assertEqual(
+            policy["last_health_probe"]["logical_name"], "1.0.1.8.0.255"
+        )
+        outcomes = [
+            attribute["outcome"]
+            for obj in profile["objects"]
+            for attribute in obj["attributes"]
+            if attribute["attribute_id"] == 2
+        ]
+        self.assertEqual(
+            outcomes,
+            ["SUCCESS", "TIMEOUT", "TIMEOUT", "TIMEOUT"]
+            + ["INCONCLUSIVE"] * 4,
+        )
+        inconclusive_rows = [
+            row
+            for row in report["capability_matrix"]
+            if row["operation"] == "GET"
+            and row["profiles"]["public"]["status"] == "INCONCLUSIVE"
+        ]
+        self.assertEqual(len(inconclusive_rows), 4)
+        self.assertTrue(
+            all(not row["profiles"]["public"]["tested"] for row in inconclusive_rows)
+        )
+        self.assertEqual(
+            sum(event["phase"] == "timeout_reconnect" for event in events), 1
+        )
+        self.assertEqual(
+            sum(event["phase"] == "timeout_circuit_stopped" for event in events),
+            1,
+        )
+
+    def test_successful_health_check_resets_breaker_and_resumes(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {
+                    "common_catalogue": False,
+                    "timeout_breaker_threshold": 4,
+                },
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = RecoveringCircuitSession
+        RecoveringCircuitSession.read_attempts = []
+        RecoveringCircuitSession.timeout_changes = []
+        RecoveringCircuitSession.reconnects = 0
+
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        profile = report["profiles"][0]
+        policy = profile["scan_scope"]["timeout_policy"]
+        self.assertEqual(profile["summary"]["get_success"], 3)
+        self.assertEqual(profile["summary"]["get_failed"], 3)
+        self.assertEqual(profile["summary"]["get_inconclusive"], 0)
+        self.assertEqual(policy["trips"], 1)
+        self.assertEqual(policy["recoveries_without_reconnect"], 1)
+        self.assertEqual(policy["reconnect_attempts"], 0)
+        self.assertFalse(policy["stopped"])
 
     def test_association_write_and_action_rights_are_reported_but_not_executed(self):
         config = parse_config(
@@ -396,6 +585,74 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(
             sum(row["profiles"]["public"]["tested"] for row in get_rows),
             5,
+        )
+
+    def test_get_with_list_batches_in_attribute_order(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {"common_catalogue": False, "batch_size": 10},
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = BatchSession
+        BatchSession.batches = []
+        BatchSession.read_objects = []
+
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        profile = report["profiles"][0]
+        self.assertEqual([len(batch) for batch in BatchSession.batches], [5, 5, 2])
+        self.assertEqual(
+            [name for batch in BatchSession.batches for name, _ in batch],
+            sorted(f"1.0.{index}.8.0.255" for index in range(1, 13)),
+        )
+        self.assertTrue(
+            all(attribute_id == 2 for batch in BatchSession.batches for _, attribute_id in batch)
+        )
+        self.assertEqual(BatchSession.read_objects, [])
+        self.assertEqual(profile["summary"]["get_attempted"], 12)
+        self.assertEqual(profile["summary"]["get_transmissions"], 3)
+        self.assertEqual(profile["summary"]["get_success"], 12)
+        self.assertEqual(
+            profile["scan_scope"]["get_with_list"]["successful_batches"], 3
+        )
+        self.assertEqual(
+            profile["scan_scope"]["get_with_list"]["effective_batch_size"], 5
+        )
+
+    def test_failed_get_with_list_falls_back_to_individual_outcomes(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {"common_catalogue": False, "batch_size": 5},
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = FailingBatchSession
+        FailingBatchSession.batches = []
+        FailingBatchSession.read_objects = []
+
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        profile = report["profiles"][0]
+        self.assertEqual(len(FailingBatchSession.batches), 1)
+        self.assertEqual(len(FailingBatchSession.read_objects), 2)
+        self.assertEqual(profile["summary"]["get_success"], 2)
+        self.assertEqual(profile["summary"]["get_failed"], 0)
+        self.assertEqual(profile["summary"]["get_transmissions"], 3)
+        self.assertEqual(
+            profile["scan_scope"]["get_with_list"]["fallback_batches"], 1
         )
 
 

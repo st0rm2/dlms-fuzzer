@@ -19,6 +19,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(snapshot["profiles"][0]["authentication"], {"mechanism": "none"})
         self.assertNotIn("profile", snapshot)
 
+    def test_multi_role_example_is_valid(self):
+        config = load_config(ROOT / "examples" / "multi-role-meter.yaml")
+
+        self.assertEqual(
+            [profile.role for profile in config.profiles],
+            ["public", "client1", "client2"],
+        )
+
     def test_non_get_mode_is_rejected(self):
         with self.assertRaisesRegex(ConfigError, "only scan.mode: get"):
             parse_config(
@@ -32,6 +40,41 @@ class ConfigTests(unittest.TestCase):
         config = parse_config({"transport": {"device": "/dev/null"}})
 
         self.assertEqual(config.transport.response_timeout_ms, 1000)
+        self.assertEqual(config.scan.enumeration_timeout_ms, 1000)
+        self.assertEqual(config.scan.timeout_breaker_threshold, 4)
+
+    def test_enumeration_timeout_and_breaker_threshold_are_bounded(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "response_timeout_ms": 3000,
+                },
+                "scan": {
+                    "enumeration_timeout_ms": 750,
+                    "timeout_breaker_threshold": 5,
+                },
+            }
+        )
+
+        self.assertEqual(config.transport.response_timeout_ms, 3000)
+        self.assertEqual(config.scan.enumeration_timeout_ms, 750)
+        self.assertEqual(config.scan.timeout_breaker_threshold, 5)
+
+        for key, invalid in (
+            ("enumeration_timeout_ms", 0),
+            ("timeout_breaker_threshold", 2),
+            ("timeout_breaker_threshold", 11),
+        ):
+            with self.subTest(key=key, invalid=invalid), self.assertRaisesRegex(
+                ConfigError, f"scan.{key}"
+            ):
+                parse_config(
+                    {
+                        "transport": {"device": "/dev/null"},
+                        "scan": {key: invalid},
+                    }
+                )
 
     def test_unimplemented_manufacturer_catalogue_is_rejected(self):
         with self.assertRaisesRegex(ConfigError, "unsupported keys"):
@@ -68,18 +111,28 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
-    def test_additional_profile_is_rejected_in_this_milestone(self):
-        profile = {
+    def test_multiple_uniquely_named_roles_are_supported(self):
+        public = {
             "name": "public",
+            "role": "public",
             "client_address": 16,
             "authentication": {"mechanism": "none"},
             "security": {"policy": "none"},
         }
-        with self.assertRaisesRegex(ConfigError, "exactly one public profile"):
+        second_public = {**public, "role": "public2", "client_address": 17}
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "profiles": [public, second_public],
+            }
+        )
+
+        self.assertEqual([item.role for item in config.profiles], ["public", "public2"])
+        with self.assertRaisesRegex(ConfigError, "role names must be unique"):
             parse_config(
                 {
                     "transport": {"device": "/dev/null"},
-                    "profiles": [profile, profile],
+                    "profiles": [public, public],
                 }
             )
 
@@ -139,6 +192,26 @@ class ConfigTests(unittest.TestCase):
                     "scan": {"object_limit": 10, "get_limit": 100},
                 }
             )
+
+    def test_get_with_list_batch_size_is_bounded(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "scan": {"batch_size": 10},
+            }
+        )
+        self.assertEqual(config.scan.batch_size, 10)
+
+        for invalid in (0, 11, True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ConfigError, "scan.batch_size"
+            ):
+                parse_config(
+                    {
+                        "transport": {"device": "/dev/null"},
+                        "scan": {"batch_size": invalid},
+                    }
+                )
 
 
 if __name__ == "__main__":

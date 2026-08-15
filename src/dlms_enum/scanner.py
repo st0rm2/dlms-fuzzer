@@ -33,8 +33,6 @@ class _GetRetryPolicy:
         return configured_attempts
 
     def record(self, outcome: Outcome) -> None:
-        if self.retries_suppressed:
-            return
         if outcome == Outcome.TIMEOUT:
             self.consecutive_timeouts += 1
             self.retries_suppressed = (
@@ -42,7 +40,233 @@ class _GetRetryPolicy:
                 >= CONSECUTIVE_TIMEOUTS_BEFORE_RETRY_SUPPRESSION
             )
         else:
-            self.consecutive_timeouts = 0
+            self.reset()
+
+    def reset(self) -> None:
+        self.consecutive_timeouts = 0
+        self.retries_suppressed = False
+
+
+class _TimeoutCircuitBreaker:
+    """Detect a sustained run of unanswered requests in one scan phase."""
+
+    def __init__(self, threshold: int) -> None:
+        self.threshold = threshold
+        self.consecutive_timeouts = 0
+
+    @property
+    def tripped(self) -> bool:
+        return self.consecutive_timeouts >= self.threshold
+
+    def record(self, outcome: Outcome) -> None:
+        if outcome == Outcome.TIMEOUT:
+            self.consecutive_timeouts += 1
+        else:
+            self.reset()
+
+    def reset(self) -> None:
+        self.consecutive_timeouts = 0
+
+
+def _set_session_timeout(session: Any, timeout_ms: int) -> bool:
+    setter = getattr(session, "set_response_timeout", None)
+    if not callable(setter):
+        return False
+    setter(timeout_ms)
+    return True
+
+
+def _timeout_policy_scope(
+    config: AppConfig, *, enumeration_timeout_applied: bool
+) -> dict[str, Any]:
+    return {
+        "validation_timeout_ms": config.transport.response_timeout_ms,
+        "enumeration_timeout_ms": config.scan.enumeration_timeout_ms,
+        "enumeration_timeout_applied": enumeration_timeout_applied,
+        "circuit_breaker_threshold": config.scan.timeout_breaker_threshold,
+        "trips": 0,
+        "health_check_transmissions": 0,
+        "successful_health_checks": 0,
+        "failed_health_checks": 0,
+        "recoveries_without_reconnect": 0,
+        "reconnect_attempts": 0,
+        "successful_reconnects": 0,
+        "stopped": False,
+        "stop_reason": None,
+        "last_health_probe": None,
+    }
+
+
+def _health_probe_description(
+    health_probe: tuple[str, Any | None, int | None]
+) -> dict[str, Any]:
+    kind, target, attribute_id = health_probe
+    if kind == "association_view":
+        return {
+            "kind": kind,
+            "class_id": 15,
+            "logical_name": "0.0.40.0.0.255",
+            "attribute_id": 2,
+        }
+    return {
+        "kind": kind,
+        "class_id": int(target.objectType),
+        "logical_name": str(target.logicalName),
+        "attribute_id": int(attribute_id),
+    }
+
+
+def _run_health_probe(
+    session: Any,
+    health_probe: tuple[str, Any | None, int | None],
+    attempt: int,
+) -> None:
+    kind, target, attribute_id = health_probe
+    if kind == "association_view":
+        list(session.discover_objects(attempt))
+        return
+    session.read_attribute(
+        target,
+        int(attribute_id),
+        attempt,
+        phase="get_health_check",
+        purpose="timeout_circuit_health_check",
+    )
+
+
+def _recover_timeout_circuit(
+    session: Any,
+    config: AppConfig,
+    retry_policy: _GetRetryPolicy,
+    circuit: _TimeoutCircuitBreaker,
+    health_probe: tuple[str, Any | None, int | None],
+    circuit_scope: dict[str, Any],
+    report: dict[str, Any],
+    progress: ProgressCallback,
+    *,
+    profile_name: str,
+    phase: str,
+) -> tuple[bool, int]:
+    """Probe and, if necessary, reconnect after the timeout threshold."""
+
+    if not circuit.tripped:
+        return True, 0
+
+    transmissions = 0
+    circuit_scope["trips"] += 1
+    circuit_scope["last_health_probe"] = _health_probe_description(health_probe)
+    progress(
+        {
+            "phase": "timeout_circuit_open",
+            "profile": profile_name,
+            "consecutive_timeouts": circuit.consecutive_timeouts,
+            "message": (
+                f"Timeout circuit opened after {circuit.consecutive_timeouts} "
+                "unanswered requests; checking a known-good GET"
+            ),
+        }
+    )
+
+    def probe(label: str) -> bool:
+        nonlocal transmissions
+        transmissions += 1
+        circuit_scope["health_check_transmissions"] += 1
+        try:
+            _run_health_probe(session, health_probe, 1)
+        except Exception as exc:
+            circuit_scope["failed_health_checks"] += 1
+            report["errors"].append(
+                error_record(
+                    exc,
+                    phase=phase,
+                    context={
+                        "operation": "GET_HEALTH_CHECK",
+                        "stage": label,
+                        **_health_probe_description(health_probe),
+                    },
+                )
+            )
+            progress(
+                {
+                    "phase": "timeout_health_check_failed",
+                    "profile": profile_name,
+                    "message": f"Known-good GET failed: {type(exc).__name__}: {exc}",
+                }
+            )
+            return False
+        circuit_scope["successful_health_checks"] += 1
+        return True
+
+    if probe("before_reconnect"):
+        circuit.reset()
+        retry_policy.reset()
+        circuit_scope["recoveries_without_reconnect"] += 1
+        progress(
+            {
+                "phase": "timeout_circuit_recovered",
+                "profile": profile_name,
+                "message": "Known-good GET succeeded; resuming the scan",
+            }
+        )
+        return True, transmissions
+
+    reconnect = getattr(session, "reconnect", None)
+    if not callable(reconnect):
+        circuit_scope["stopped"] = True
+        circuit_scope["stop_reason"] = "session does not support reconnect"
+        return False, transmissions
+
+    circuit_scope["reconnect_attempts"] += 1
+    progress(
+        {
+            "phase": "timeout_reconnect",
+            "profile": profile_name,
+            "message": "Known-good GET also failed; reconnecting once",
+        }
+    )
+    try:
+        _set_session_timeout(session, config.transport.response_timeout_ms)
+        reconnect()
+    except Exception as exc:
+        _set_session_timeout(session, config.scan.enumeration_timeout_ms)
+        circuit_scope["stopped"] = True
+        circuit_scope["stop_reason"] = f"reconnect failed: {type(exc).__name__}: {exc}"
+        report["errors"].append(
+            error_record(exc, phase=phase, context={"operation": "RECONNECT"})
+        )
+        progress(
+            {
+                "phase": "timeout_reconnect_failed",
+                "profile": profile_name,
+                "message": circuit_scope["stop_reason"],
+            }
+        )
+        return False, transmissions
+
+    _set_session_timeout(session, config.scan.enumeration_timeout_ms)
+    circuit_scope["successful_reconnects"] += 1
+    if probe("after_reconnect"):
+        circuit.reset()
+        retry_policy.reset()
+        progress(
+            {
+                "phase": "timeout_circuit_recovered",
+                "profile": profile_name,
+                "message": "Reconnect and known-good GET succeeded; resuming the scan",
+            }
+        )
+        return True, transmissions
+
+    circuit_scope["stopped"] = True
+    circuit_scope["stop_reason"] = "known-good GET failed after reconnect"
+    progress(
+        {
+            "phase": "timeout_circuit_stopped",
+            "profile": profile_name,
+            "message": "Meter remained unresponsive after reconnect; remaining GETs are inconclusive",
+        }
+    )
+    return False, transmissions
 
 
 def _serial_permission_message(device_stat: os.stat_result, device: str) -> str:
@@ -418,6 +642,20 @@ def _run_public_union_gets(
     results: list[dict[str, Any]] = []
     unexpected_access = rejected = inconclusive = transmissions = 0
     retry_policy = _GetRetryPolicy()
+    timeout_circuit = _TimeoutCircuitBreaker(
+        config.scan.timeout_breaker_threshold
+    )
+    enumeration_timeout_applied = _set_session_timeout(
+        session, config.scan.enumeration_timeout_ms
+    )
+    circuit_scope = _timeout_policy_scope(
+        config, enumeration_timeout_applied=enumeration_timeout_applied
+    )
+    health_probe: tuple[str, Any | None, int | None] = (
+        "association_view",
+        None,
+        None,
+    )
     candidate_count = len(candidates) if candidate_count is None else candidate_count
     progress(
         {
@@ -429,7 +667,7 @@ def _run_public_union_gets(
             ),
         }
     )
-    for candidate in candidates:
+    for candidate_index, candidate in enumerate(candidates):
         result = {**candidate, "attempt_count": 0, "attempts": []}
         target = session.create_object(candidate["class_id"], candidate["logical_name"])
         last_exception: BaseException | None = None
@@ -463,6 +701,7 @@ def _run_public_union_gets(
                 last_exception = exc
                 outcome = classify_exception(exc)
                 retry_policy.record(outcome)
+                timeout_circuit.record(outcome)
                 result["attempts"].append(
                     {
                         "attempt": attempt,
@@ -485,6 +724,8 @@ def _run_public_union_gets(
                 {"attempt": attempt, "outcome": Outcome.SUCCESS.value}
             )
             retry_policy.record(Outcome.SUCCESS)
+            timeout_circuit.record(Outcome.SUCCESS)
+            health_probe = ("attribute", target, candidate["attribute_id"])
             last_exception = None
             unexpected_access += 1
             break
@@ -528,15 +769,56 @@ def _run_public_union_gets(
             }
         )
 
+        if (
+            last_exception is not None
+            and classify_exception(last_exception) == Outcome.TIMEOUT
+            and timeout_circuit.tripped
+        ):
+            recovered, probe_transmissions = _recover_timeout_circuit(
+                session,
+                config,
+                retry_policy,
+                timeout_circuit,
+                health_probe,
+                circuit_scope,
+                report,
+                progress,
+                profile_name="public",
+                phase="public_union_timeout_circuit",
+            )
+            transmissions += probe_transmissions
+            if not recovered:
+                for remaining in candidates[candidate_index + 1 :]:
+                    remaining_result = {
+                        **remaining,
+                        "attempt_count": 0,
+                        "attempts": [],
+                        "outcome": Outcome.INCONCLUSIVE.value,
+                        "access_assessment": "INCONCLUSIVE",
+                        "unexpected_public_access": False,
+                        "inconclusive_reason": circuit_scope["stop_reason"],
+                    }
+                    results.append(remaining_result)
+                    inconclusive += 1
+                    progress(
+                        {
+                            "phase": "public_union_complete",
+                            **remaining,
+                            "outcome": Outcome.INCONCLUSIVE.value,
+                        }
+                    )
+                break
+
     return {
         "status": "inconclusive" if inconclusive else "completed",
         "candidate_gets": candidate_count,
         "selected_gets": len(candidates),
-        "attempted_gets": len(results),
+        "attempted_gets": sum(item["attempt_count"] > 0 for item in results),
         "get_transmissions": transmissions,
         "unexpected_public_access": unexpected_access,
         "public_access_rejected": rejected,
         "inconclusive": inconclusive,
+        "timeout_policy": circuit_scope,
         "results": results,
     }
 
@@ -618,6 +900,8 @@ def scan_public(
             "selected_server_physical_address": None,
             "server_address_size": None,
             "server_addressing_type": None,
+            "validation_response_timeout_ms": config.transport.response_timeout_ms,
+            "enumeration_response_timeout_ms": config.scan.enumeration_timeout_ms,
         },
         "profiles": [],
         "capability_matrix": [],
@@ -752,7 +1036,7 @@ def scan_public(
         if session is None:
             raise RuntimeError("no baud rate and server-address combination produced a valid public DLMS association")
 
-        profile_name = config.profile.name
+        profile_name = config.profile.role
         if isinstance(config.profile, SecureProfile):
             from .gurux_adapter import GuruxSecureSession
 
@@ -886,6 +1170,21 @@ def scan_public(
         )
         if discovery_error is not None:
             raise RuntimeError(f"association-view discovery failed: {discovery_error}")
+
+        enumeration_timeout_applied = _set_session_timeout(
+            session, config.scan.enumeration_timeout_ms
+        )
+        progress(
+            {
+                "phase": "enumeration_timeout",
+                "profile": profile_name,
+                "timeout_ms": config.scan.enumeration_timeout_ms,
+                "message": (
+                    f"Association View validated; using {config.scan.enumeration_timeout_ms} ms "
+                    "timeouts for enumeration GETs"
+                ),
+            }
+        )
 
         version = _association_version(objects)
         inventory: dict[tuple[int, str], dict[str, Any]] = {}
@@ -1034,6 +1333,7 @@ def scan_public(
         get_failed = 0
         profile_result: dict[str, Any] = {
             "name": profile_name,
+            "type": config.profile.name,
             "association": association,
             "identification": {},
             "association_view_object_count": len(objects),
@@ -1053,6 +1353,20 @@ def scan_public(
                 "derived_gets": len(derived_get_capabilities),
                 "testable_gets": len(testable_get_capabilities),
                 "selected_gets": len(selected_get_capabilities),
+                "get_with_list": {
+                    "requested_batch_size": config.scan.batch_size,
+                    "negotiated": "multiple_references"
+                    in association.get("negotiated_conformance", []),
+                    "negotiated_pdu_item_limit": None,
+                    "effective_batch_size": 1,
+                    "attempted_batches": 0,
+                    "successful_batches": 0,
+                    "fallback_batches": 0,
+                },
+                "timeout_policy": _timeout_policy_scope(
+                    config,
+                    enumeration_timeout_applied=enumeration_timeout_applied,
+                ),
             },
             "objects": object_records,
             "summary": {
@@ -1070,12 +1384,125 @@ def scan_public(
                 "get_transmissions": 0,
                 "get_success": 0,
                 "get_failed": 0,
+                "get_inconclusive": 0,
                 "get_not_tested": len(all_get_capabilities),
             },
         }
         report["profiles"].append(profile_result)
         get_transmissions = 0
         retry_policy = _GetRetryPolicy()
+        timeout_circuit = _TimeoutCircuitBreaker(
+            config.scan.timeout_breaker_threshold
+        )
+        circuit_scope = profile_result["scan_scope"]["timeout_policy"]
+        health_probe: tuple[str, Any | None, int | None] = (
+            "association_view",
+            None,
+            None,
+        )
+        phase_inconclusive = False
+        get_inconclusive = 0
+        batch_results: dict[tuple[tuple[int, str], int], dict[str, Any]] = {}
+        batch_scope = profile_result["scan_scope"]["get_with_list"]
+        multiple_references = bool(batch_scope["negotiated"])
+        batch_reader = getattr(session, "read_attributes", None)
+        max_pdu_size = association.get("max_receive_pdu_size")
+        pdu_item_limit = (
+            max(1, min(10, (int(max_pdu_size) - 12) // 10))
+            if max_pdu_size is not None
+            else 10
+        )
+        batch_scope["negotiated_pdu_item_limit"] = pdu_item_limit
+        effective_batch_size = (
+            min(config.scan.batch_size, pdu_item_limit)
+            if config.scan.batch_size > 1
+            and multiple_references
+            and callable(batch_reader)
+            and pdu_item_limit > 1
+            else 1
+        )
+        batch_scope["effective_batch_size"] = effective_batch_size
+
+        # Only Association View-advertised reads are safe to combine. Catalogue
+        # probes remain individual requests because their access is speculative.
+        item_by_key = dict(all_items)
+        batch_capabilities = [
+            capability
+            for capability in testable_get_capabilities
+            if capability in selected_get_capabilities
+            and capability != association_view_get
+            and item_by_key[capability[0]]["attributes"][capability[1]].get("read")
+            and not item_by_key[capability[0]]["attributes"][capability[1]].get(
+                "catalogue_probe"
+            )
+        ]
+        if effective_batch_size > 1:
+            for start in range(0, len(batch_capabilities), effective_batch_size):
+                if phase_inconclusive:
+                    break
+                chunk = batch_capabilities[start : start + effective_batch_size]
+                # A one-item list adds complexity without reducing round trips.
+                if len(chunk) < 2:
+                    continue
+                requests = [
+                    (item_by_key[key]["target"], attribute_id)
+                    for key, attribute_id in chunk
+                ]
+                batch_scope["attempted_batches"] += 1
+                get_transmissions += 1
+                progress(
+                    {
+                        "phase": "get_list_scan",
+                        "profile": profile_name,
+                        "items": len(chunk),
+                        "message": f"GET-with-list for {len(chunk)} attributes",
+                    }
+                )
+                try:
+                    decoded_items = batch_reader(requests, 1)
+                    if len(decoded_items) != len(chunk):
+                        raise ValueError(
+                            "GET-with-list returned "
+                            f"{len(decoded_items)} values for {len(chunk)} requests"
+                        )
+                except Exception as exc:
+                    batch_scope["fallback_batches"] += 1
+                    outcome = classify_exception(exc)
+                    retry_policy.record(outcome)
+                    timeout_circuit.record(outcome)
+                    progress(
+                        {
+                            "phase": "get_list_fallback",
+                            "profile": profile_name,
+                            "items": len(chunk),
+                            "message": (
+                                f"GET-with-list failed ({type(exc).__name__}: {exc}); "
+                                "retrying each attribute individually"
+                            ),
+                        }
+                    )
+                    if timeout_circuit.tripped:
+                        recovered, probe_transmissions = _recover_timeout_circuit(
+                            session,
+                            config,
+                            retry_policy,
+                            timeout_circuit,
+                            health_probe,
+                            circuit_scope,
+                            report,
+                            progress,
+                            profile_name=profile_name,
+                            phase="get_scan_timeout_circuit",
+                        )
+                        get_transmissions += probe_transmissions
+                        phase_inconclusive = not recovered
+                    continue
+                batch_scope["successful_batches"] += 1
+                batch_results.update(zip(chunk, decoded_items, strict=True))
+                retry_policy.record(Outcome.SUCCESS)
+                timeout_circuit.record(Outcome.SUCCESS)
+                health_probe = ("attribute", requests[0][0], requests[0][1])
+
         for (class_id, logical_name), item in all_items:
             target = item["target"]
             object_result = _object_record(target, item["sources"], version)
@@ -1194,6 +1621,67 @@ def scan_public(
                     )
                     continue
 
+                capability = ((class_id, logical_name), attribute_id)
+                if capability in batch_results:
+                    attribute_result.update(
+                        {
+                            "lifecycle": "success",
+                            "outcome": Outcome.SUCCESS.value,
+                            "attempt_count": 1,
+                            "attempts": [
+                                {
+                                    "attempt": 1,
+                                    "outcome": Outcome.SUCCESS.value,
+                                    "get_with_list": True,
+                                }
+                            ],
+                            "decoded": batch_results[capability],
+                        }
+                    )
+                    get_success += 1
+                    retry_policy.record(Outcome.SUCCESS)
+                    profile_result["summary"].update(
+                        {
+                            "get_attempted": get_success + get_failed,
+                            "get_transmissions": get_transmissions,
+                            "get_success": get_success,
+                            "get_failed": get_failed,
+                        }
+                    )
+                    progress(
+                        {
+                            "phase": "get_complete",
+                            "profile": profile_name,
+                            "logical_name": logical_name,
+                            "class_id": class_id,
+                            "attribute_id": attribute_id,
+                            "outcome": Outcome.SUCCESS.value,
+                            "get_with_list": True,
+                        }
+                    )
+                    continue
+
+                if phase_inconclusive:
+                    attribute_result.update(
+                        {
+                            "lifecycle": "inconclusive",
+                            "outcome": Outcome.INCONCLUSIVE.value,
+                            "inconclusive_reason": circuit_scope["stop_reason"],
+                        }
+                    )
+                    get_inconclusive += 1
+                    progress(
+                        {
+                            "phase": "get_complete",
+                            "profile": profile_name,
+                            "logical_name": logical_name,
+                            "class_id": class_id,
+                            "attribute_id": attribute_id,
+                            "outcome": Outcome.INCONCLUSIVE.value,
+                        }
+                    )
+                    continue
+
                 last_exception: BaseException | None = None
                 allowed_attempts = retry_policy.attempts_for_next_get(
                     config.scan.total_get_attempts
@@ -1220,6 +1708,7 @@ def scan_public(
                         last_exception = exc
                         outcome = classify_exception(exc)
                         retry_policy.record(outcome)
+                        timeout_circuit.record(outcome)
                         attribute_result["attempts"].append(
                             {"attempt": attempt, "outcome": outcome.value, "error": f"{type(exc).__name__}: {exc}"}
                         )
@@ -1238,8 +1727,30 @@ def scan_public(
                     )
                     attribute_result["attempts"].append({"attempt": attempt, "outcome": Outcome.SUCCESS.value})
                     retry_policy.record(Outcome.SUCCESS)
+                    timeout_circuit.record(Outcome.SUCCESS)
+                    health_probe = ("attribute", target, attribute_id)
                     last_exception = None
                     break
+
+                if (
+                    last_exception is not None
+                    and classify_exception(last_exception) == Outcome.TIMEOUT
+                    and timeout_circuit.tripped
+                ):
+                    recovered, probe_transmissions = _recover_timeout_circuit(
+                        session,
+                        config,
+                        retry_policy,
+                        timeout_circuit,
+                        health_probe,
+                        circuit_scope,
+                        report,
+                        progress,
+                        profile_name=profile_name,
+                        phase="get_scan_timeout_circuit",
+                    )
+                    get_transmissions += probe_transmissions
+                    phase_inconclusive = not recovered
 
                 if last_exception is not None:
                     attribute_result.update(
@@ -1258,6 +1769,7 @@ def scan_public(
                         "get_transmissions": get_transmissions,
                         "get_success": get_success,
                         "get_failed": get_failed,
+                        "get_inconclusive": get_inconclusive,
                     }
                 )
                 progress(
@@ -1308,6 +1820,7 @@ def scan_public(
                 "get_transmissions": get_transmissions,
                 "get_success": get_success,
                 "get_failed": get_failed,
+                "get_inconclusive": get_inconclusive,
                 "get_not_tested": sum(
                     attribute.get("outcome") == Outcome.NOT_TESTED.value
                     for obj in object_records

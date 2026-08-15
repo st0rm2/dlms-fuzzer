@@ -16,6 +16,10 @@ transport:
 scan:
   mode: get
   total_get_attempts: 2
+  # Association and Association View validation use transport.response_timeout_ms.
+  # Subsequent enumeration GETs use this shorter failure-path timeout.
+  enumeration_timeout_ms: 1000
+  timeout_breaker_threshold: 4
   association_view_first: true
   common_catalogue: true
 
