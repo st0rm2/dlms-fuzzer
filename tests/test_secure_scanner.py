@@ -40,6 +40,11 @@ class SecureOnlyObject(FakeObject):
     description = "Secure-only value"
 
 
+class SecondSecureOnlyObject(FakeObject):
+    logicalName = "1.0.99.2.0.255"
+    description = "Second secure-only value"
+
+
 class PublicAuthenticatedObject(FakeObject):
     def getAccess(self, _index):
         return 4
@@ -221,8 +226,8 @@ class SecureScannerTests(unittest.TestCase):
 
         union_test = report["public_union_test"]
         self.assertEqual(union_test["status"], "completed")
-        self.assertEqual(union_test["candidate_gets"], 2)
-        self.assertEqual(union_test["unexpected_public_access"], 2)
+        self.assertEqual(union_test["candidate_gets"], 1)
+        self.assertEqual(union_test["unexpected_public_access"], 1)
         self.assertEqual(union_test["public_access_rejected"], 0)
         self.assertEqual(
             {
@@ -230,7 +235,6 @@ class SecureScannerTests(unittest.TestCase):
                 for item in union_test["results"]
             },
             {
-                (SecureOnlyObject.logicalName, 1),
                 (SecureOnlyObject.logicalName, 2),
             },
         )
@@ -252,12 +256,17 @@ class SecureScannerTests(unittest.TestCase):
             and row["logical_name"] == SecureOnlyObject.logicalName
         ]
         self.assertEqual(len(rows), 2)
-        self.assertTrue(all(row["profiles"]["public"]["cross_profile_probe"] for row in rows))
+        probed_rows = [
+            row
+            for row in rows
+            if row["profiles"].get("public", {}).get("cross_profile_probe")
+        ]
+        self.assertEqual(len(probed_rows), 1)
         self.assertTrue(
             all(
                 row["profiles"]["public"]["access_assessment"]
                 == "UNEXPECTED_PUBLIC_ACCESS"
-                for row in rows
+                for row in probed_rows
             )
         )
 
@@ -275,7 +284,7 @@ class SecureScannerTests(unittest.TestCase):
         union_test = report["public_union_test"]
         self.assertEqual(report["run"]["status"], "completed")
         self.assertEqual(union_test["unexpected_public_access"], 0)
-        self.assertEqual(union_test["public_access_rejected"], 2)
+        self.assertEqual(union_test["public_access_rejected"], 1)
         self.assertEqual(union_test["inconclusive"], 0)
         self.assertEqual(report["errors"], [])
         self.assertTrue(
@@ -297,7 +306,7 @@ class SecureScannerTests(unittest.TestCase):
             )
 
         union_test = report["public_union_test"]
-        self.assertEqual(union_test["candidate_gets"], 2)
+        self.assertEqual(union_test["candidate_gets"], 1)
         self.assertEqual(union_test["selected_gets"], 1)
         self.assertEqual(union_test["attempted_gets"], 1)
         public_rows = [
@@ -305,15 +314,20 @@ class SecureScannerTests(unittest.TestCase):
             for row in report["capability_matrix"]
             if row["operation"] == "GET"
             and row["logical_name"] == SecureOnlyObject.logicalName
+            and "public" in row["profiles"]
         ]
         self.assertEqual(sum(item["tested"] for item in public_rows), 1)
         self.assertEqual(
             sum(item["status"] == "NOT_TESTED" for item in public_rows),
-            1,
+            0,
         )
 
     def test_public_cross_profile_retries_are_suppressed_after_timeouts(self):
-        SecureSession.objects = [FakeObject(), SecureOnlyObject()]
+        SecureSession.objects = [
+            FakeObject(),
+            SecureOnlyObject(),
+            SecondSecureOnlyObject(),
+        ]
         BootstrapSession.public_read_error = TimeoutError("meter did not reply")
         with tempfile.TemporaryDirectory() as directory:
             report = self._run(
@@ -345,7 +359,7 @@ class SecureScannerTests(unittest.TestCase):
             )
 
         union_test = report["public_union_test"]
-        self.assertEqual(union_test["candidate_gets"], 2)
+        self.assertEqual(union_test["candidate_gets"], 1)
         self.assertTrue(
             all(
                 item["public_advertised_access"] == "authenticated_read"

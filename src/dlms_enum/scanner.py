@@ -373,6 +373,10 @@ def _public_union_candidates(
             continue
         target = item["target"]
         for attribute_id in _ordered_attribute_ids(target, item["attributes"]):
+            # The Association View already identifies every object by its
+            # logical-name attribute. Do not probe that same value again.
+            if attribute_id == 1:
+                continue
             rights = item["attributes"][attribute_id]
             if not (rights.get("advertised") and rights.get("read")):
                 continue
@@ -944,10 +948,20 @@ def scan_public(
             if item["attributes"][attribute_id].get("read")
             or item["attributes"][attribute_id].get("catalogue_probe")
         ]
+        derived_get_capabilities = {
+            (key, 1)
+            for key, item in all_items
+            if "association_view" in item["sources"] and 1 in item["attributes"]
+        }
+        testable_get_capabilities = [
+            capability
+            for capability in all_get_capabilities
+            if capability not in derived_get_capabilities
+        ]
         association_view_get = ((15, "0.0.40.0.0.255"), 2)
-        if association_view_get in all_get_capabilities:
-            all_get_capabilities.remove(association_view_get)
-            all_get_capabilities.insert(0, association_view_get)
+        if association_view_get in testable_get_capabilities:
+            testable_get_capabilities.remove(association_view_get)
+            testable_get_capabilities.insert(0, association_view_get)
 
         if config.scan.object_limit is not None:
             selected_inventory_items = association_order_items[: config.scan.object_limit]
@@ -958,10 +972,13 @@ def scan_public(
                 for attribute_id in _ordered_attribute_ids(
                     item["target"], item["attributes"]
                 )
-                if item["attributes"][attribute_id].get("read")
-                or item["attributes"][attribute_id].get("catalogue_probe")
+                if (
+                    item["attributes"][attribute_id].get("read")
+                    or item["attributes"][attribute_id].get("catalogue_probe")
+                )
+                and (key, attribute_id) not in derived_get_capabilities
             }
-            if association_view_get in all_get_capabilities:
+            if association_view_get in testable_get_capabilities:
                 selected_get_capabilities.add(association_view_get)
             progress(
                 {
@@ -979,7 +996,7 @@ def scan_public(
             )
         elif config.scan.get_limit is not None:
             selected_get_capabilities = set(
-                all_get_capabilities[: config.scan.get_limit]
+                testable_get_capabilities[: config.scan.get_limit]
             )
             selected_object_keys = {
                 key for key, _ in selected_get_capabilities
@@ -994,12 +1011,12 @@ def scan_public(
                     "selected_gets": len(selected_get_capabilities),
                     "message": (
                         f"Short test: testing {len(selected_get_capabilities)} of "
-                        f"{len(all_get_capabilities)} mapped GET capabilities"
+                        f"{len(testable_get_capabilities)} testable GET capabilities"
                     ),
                 }
             )
         else:
-            selected_get_capabilities = set(all_get_capabilities)
+            selected_get_capabilities = set(testable_get_capabilities)
             selected_object_keys = {key for key, _ in all_items}
 
         planned_attributes = len(selected_get_capabilities)
@@ -1033,6 +1050,8 @@ def scan_public(
                 "mapped_objects": len(all_items),
                 "selected_objects": len(selected_object_keys),
                 "mapped_gets": len(all_get_capabilities),
+                "derived_gets": len(derived_get_capabilities),
+                "testable_gets": len(testable_get_capabilities),
                 "selected_gets": len(selected_get_capabilities),
             },
             "objects": object_records,
@@ -1044,6 +1063,8 @@ def scan_public(
                 "object_limit": config.scan.object_limit,
                 "get_limit": config.scan.get_limit,
                 "mapped_gets": len(all_get_capabilities),
+                "derived_gets": len(derived_get_capabilities),
+                "testable_gets": len(testable_get_capabilities),
                 "selected_gets": len(selected_get_capabilities),
                 "get_attempted": 0,
                 "get_transmissions": 0,
@@ -1102,6 +1123,20 @@ def scan_public(
                     "attempts": [],
                 }
                 object_result["attributes"].append(attribute_result)
+
+                if ((class_id, logical_name), attribute_id) in derived_get_capabilities:
+                    attribute_result.update(
+                        {
+                            "lifecycle": "derived",
+                            "outcome": Outcome.NOT_TESTED.value,
+                            "value_source": "association_view",
+                            "decoded": {
+                                "value": logical_name,
+                                "dlms_data_type": "octet_string",
+                            },
+                        }
+                    )
+                    continue
 
                 # Preserve write-only attributes as passive Association View
                 # capabilities, but never issue a modifying SET during enumeration.
