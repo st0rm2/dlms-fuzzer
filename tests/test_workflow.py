@@ -202,7 +202,7 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertFalse(selected)
         self.assertFalse(confirm.call_args.kwargs["default"])
-        self.assertIn("five protected GET requests", console.file.getvalue())
+        self.assertIn("two protected GET requests", console.file.getvalue())
 
     def test_read_plan_accepts_only_a_total_get_limit(self):
         config = multi_role_config()

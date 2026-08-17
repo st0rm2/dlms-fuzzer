@@ -923,6 +923,7 @@ def scan_public(
     union_candidates: list[dict[str, Any]] | None = None
 
     try:
+        progress({"phase": "scan_start"})
         validate_serial_device(config.transport.device)
         try:
             from .gurux_adapter import GuruxSession
@@ -1164,26 +1165,6 @@ def scan_public(
                 "enabled": invocation_counter_reuse_test,
                 "status": "not_requested",
             }
-            if invocation_counter_reuse_test:
-                _set_session_timeout(
-                    secure_session, config.scan.enumeration_timeout_ms
-                )
-                progress(
-                    {
-                        "phase": "invocation_counter_reuse_test",
-                        "message": (
-                            "Testing five stale invocation counters; a conforming "
-                            "meter should reject every probe"
-                        ),
-                    }
-                )
-                reuse_result = secure_session.test_invocation_counter_reuse()
-                association["invocation_counter_reuse_test"] = reuse_result
-                if not reuse_result.get("association_restored"):
-                    raise RuntimeError(
-                        "secure association could not be restored after the "
-                        "invocation-counter reuse test"
-                    )
 
         progress({"phase": "association_view", "message": "Reading Association LN object list"})
         objects, association_view_attempts, discovery_error = _discover_association_view(
@@ -1917,6 +1898,30 @@ def scan_public(
                             candidate_count=len(union_candidates),
                         ),
                     }
+                )
+        if invocation_counter_reuse_test and secure_session is not None:
+            if session is not secure_session:
+                if session is not None:
+                    _record_cleanup_warnings(
+                        report,
+                        session.close(),
+                        phase="public_union_finalization",
+                    )
+                    session = None
+                secure_session.reconnect()
+                session = secure_session
+            _set_session_timeout(
+                secure_session, config.scan.enumeration_timeout_ms
+            )
+            progress({"phase": "invocation_counter_reuse_start"})
+            reuse_result = secure_session.test_invocation_counter_reuse(
+                progress=progress
+            )
+            association["invocation_counter_reuse_test"] = reuse_result
+            if not reuse_result.get("association_restored"):
+                raise RuntimeError(
+                    "secure association could not be restored after the "
+                    "invocation-counter reuse test"
                 )
         report["run"]["status"] = (
             "completed" if not get_failed and not report["errors"] else "completed_with_errors"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import time
+from collections.abc import Callable
 from typing import Any
 
 from gurux_common import ReceiveParameters, TimeoutException
@@ -965,43 +966,18 @@ class GuruxSecureSession(GuruxSession):
         finally:
             self.client.ciphering.invocationCounter = safe_next
 
-    def test_invocation_counter_reuse(self) -> dict[str, Any]:
-        """Send five isolated GET probes with stale invocation counters."""
+    def test_invocation_counter_reuse(
+        self,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Send two isolated GET probes with stale invocation counters."""
 
         if not self._associated:
             raise RuntimeError("counter-reuse testing requires a validated secure association")
 
+        progress = progress or (lambda _: None)
         target = self.create_object(15, "0.0.40.0.0.255")
-        distinct_session_counters = list(dict.fromkeys(self._used_invocation_counters))
-        priming_requests = 0
-        priming_errors: list[dict[str, Any]] = []
-        while len(distinct_session_counters) < 4 and priming_requests < 4:
-            priming_requests += 1
-            try:
-                self.read_attribute(
-                    target,
-                    1,
-                    priming_requests,
-                    phase="invocation_counter_reuse_test",
-                    purpose="safe_counter_priming_get",
-                )
-            except Exception as exc:
-                priming_errors.append(
-                    {
-                        "outcome": classify_exception(exc).value,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-                try:
-                    self.reconnect()
-                except Exception as reconnect_exc:
-                    priming_errors[-1]["reconnect_error"] = (
-                        f"{type(reconnect_exc).__name__}: {reconnect_exc}"
-                    )
-                    break
-            distinct_session_counters = list(
-                dict.fromkeys(self._used_invocation_counters)
-            )
+        session_counters = list(self._used_invocation_counters)
 
         result: dict[str, Any] = {
             "enabled": True,
@@ -1011,15 +987,15 @@ class GuruxSecureSession(GuruxSession):
                 "logical_name": "0.0.40.0.0.255",
                 "attribute_id": 1,
             },
-            "requested_probes": 5,
-            "priming_requests": priming_requests,
-            "priming_errors": priming_errors,
+            "requested_probes": 2,
             "probes": [],
             "association_restored": False,
         }
-        if len(distinct_session_counters) < 4:
+        if not session_counters or (
+            session_counters[0] == 0 and len(session_counters) < 2
+        ):
             result["preparation_error"] = (
-                "fewer than four transmitted session counters were available"
+                "no eligible transmitted session counter was available"
             )
             result.update(
                 {
@@ -1031,17 +1007,36 @@ class GuruxSecureSession(GuruxSession):
             )
             return result
 
-        replay_counters = [0, *distinct_session_counters[:4]]
+        session_counter_index = 1 if session_counters[0] == 0 else 0
+        replay_counters = [0, session_counters[session_counter_index]]
         for sequence, reused_counter in enumerate(replay_counters, 1):
             probe = {
                 "sequence": sequence,
                 "reused_counter": reused_counter,
                 "reused_counter_hex": f"0x{reused_counter:08X}",
-                "source": "initial_zero" if sequence == 1 else (
-                    "first_session_counter" if sequence == 2 else "session_counter"
+                "source": (
+                    "initial_zero"
+                    if sequence == 1
+                    else (
+                        "second_session_counter"
+                        if session_counter_index == 1
+                        else "first_session_counter"
+                    )
                 ),
                 "accepted": False,
             }
+            progress(
+                {
+                    "phase": "invocation_counter_reuse_attempt",
+                    "attempt": sequence,
+                    "total": len(replay_counters),
+                    "invocation_counter": reused_counter,
+                    "invocation_counter_hex": probe["reused_counter_hex"],
+                    "message": (
+                        f"Attempt {probe['reused_counter_hex']} as invocation counter"
+                    ),
+                }
+            )
             safe_next = int(self.client.ciphering.invocationCounter)
             try:
                 packets = self._generate_replay_get(target, 1, reused_counter)

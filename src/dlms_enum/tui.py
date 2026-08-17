@@ -85,6 +85,20 @@ class ScanUI:
             self.close()
             self.error(message or "Scan failed")
             return
+        if phase == "scan_start":
+            self.close()
+            self.console.rule("Scan")
+            return
+        if phase == "invocation_counter_reuse_start":
+            self.close()
+            self.console.rule("Retry Invocation Counter")
+            return
+        if phase == "invocation_counter_reuse_attempt":
+            counter = int(event["invocation_counter"])
+            self.console.print(
+                f"Attempt 0x{counter:08X} as invocation counter"
+            )
+            return
         if phase == "baud_detection":
             self._update(
                 stage="Discovery",
@@ -360,7 +374,7 @@ def choose_invocation_counter_reuse_test(
 
     console = console or Console()
     console.print(
-        "[yellow]Optional laboratory diagnostic:[/yellow] this sends five protected "
+        "[yellow]Optional laboratory diagnostic:[/yellow] this sends two protected "
         "GET requests with invocation counters that have already been used. A "
         "conforming meter should reject them. The meter may terminate the secure "
         "association; fresh counters remain persisted and are never rolled back."

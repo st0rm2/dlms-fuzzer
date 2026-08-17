@@ -251,7 +251,7 @@ def render_summary_report(
             elif reuse_test.get("status") == "reuse_not_observed":
                 lines.extend(
                     [
-                        "No stale-counter GET was accepted in the five requested probes.",
+                        "No stale-counter GET was accepted in the two requested probes.",
                         "",
                     ]
                 )

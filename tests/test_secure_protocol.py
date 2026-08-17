@@ -197,7 +197,7 @@ class SecureProtocolTests(unittest.TestCase):
         self.assertEqual(lease.next_counter, 101)
         self.assertEqual(lease.persisted, [])
 
-    def test_reuse_test_uses_zero_and_first_four_session_counters(self):
+    def test_reuse_test_uses_zero_and_first_session_counter(self):
         session = object.__new__(GuruxSecureSession)
         session._associated = True
         session._used_invocation_counters = [101, 102, 103, 104]
@@ -225,15 +225,42 @@ class SecureProtocolTests(unittest.TestCase):
         session._read_blocks = read_blocks
         session.reconnect = reconnect
 
-        result = session.test_invocation_counter_reuse()
+        progress_events = []
+        result = session.test_invocation_counter_reuse(progress_events.append)
 
-        self.assertEqual(generated, [0, 101, 102, 103, 104])
+        self.assertEqual(generated, [0, 101])
         self.assertEqual(transmitted, generated)
-        self.assertEqual(len(reconnects), 5)
+        self.assertEqual(len(reconnects), 2)
         self.assertEqual(result["status"], "reuse_accepted")
-        self.assertEqual(result["accepted_probes"], 5)
+        self.assertEqual(result["requested_probes"], 2)
+        self.assertEqual(result["accepted_probes"], 2)
+        self.assertEqual(
+            [event["invocation_counter"] for event in progress_events],
+            generated,
+        )
         self.assertTrue(result["association_restored"])
         self.assertEqual(session.client.ciphering.invocationCounter, 105)
+
+    def test_reuse_test_uses_second_session_counter_when_first_is_zero(self):
+        session = object.__new__(GuruxSecureSession)
+        session._associated = True
+        session._used_invocation_counters = [0, 1, 2]
+        session._replay_probe_counter = None
+        session.client = types.SimpleNamespace(
+            ciphering=types.SimpleNamespace(invocationCounter=3)
+        )
+        session.create_object = lambda *_args: object()
+        generated = []
+        session._generate_replay_get = (
+            lambda _target, _attribute_id, counter: generated.append(counter) or [b"GET"]
+        )
+        session._read_blocks = lambda *_args, **_kwargs: None
+        session.reconnect = lambda: {"associated": True}
+
+        result = session.test_invocation_counter_reuse()
+
+        self.assertEqual(generated, [0, 1])
+        self.assertEqual(result["probes"][1]["source"], "second_session_counter")
 
     def test_counter_is_persisted_before_media_send_and_cc_is_decoded(self):
         events = []

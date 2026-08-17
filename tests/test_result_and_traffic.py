@@ -215,7 +215,7 @@ class ResultAndTrafficTests(unittest.TestCase):
                         "invocation_counter_reuse_test": {
                             "enabled": True,
                             "status": "reuse_accepted",
-                            "attempted_probes": 5,
+                            "attempted_probes": 2,
                             "accepted_probes": 1,
                             "device_allows_reuse": True,
                             "probes": [

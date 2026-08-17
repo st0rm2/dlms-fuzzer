@@ -69,6 +69,31 @@ class ScanUITests(unittest.TestCase):
         self.assertIn("GET 1.0.1.8.0.255  class 3  attribute 2  attempt 1", rendered)
         self.assertIn("1/2", rendered)
 
+    def test_scan_and_counter_retry_events_render_separators_and_attempts(self):
+        output = io.StringIO()
+        ui = ScanUI(Console(file=output, color_system=None, width=80))
+
+        ui.progress({"phase": "scan_start"})
+        ui.progress({"phase": "invocation_counter_reuse_start"})
+        ui.progress(
+            {
+                "phase": "invocation_counter_reuse_attempt",
+                "invocation_counter": 0,
+            }
+        )
+        ui.progress(
+            {
+                "phase": "invocation_counter_reuse_attempt",
+                "invocation_counter": 0x12345678,
+            }
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("Scan", rendered)
+        self.assertIn("Retry Invocation Counter", rendered)
+        self.assertIn("Attempt 0x00000000 as invocation counter", rendered)
+        self.assertIn("Attempt 0x12345678 as invocation counter", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

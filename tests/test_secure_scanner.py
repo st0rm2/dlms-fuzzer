@@ -130,18 +130,22 @@ class SecureSession:
         self.events.append("secure_get_scan")
         return self.objects
 
-    def test_invocation_counter_reuse(self):
+    def test_invocation_counter_reuse(self, progress=None):
         self.__class__.reuse_test_called = True
         self.events.append("counter_reuse_test")
         return {
             "enabled": True,
             "status": "reuse_not_observed",
-            "requested_probes": 5,
-            "attempted_probes": 5,
+            "requested_probes": 2,
+            "attempted_probes": 2,
             "accepted_probes": 0,
             "association_restored": True,
             "probes": [],
         }
+
+    def reconnect(self):
+        self.events.append("secure_reconnect")
+        return self.connect()
 
     def set_response_timeout(self, timeout_ms):
         self.events.append(f"secure_timeout:{timeout_ms}")
@@ -223,7 +227,7 @@ class SecureScannerTests(unittest.TestCase):
         )
         self.assertTrue(SecureSession.discover_called)
 
-    def test_opt_in_counter_reuse_test_runs_before_association_view(self):
+    def test_opt_in_counter_reuse_test_runs_after_get_scan(self):
         with tempfile.TemporaryDirectory() as directory:
             config = secure_config(Path(directory) / "counters.json")
             module = types.ModuleType("dlms_enum.gurux_adapter")
@@ -241,10 +245,37 @@ class SecureScannerTests(unittest.TestCase):
         ]
         self.assertEqual(reuse["status"], "reuse_not_observed")
         self.assertTrue(SecureSession.reuse_test_called)
-        self.assertLess(
+        self.assertGreater(
             BootstrapSession.events.index("counter_reuse_test"),
             BootstrapSession.events.index("secure_get_scan"),
         )
+
+    def test_counter_reuse_test_runs_after_public_cross_profile_test(self):
+        SecureSession.objects = [FakeObject(), SecureOnlyObject()]
+        with tempfile.TemporaryDirectory() as directory:
+            config = secure_config(
+                Path(directory) / "counters.json",
+                union_profile_test=True,
+            )
+            module = types.ModuleType("dlms_enum.gurux_adapter")
+            module.GuruxSession = BootstrapSession
+            module.GuruxSecureSession = SecureSession
+            with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+                report = scan(
+                    config,
+                    object(),
+                    invocation_counter_reuse_test=True,
+                )
+
+        self.assertEqual(report["run"]["status"], "completed")
+        public_get = next(
+            index
+            for index, event in enumerate(BootstrapSession.events)
+            if event.startswith("public_get:")
+        )
+        reuse = BootstrapSession.events.index("counter_reuse_test")
+        self.assertLess(public_get, reuse)
+        self.assertIn("secure_reconnect", BootstrapSession.events[public_get:reuse])
 
     def test_hls_failure_prevents_all_get_scanning(self):
         SecureSession.fail_hls = True
