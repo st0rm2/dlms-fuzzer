@@ -84,7 +84,7 @@ profiles:
       logical_name: 0.0.43.1.1.255
 ```
 
-The public preflight always runs, even when the public role is not selected for a full scan. For every selected secure role, the operator sees its SAP and system title together with the configured counter object and decoded current value. The operator can accept it, select another validated public-readable unsigned Data value, enter an OBIS from that list, or abort. The chosen mapping affects only the runtime configuration; the source YAML is not rewritten. Immediately before the secure association, the counter is read again and combined with crash-safe local state as described below.
+The public preflight always runs, even when the public role is not selected for a full scan. For every selected secure role, the operator sees its SAP and system title together with the full list of validated public-readable unsigned counter candidates, the configured counter object, and its decoded current value. The operator can accept it, select another candidate, enter an OBIS from that list, redisplay the list, or abort. The chosen mapping affects only the runtime configuration; the source YAML is not rewritten. Immediately before the secure association, the counter is read again and combined with crash-safe local state as described below.
 
 With multiple selected roles, each role receives its own subdirectory and canonical report. The parent directory contains `workflow.json` and the public `preflight-traffic.jsonl`. A single selected role retains the existing flat output layout.
 

@@ -302,6 +302,11 @@ def verify_counter_source(
     console.print(
         "Client system title: " + profile.client_system_title.hex().upper()
     )
+    if not candidates:
+        raise RuntimeError(
+            f"no public-readable unsigned counter candidates were found for role {profile.role}"
+        )
+    console.print(_counter_table(candidates))
     while True:
         if selected is not None:
             console.print(
@@ -322,13 +327,10 @@ def verify_counter_source(
             if choice == "abort":
                 raise KeyboardInterrupt
         else:
-            choice = "list"
+            choice = "select"
 
-        if not candidates:
-            raise RuntimeError(
-                f"no public-readable unsigned counter candidates were found for role {profile.role}"
-            )
-        console.print(_counter_table(candidates))
+        if choice == "list":
+            console.print(_counter_table(candidates))
         if choice == "manual":
             logical_name = Prompt.ask("Logical name", console=console).strip()
             selected = next(

@@ -184,6 +184,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             profile.invocation_counter.logical_name, "0.0.43.1.0.255"
         )
+        rendered = console.file.getvalue()
+        self.assertIn("Public-readable unsigned counter candidates", rendered)
+        self.assertIn(candidate.logical_name, rendered)
 
     def test_read_plan_accepts_only_a_total_get_limit(self):
         config = multi_role_config()
