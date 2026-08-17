@@ -877,6 +877,7 @@ def scan_public(
     traffic: Any,
     *,
     progress: ProgressCallback | None = None,
+    invocation_counter_reuse_test: bool = False,
 ) -> dict[str, Any]:
     """Run the configured public or secure read-only scan."""
 
@@ -1159,6 +1160,30 @@ def scan_public(
                 "counter_identity_key": counter_lease.identity_key,
                 "meter_identity": meter_identity,
             }
+            association["invocation_counter_reuse_test"] = {
+                "enabled": invocation_counter_reuse_test,
+                "status": "not_requested",
+            }
+            if invocation_counter_reuse_test:
+                _set_session_timeout(
+                    secure_session, config.scan.enumeration_timeout_ms
+                )
+                progress(
+                    {
+                        "phase": "invocation_counter_reuse_test",
+                        "message": (
+                            "Testing five stale invocation counters; a conforming "
+                            "meter should reject every probe"
+                        ),
+                    }
+                )
+                reuse_result = secure_session.test_invocation_counter_reuse()
+                association["invocation_counter_reuse_test"] = reuse_result
+                if not reuse_result.get("association_restored"):
+                    raise RuntimeError(
+                        "secure association could not be restored after the "
+                        "invocation-counter reuse test"
+                    )
 
         progress({"phase": "association_view", "message": "Reading Association LN object list"})
         objects, association_view_attempts, discovery_error = _discover_association_view(

@@ -100,6 +100,7 @@ class SecureSession:
     first_counter = None
     discover_called = False
     fail_hls = False
+    reuse_test_called = False
     objects = [FakeObject()]
 
     def __init__(
@@ -128,6 +129,22 @@ class SecureSession:
         self.__class__.discover_called = True
         self.events.append("secure_get_scan")
         return self.objects
+
+    def test_invocation_counter_reuse(self):
+        self.__class__.reuse_test_called = True
+        self.events.append("counter_reuse_test")
+        return {
+            "enabled": True,
+            "status": "reuse_not_observed",
+            "requested_probes": 5,
+            "attempted_probes": 5,
+            "accepted_probes": 0,
+            "association_restored": True,
+            "probes": [],
+        }
+
+    def set_response_timeout(self, timeout_ms):
+        self.events.append(f"secure_timeout:{timeout_ms}")
 
     def read_attribute(self, _target, _attribute_id, _attempt):
         return {"value": "secure", "dlms_data_type": "visible_string"}
@@ -177,6 +194,7 @@ class SecureScannerTests(unittest.TestCase):
         SecureSession.first_counter = None
         SecureSession.discover_called = False
         SecureSession.fail_hls = False
+        SecureSession.reuse_test_called = False
         SecureSession.objects = [FakeObject()]
         BootstrapSession.public_read_error = None
         BootstrapSession.objects = [FakeObject()]
@@ -204,6 +222,29 @@ class SecureScannerTests(unittest.TestCase):
             BootstrapSession.events.index("secure_created"),
         )
         self.assertTrue(SecureSession.discover_called)
+
+    def test_opt_in_counter_reuse_test_runs_before_association_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = secure_config(Path(directory) / "counters.json")
+            module = types.ModuleType("dlms_enum.gurux_adapter")
+            module.GuruxSession = BootstrapSession
+            module.GuruxSecureSession = SecureSession
+            with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+                report = scan(
+                    config,
+                    object(),
+                    invocation_counter_reuse_test=True,
+                )
+
+        reuse = report["profiles"][0]["association"][
+            "invocation_counter_reuse_test"
+        ]
+        self.assertEqual(reuse["status"], "reuse_not_observed")
+        self.assertTrue(SecureSession.reuse_test_called)
+        self.assertLess(
+            BootstrapSession.events.index("counter_reuse_test"),
+            BootstrapSession.events.index("secure_get_scan"),
+        )
 
     def test_hls_failure_prevents_all_get_scanning(self):
         SecureSession.fail_hls = True

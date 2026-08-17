@@ -7,7 +7,12 @@ from unittest.mock import patch
 from rich.console import Console
 
 from dlms_enum.config import SecureProfile, parse_config
-from dlms_enum.tui import choose_read_plan, select_roles, verify_counter_source
+from dlms_enum.tui import (
+    choose_invocation_counter_reuse_test,
+    choose_read_plan,
+    select_roles,
+    verify_counter_source,
+)
 from dlms_enum.workflow import (
     CounterCandidate,
     PublicPreflight,
@@ -187,6 +192,17 @@ class WorkflowTests(unittest.TestCase):
         rendered = console.file.getvalue()
         self.assertIn("Public-readable unsigned counter candidates", rendered)
         self.assertIn(candidate.logical_name, rendered)
+
+    def test_counter_reuse_prompt_defaults_to_no(self):
+        profile = multi_role_config().profiles[1]
+        console = Console(file=io.StringIO(), color_system=None)
+
+        with patch("dlms_enum.tui.Confirm.ask", return_value=False) as confirm:
+            selected = choose_invocation_counter_reuse_test(profile, console)
+
+        self.assertFalse(selected)
+        self.assertFalse(confirm.call_args.kwargs["default"])
+        self.assertIn("five protected GET requests", console.file.getvalue())
 
     def test_read_plan_accepts_only_a_total_get_limit(self):
         config = multi_role_config()

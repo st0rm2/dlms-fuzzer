@@ -169,6 +169,72 @@ class SecureProtocolTests(unittest.TestCase):
         self.assertEqual(used, [101, 102])
         self.assertEqual(lease.persisted, [102, 103])
 
+    def test_replay_generation_does_not_persist_or_roll_back_safe_counter(self):
+        lease = StubLease(next_counter=101)
+        session = GuruxSecureSession(
+            secure_config(),
+            9600,
+            NullTraffic(),
+            lease,
+            GAK,
+            GUEK,
+            server_logical_address=0,
+            server_physical_address=1,
+            server_address_size=1,
+        )
+        target = session.create_object(15, "0.0.40.0.0.255")
+
+        packet = bytes(session._generate_replay_get(target, 1, 0)[0])
+        session._replay_probe_counter = 0
+        metadata = session._before_transmit(
+            packet, operation="GET", purpose="stale_counter_get"
+        )
+
+        self.assertEqual(metadata["invocation_counter"], 0)
+        self.assertTrue(metadata["counter_reuse_probe"])
+        self.assertFalse(metadata["counter_state_persisted"])
+        self.assertEqual(session.client.ciphering.invocationCounter, 101)
+        self.assertEqual(lease.next_counter, 101)
+        self.assertEqual(lease.persisted, [])
+
+    def test_reuse_test_uses_zero_and_first_four_session_counters(self):
+        session = object.__new__(GuruxSecureSession)
+        session._associated = True
+        session._used_invocation_counters = [101, 102, 103, 104]
+        session._replay_probe_counter = None
+        session.client = types.SimpleNamespace(
+            ciphering=types.SimpleNamespace(invocationCounter=105)
+        )
+        session.create_object = lambda *_args: object()
+        generated = []
+        session._generate_replay_get = (
+            lambda _target, _attribute_id, counter: generated.append(counter) or [b"GET"]
+        )
+        transmitted = []
+
+        def read_blocks(_packets, _reply, **_kwargs):
+            transmitted.append(session._replay_probe_counter)
+
+        reconnects = []
+
+        def reconnect():
+            reconnects.append(True)
+            session._associated = True
+            return {}
+
+        session._read_blocks = read_blocks
+        session.reconnect = reconnect
+
+        result = session.test_invocation_counter_reuse()
+
+        self.assertEqual(generated, [0, 101, 102, 103, 104])
+        self.assertEqual(transmitted, generated)
+        self.assertEqual(len(reconnects), 5)
+        self.assertEqual(result["status"], "reuse_accepted")
+        self.assertEqual(result["accepted_probes"], 5)
+        self.assertTrue(result["association_restored"])
+        self.assertEqual(session.client.ciphering.invocationCounter, 105)
+
     def test_counter_is_persisted_before_media_send_and_cc_is_decoded(self):
         events = []
         lease = StubLease(next_counter=12, events=events)
@@ -178,6 +244,8 @@ class SecureProtocolTests(unittest.TestCase):
         session.profile_name = "hls_gmac_suite0"
         session.counter_lease = lease
         session.traffic = traffic
+        session._used_invocation_counters = []
+        session._replay_probe_counter = None
         session.client = types.SimpleNamespace(
             ciphering=types.SimpleNamespace(
                 invocationCounter=12,
@@ -224,6 +292,7 @@ class SecureProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual(events[:2], [("persist", 12), ("send", None)])
+        self.assertEqual(session._used_invocation_counters, [11])
         self.assertEqual(traffic.records[0]["profile"], "hls_gmac_suite0")
         self.assertEqual(
             traffic.records[0]["rx_decoded"]["protected_command"], "glo-get-response"

@@ -352,6 +352,26 @@ def verify_counter_source(
             selected = candidates[number - 1]
 
 
+def choose_invocation_counter_reuse_test(
+    profile: SecureProfile,
+    console: Console | None = None,
+) -> bool:
+    """Ask whether to run the bounded, deliberately unsafe replay diagnostic."""
+
+    console = console or Console()
+    console.print(
+        "[yellow]Optional laboratory diagnostic:[/yellow] this sends five protected "
+        "GET requests with invocation counters that have already been used. A "
+        "conforming meter should reject them. The meter may terminate the secure "
+        "association; fresh counters remain persisted and are never rolled back."
+    )
+    return Confirm.ask(
+        f"Test invocation-counter reuse for role {profile.role}",
+        default=False,
+        console=console,
+    )
+
+
 def choose_read_plan(
     config: AppConfig,
     preflight: PublicPreflight,

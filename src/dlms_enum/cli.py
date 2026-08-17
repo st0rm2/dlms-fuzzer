@@ -21,6 +21,7 @@ from .traffic_logger import TrafficLogger
 from .tui import (
     ScanUI,
     choose_read_plan,
+    choose_invocation_counter_reuse_test,
     interactive_config,
     select_roles,
     show_public_preflight,
@@ -144,6 +145,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
     config = apply_preflight_endpoint(config, preflight)
     verified_profiles = []
     verified_counter_sources = []
+    counter_reuse_tests: dict[str, bool] = {}
     for profile in config.profiles:
         if not isinstance(profile, SecureProfile):
             verified_profiles.append(profile)
@@ -168,17 +170,16 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 console=console,
             )
         if use_unsafe_override:
-            verified_profiles.append(
-                replace(
-                    profile,
-                    invocation_counter=replace(
-                        counter,
-                        meter_identity=(
-                            preflight.meter_identity or counter.meter_identity
-                        ),
+            verified_profile = replace(
+                profile,
+                invocation_counter=replace(
+                    counter,
+                    meter_identity=(
+                        preflight.meter_identity or counter.meter_identity
                     ),
-                )
+                ),
             )
+            verified_profiles.append(verified_profile)
             verified_counter_sources.append(
                 {
                     "role": profile.role,
@@ -190,6 +191,11 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                     "operator_verified": interactive,
                     "unsafe_override_used": True,
                 }
+            )
+            counter_reuse_tests[profile.role] = (
+                choose_invocation_counter_reuse_test(verified_profile, console)
+                if interactive
+                else False
             )
             continue
         if not preflight.counter_candidates:
@@ -205,11 +211,10 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                     f"role {profile.role} invocation-counter source could not be "
                     "verified during non-interactive public preflight"
                 )
-        verified_profiles.append(
-            select_counter_source(
-                profile, candidate, meter_identity=preflight.meter_identity
-            )
+        verified_profile = select_counter_source(
+            profile, candidate, meter_identity=preflight.meter_identity
         )
+        verified_profiles.append(verified_profile)
         verified_counter_sources.append(
             {
                 "role": profile.role,
@@ -217,6 +222,11 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 "live_read_validated": True,
                 "operator_verified": interactive,
             }
+        )
+        counter_reuse_tests[profile.role] = (
+            choose_invocation_counter_reuse_test(verified_profile, console)
+            if interactive
+            else False
         )
     config = replace(config, profiles=tuple(verified_profiles))
 
@@ -262,7 +272,12 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         logger = TrafficLogger(traffic_path)
         try:
             report = scan(
-                config.for_profile(profile), logger, progress=role_ui.progress
+                config.for_profile(profile),
+                logger,
+                progress=role_ui.progress,
+                invocation_counter_reuse_test=counter_reuse_tests.get(
+                    profile.role, False
+                ),
             )
         finally:
             role_ui.close()
@@ -273,6 +288,9 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             "current_role": profile.role,
             "test_mode": "read_only",
             "verified_counter_sources": verified_counter_sources,
+            "invocation_counter_reuse_test_requested": counter_reuse_tests.get(
+                profile.role, False
+            ),
         }
         write_report(report, report_path, traffic_path, summary_path)
         role_ui.summary(
@@ -301,6 +319,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         "effective_configuration": config.redacted_dict(),
         "role_runs": role_results,
         "verified_counter_sources": verified_counter_sources,
+        "invocation_counter_reuse_tests_requested": counter_reuse_tests,
     }
     (run_directory / "workflow.json").write_text(
         json.dumps(workflow_report, indent=2, ensure_ascii=False) + "\n",

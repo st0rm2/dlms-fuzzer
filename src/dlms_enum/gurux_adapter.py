@@ -298,6 +298,16 @@ class GuruxSession:
     ) -> dict[str, Any]:
         return protected_apdu_metadata(raw_tx, outgoing=True)
 
+    def _after_transmit(
+        self,
+        raw_tx: bytes,
+        metadata: dict[str, Any],
+        *,
+        operation: str,
+        purpose: str,
+    ) -> None:
+        """Observe a frame only after the media send call has succeeded."""
+
     def _after_receive(
         self, raw_rx: list[bytes], *, operation: str, purpose: str
     ) -> dict[str, Any]:
@@ -348,6 +358,12 @@ class GuruxSession:
                         raw_tx, operation=operation, purpose=purpose
                     )
                     self.media.send(bytearray(raw_tx))
+                    self._after_transmit(
+                        raw_tx,
+                        tx_protocol,
+                        operation=operation,
+                        purpose=purpose,
+                    )
                 while not _quiet_gurux(
                     self.client.getData, frame_data, reply, notification
                 ):
@@ -839,6 +855,8 @@ class GuruxSecureSession(GuruxSession):
         self.client.ciphering.securitySuite = SecuritySuite.SUITE_0
         self.client.ciphering.invocationCounter = counter_lease.next_counter
         self.client.useProtectedRelease = True
+        self._used_invocation_counters: list[int] = []
+        self._replay_probe_counter: int | None = None
 
     def _endpoint_context(self) -> dict[str, Any]:
         context = super()._endpoint_context()
@@ -881,6 +899,26 @@ class GuruxSecureSession(GuruxSession):
                 f"refusing plaintext or incorrectly protected {operation}; expected {expected}"
             )
         if metadata.get("protected"):
+            transmitted_counter = metadata.get("invocation_counter")
+            replay_probe_counter = getattr(self, "_replay_probe_counter", None)
+            if replay_probe_counter is not None:
+                if transmitted_counter != replay_probe_counter:
+                    raise RuntimeError(
+                        "generated replay probe did not use the requested invocation counter"
+                    )
+                metadata.update(
+                    {
+                        "counter_reuse_probe": True,
+                        "counter_state_persisted": False,
+                        "authentication_mechanism": "high_gmac",
+                        "security_suite": 0,
+                        "security_policy": "authentication_encryption",
+                        "client_system_title": bytes(
+                            self.client.ciphering.systemTitle
+                        ).hex().upper(),
+                    }
+                )
+                return metadata
             # Gurux increments while generating an APDU. Persist that next value
             # under the exclusive lease before the first byte can reach media.
             previous_next = int(self.counter_lease.next_counter)
@@ -900,6 +938,167 @@ class GuruxSecureSession(GuruxSession):
                 }
             )
         return metadata
+
+    def _after_transmit(
+        self,
+        raw_tx: bytes,
+        metadata: dict[str, Any],
+        *,
+        operation: str,
+        purpose: str,
+    ) -> None:
+        if metadata.get("protected") and not metadata.get("counter_reuse_probe"):
+            transmitted_counter = metadata.get("invocation_counter")
+            used_counters = getattr(self, "_used_invocation_counters", None)
+            if isinstance(transmitted_counter, int) and used_counters is not None:
+                used_counters.append(transmitted_counter)
+
+    def _generate_replay_get(
+        self, target: Any, attribute_id: int, reused_counter: int
+    ) -> Any:
+        """Generate a protected GET without changing the safe next counter."""
+
+        safe_next = int(self.client.ciphering.invocationCounter)
+        try:
+            self.client.ciphering.invocationCounter = reused_counter
+            return _quiet_gurux(self.client.read, target, attribute_id)
+        finally:
+            self.client.ciphering.invocationCounter = safe_next
+
+    def test_invocation_counter_reuse(self) -> dict[str, Any]:
+        """Send five isolated GET probes with stale invocation counters."""
+
+        if not self._associated:
+            raise RuntimeError("counter-reuse testing requires a validated secure association")
+
+        target = self.create_object(15, "0.0.40.0.0.255")
+        distinct_session_counters = list(dict.fromkeys(self._used_invocation_counters))
+        priming_requests = 0
+        priming_errors: list[dict[str, Any]] = []
+        while len(distinct_session_counters) < 4 and priming_requests < 4:
+            priming_requests += 1
+            try:
+                self.read_attribute(
+                    target,
+                    1,
+                    priming_requests,
+                    phase="invocation_counter_reuse_test",
+                    purpose="safe_counter_priming_get",
+                )
+            except Exception as exc:
+                priming_errors.append(
+                    {
+                        "outcome": classify_exception(exc).value,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                try:
+                    self.reconnect()
+                except Exception as reconnect_exc:
+                    priming_errors[-1]["reconnect_error"] = (
+                        f"{type(reconnect_exc).__name__}: {reconnect_exc}"
+                    )
+                    break
+            distinct_session_counters = list(
+                dict.fromkeys(self._used_invocation_counters)
+            )
+
+        result: dict[str, Any] = {
+            "enabled": True,
+            "status": "inconclusive",
+            "target": {
+                "class_id": 15,
+                "logical_name": "0.0.40.0.0.255",
+                "attribute_id": 1,
+            },
+            "requested_probes": 5,
+            "priming_requests": priming_requests,
+            "priming_errors": priming_errors,
+            "probes": [],
+            "association_restored": False,
+        }
+        if len(distinct_session_counters) < 4:
+            result["preparation_error"] = (
+                "fewer than four transmitted session counters were available"
+            )
+            result.update(
+                {
+                    "attempted_probes": 0,
+                    "accepted_probes": 0,
+                    "device_allows_reuse": False,
+                    "association_restored": self._associated,
+                }
+            )
+            return result
+
+        replay_counters = [0, *distinct_session_counters[:4]]
+        for sequence, reused_counter in enumerate(replay_counters, 1):
+            probe = {
+                "sequence": sequence,
+                "reused_counter": reused_counter,
+                "reused_counter_hex": f"0x{reused_counter:08X}",
+                "source": "initial_zero" if sequence == 1 else (
+                    "first_session_counter" if sequence == 2 else "session_counter"
+                ),
+                "accepted": False,
+            }
+            safe_next = int(self.client.ciphering.invocationCounter)
+            try:
+                packets = self._generate_replay_get(target, 1, reused_counter)
+                self._replay_probe_counter = reused_counter
+                reply = GXReplyData()
+                self._read_blocks(
+                    packets,
+                    reply,
+                    phase="invocation_counter_reuse_test",
+                    purpose="stale_counter_get",
+                    operation="GET",
+                    attempt=sequence,
+                    object_context={
+                        "class_id": 15,
+                        "logical_name": "0.0.40.0.0.255",
+                        "attribute_id": 1,
+                        "reused_invocation_counter": reused_counter,
+                    },
+                    tx_context={
+                        "service": "get-request",
+                        "counter_reuse_probe": True,
+                    },
+                )
+            except Exception as exc:
+                probe.update(
+                    {
+                        "outcome": classify_exception(exc).value,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            else:
+                probe.update({"outcome": Outcome.SUCCESS.value, "accepted": True})
+            finally:
+                self._replay_probe_counter = None
+                self.client.ciphering.invocationCounter = safe_next
+            result["probes"].append(probe)
+
+            try:
+                self.reconnect()
+            except Exception as exc:
+                probe["reconnect_error"] = f"{type(exc).__name__}: {exc}"
+                result["restore_error"] = probe["reconnect_error"]
+                break
+
+        result["association_restored"] = self._associated
+        result["attempted_probes"] = len(result["probes"])
+        result["accepted_probes"] = sum(
+            bool(item["accepted"]) for item in result["probes"]
+        )
+        result["device_allows_reuse"] = result["accepted_probes"] > 0
+        if result["attempted_probes"] == result["requested_probes"] and self._associated:
+            result["status"] = (
+                "reuse_accepted"
+                if result["device_allows_reuse"]
+                else "reuse_not_observed"
+            )
+        return result
 
     def _after_receive(
         self, raw_rx: list[bytes], *, operation: str, purpose: str

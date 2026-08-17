@@ -202,6 +202,49 @@ class ResultAndTrafficTests(unittest.TestCase):
         self.assertIn("| ACTION | 1.0.0.1.0.255 | 1 | 1 | Reset | access | NOT_TESTED |", rendered)
         self.assertIn("SET and ACTION are mapped passively", rendered)
 
+    def test_summary_lists_each_invocation_counter_reuse_probe(self):
+        report = {
+            "schema_version": 1,
+            "run": {"id": "test", "status": "completed"},
+            "transport": {},
+            "profiles": [
+                {
+                    "name": "c4",
+                    "association": {
+                        "client_address": 4,
+                        "invocation_counter_reuse_test": {
+                            "enabled": True,
+                            "status": "reuse_accepted",
+                            "attempted_probes": 5,
+                            "accepted_probes": 1,
+                            "device_allows_reuse": True,
+                            "probes": [
+                                {
+                                    "sequence": 1,
+                                    "source": "initial_zero",
+                                    "reused_counter": 0,
+                                    "reused_counter_hex": "0x00000000",
+                                    "outcome": "SUCCESS",
+                                    "accepted": True,
+                                }
+                            ],
+                        },
+                    },
+                    "summary": {"objects": 0},
+                    "objects": [],
+                }
+            ],
+            "errors": [],
+        }
+
+        rendered = render_summary_report(report)
+
+        self.assertIn("### Invocation-counter reuse test", rendered)
+        self.assertIn("reuse was accepted by the meter", rendered)
+        self.assertIn(
+            "| 1 | initial_zero | 0x00000000 | SUCCESS | True |", rendered
+        )
+
     def test_summary_highlights_unexpected_public_cross_profile_access(self):
         report = {
             "schema_version": 1,

@@ -229,7 +229,61 @@ def render_summary_report(
                     f"| Next persisted counter | {_markdown(association.get('next_client_invocation_counter', '—'))} |",
                 ]
             )
+        reuse_test = association.get("invocation_counter_reuse_test")
+        if isinstance(reuse_test, dict):
+            lines.extend(
+                [
+                    f"| Counter-reuse test | {_markdown(reuse_test.get('status', '—'))} |",
+                    f"| Replayed counters accepted | {_markdown(reuse_test.get('accepted_probes', 0))} / {_markdown(reuse_test.get('attempted_probes', 0))} |",
+                ]
+            )
         lines.append("")
+
+        if isinstance(reuse_test, dict) and reuse_test.get("enabled"):
+            lines.extend(["### Invocation-counter reuse test", ""])
+            if reuse_test.get("device_allows_reuse"):
+                lines.extend(
+                    [
+                        "**Invocation-counter reuse was accepted by the meter.** At least one protected GET using a stale counter succeeded.",
+                        "",
+                    ]
+                )
+            elif reuse_test.get("status") == "reuse_not_observed":
+                lines.extend(
+                    [
+                        "No stale-counter GET was accepted in the five requested probes.",
+                        "",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "The replay diagnostic was inconclusive; inspect the individual outcomes and traffic log.",
+                        "",
+                    ]
+                )
+            lines.extend(
+                [
+                    "| Probe | Counter source | Reused counter | Outcome | Accepted |",
+                    "|---:|---|---|---|---|",
+                ]
+            )
+            for probe in reuse_test.get("probes", []):
+                lines.append(
+                    "| {} | {} | {} | {} | {} |".format(
+                        _markdown(probe.get("sequence", "—")),
+                        _markdown(probe.get("source", "—")),
+                        _markdown(
+                            probe.get(
+                                "reused_counter_hex",
+                                probe.get("reused_counter", "—"),
+                            )
+                        ),
+                        _markdown(probe.get("outcome", "—")),
+                        _markdown(probe.get("accepted", False)),
+                    )
+                )
+            lines.append("")
 
         identification = profile.get("identification", {})
         if identification:
