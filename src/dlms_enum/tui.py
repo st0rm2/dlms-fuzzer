@@ -99,6 +99,15 @@ class ScanUI:
                 f"Attempt 0x{counter:08X} as invocation counter"
             )
             return
+        if phase == "invocation_counter_recovery_get":
+            counter = int(event["invocation_counter"])
+            self.console.print(
+                f"Verify association with safe counter 0x{counter:08X}"
+            )
+            return
+        if phase == "invocation_counter_recovery_wait":
+            self.console.print(message)
+            return
         if phase == "baud_detection":
             self._update(
                 stage="Discovery",

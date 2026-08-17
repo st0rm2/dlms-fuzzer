@@ -86,7 +86,7 @@ profiles:
 
 The public preflight always runs, even when the public role is not selected for a full scan. For every selected secure role, the operator sees its SAP and system title together with the full list of validated public-readable unsigned counter candidates, the configured counter object, and its decoded current value. The operator can accept it, select another candidate, enter an OBIS from that list, redisplay the list, or abort. The chosen mapping affects only the runtime configuration; the source YAML is not rewritten. Immediately before the secure association, the counter is read again and combined with crash-safe local state as described below.
 
-After confirming each secure role's counter source, an interactive run optionally offers a two-request invocation-counter reuse diagnostic (default: no). This laboratory check runs after the other scan tests and replays `0x00000000` plus the first counter actually transmitted in that secure session against a small Association LN GET. If that first counter is also zero, the second transmitted counter is used instead. Each probe is followed by a fresh secure association using safe counters. The persistent counter is never rolled back. Any accepted replay is reported explicitly; timeouts and protocol errors retain their individual outcomes.
+After confirming each secure role's counter source, an interactive run optionally offers a two-request invocation-counter reuse diagnostic (default: no). This laboratory check runs after the other scan tests and replays `0x00000000` plus the first counter actually transmitted in that secure session against a small Association LN GET. If that first counter is also zero, the second transmitted counter is used instead. After a rejected replay, the tool sends one protected GET with the next persisted safe counter on the existing association. If that recovery GET fails, it attempts a protected release, always sends HDLC DISC, resets all local HDLC state, and reconnects with a fresh Gurux client. A meter-side AARQ rejection is retried once after `invocation_counter.recovery_wait_ms` (default: 60000 ms); a meter-specific reset or administrative unlock is never attempted automatically. The persistent counter is never rolled back. Any accepted replay is reported explicitly; timeouts and protocol errors retain their individual outcomes.
 
 With multiple selected roles, each role receives its own subdirectory and canonical report. The parent directory contains `workflow.json` and the public `preflight-traffic.jsonl`. A single selected role retains the existing flat output layout.
 
@@ -119,6 +119,7 @@ The secure profile name fixes the following behavior:
 - AES-GCM with 128-bit GAK and GUEK values;
 - public bootstrap client SAP 16;
 - invocation-counter Data object `0.0.43.1.0.255`, class 1, attribute 2;
+- a 60000 ms one-time recovery wait if the meter rejects the post-replay secure AARQ;
 - automatic baud and one-byte/two-byte HDLC server-address discovery;
 - protected GET requests and responses after HLS succeeds.
 

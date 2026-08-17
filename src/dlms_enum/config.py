@@ -97,6 +97,7 @@ class InvocationCounterConfig:
     state_file: str = "~/.local/state/dlms-enum/invocation-counters.json"
     meter_identity: str | None = None
     unsafe_override: int | None = None
+    recovery_wait_ms: int = 60_000
 
 
 @dataclass(frozen=True)
@@ -435,7 +436,7 @@ def _parse_invocation_counter(
         data,
         {
             "public_client_address", "class_id", "logical_name", "attribute_id",
-            "state_file", "meter_identity", "unsafe_override",
+            "state_file", "meter_identity", "unsafe_override", "recovery_wait_ms",
         },
         counter_label,
     )
@@ -464,6 +465,11 @@ def _parse_invocation_counter(
         state_file=str(state_path),
         meter_identity=meter_identity.strip() if meter_identity else None,
         unsafe_override=unsafe_override,
+        recovery_wait_ms=_positive_ms(
+            data.get("recovery_wait_ms", 60_000),
+            f"{counter_label}.recovery_wait_ms",
+            allow_zero=True,
+        ),
     )
 
 

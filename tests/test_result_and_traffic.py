@@ -226,6 +226,13 @@ class ResultAndTrafficTests(unittest.TestCase):
                                     "reused_counter_hex": "0x00000000",
                                     "outcome": "SUCCESS",
                                     "accepted": True,
+                                    "recovery": {
+                                        "safe_counter": 43,
+                                        "safe_get_succeeded": False,
+                                        "fresh_client": True,
+                                        "reconnect_attempts": 2,
+                                        "waited_ms": 60000,
+                                    },
                                 }
                             ],
                         },
@@ -244,6 +251,8 @@ class ResultAndTrafficTests(unittest.TestCase):
         self.assertIn(
             "| 1 | initial_zero | 0x00000000 | SUCCESS | True |", rendered
         )
+        self.assertIn("#### Post-replay recovery", rendered)
+        self.assertIn("| 1 | 43 | False | True | 2 | 60000 |", rendered)
 
     def test_summary_highlights_unexpected_public_cross_profile_access(self):
         report = {

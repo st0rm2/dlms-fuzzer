@@ -10,7 +10,7 @@ profiles:
   - name: hls_gmac_suite0
     role: client1
     client_address: 1
-    client_system_title: "hex:12341234123413"
+    client_system_title: "hex:1234123412341301"
     secrets:
       gak: {env: CLIENT1_GAK}
       guek: {env: CLIENT1_GUEK}
@@ -18,7 +18,7 @@ profiles:
   - name: hls_gmac_suite0
     role: client2
     client_address: 4
-    client_system_title: "hex:12341234123413"
+    client_system_title: "hex:1234123412341302"
     secrets:
       gak: {env: CLIENT2_GAK}
       guek: {env: CLIENT2_GUEK}

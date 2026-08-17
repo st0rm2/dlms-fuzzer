@@ -284,6 +284,32 @@ def render_summary_report(
                     )
                 )
             lines.append("")
+            recoveries = [
+                (probe.get("sequence", "—"), probe.get("recovery"))
+                for probe in reuse_test.get("probes", [])
+                if isinstance(probe.get("recovery"), dict)
+            ]
+            if recoveries:
+                lines.extend(
+                    [
+                        "#### Post-replay recovery",
+                        "",
+                        "| Probe | Safe counter | Safe GET | Fresh client | Reconnect attempts | Waited (ms) |",
+                        "|---:|---:|---|---|---:|---:|",
+                    ]
+                )
+                for sequence, recovery in recoveries:
+                    lines.append(
+                        "| {} | {} | {} | {} | {} | {} |".format(
+                            _markdown(sequence),
+                            _markdown(recovery.get("safe_counter", "—")),
+                            _markdown(recovery.get("safe_get_succeeded", False)),
+                            _markdown(recovery.get("fresh_client", False)),
+                            _markdown(recovery.get("reconnect_attempts", 0)),
+                            _markdown(recovery.get("waited_ms", 0)),
+                        )
+                    )
+                lines.append("")
 
         identification = profile.get("identification", {})
         if identification:

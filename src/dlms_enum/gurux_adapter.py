@@ -802,6 +802,14 @@ class GuruxSession:
             self._open = False
             self._linked = False
             self._associated = False
+        # snrmRequest() clears Gurux's connection flags but does not reset the
+        # HDLC sender/receiver sequence. Without this reset a valid UA can be
+        # discarded after an interrupted association and the reconnect times
+        # out even though the meter answered.
+        try:
+            self.client.settings.resetFrameSequence()
+        except Exception:
+            pass
         if self.config.transport.session_guard_ms:
             time.sleep(self.config.transport.session_guard_ms / 1000)
         try:
@@ -846,18 +854,196 @@ class GuruxSecureSession(GuruxSession):
             profile_name=profile.role,
         )
         self.counter_lease = counter_lease
+        self._gak = bytes(gak)
+        self._guek = bytes(guek)
         self.authentication_name = "high_gmac"
         self.security_name = "authentication_encryption"
-        self.client.authentication = Authentication.HIGH_GMAC
-        self.client.ciphering.systemTitle = bytearray(profile.client_system_title)
-        self.client.ciphering.authenticationKey = bytearray(gak)
-        self.client.ciphering.blockCipherKey = bytearray(guek)
-        self.client.ciphering.security = Security.AUTHENTICATION_ENCRYPTION
-        self.client.ciphering.securitySuite = SecuritySuite.SUITE_0
-        self.client.ciphering.invocationCounter = counter_lease.next_counter
-        self.client.useProtectedRelease = True
+        self._configure_secure_client(self.client)
         self._used_invocation_counters: list[int] = []
         self._replay_probe_counter: int | None = None
+
+    def _configure_secure_client(self, client: Any) -> None:
+        """Apply this session's Suite 0 identity and current leased counter."""
+
+        profile = self.config.profile
+        if not isinstance(profile, SecureProfile):
+            raise TypeError("secure protocol client requires hls_gmac_suite0 configuration")
+        client.authentication = Authentication.HIGH_GMAC
+        client.ciphering.systemTitle = bytearray(profile.client_system_title)
+        client.ciphering.authenticationKey = bytearray(self._gak)
+        client.ciphering.blockCipherKey = bytearray(self._guek)
+        client.ciphering.security = Security.AUTHENTICATION_ENCRYPTION
+        client.ciphering.securitySuite = SecuritySuite.SUITE_0
+        client.ciphering.invocationCounter = int(self.counter_lease.next_counter)
+        client.useProtectedRelease = True
+
+    def _replace_secure_client(self) -> None:
+        """Replace all Gurux protocol state while preserving the counter lease."""
+
+        profile = self.config.profile
+        if not isinstance(profile, SecureProfile):
+            raise TypeError("secure protocol client requires hls_gmac_suite0 configuration")
+        server_address = GXDLMSClient.getServerAddress(
+            self.server_logical_address,
+            self.server_physical_address,
+            self.server_address_size,
+        )
+        client = GXDLMSSecureClient(
+            True,
+            profile.client_address,
+            server_address,
+            Authentication.NONE,
+            None,
+            InterfaceType.HDLC,
+        )
+        if self.server_address_size:
+            client.serverAddressSize = self.server_address_size
+        client.maxReceivePDUSize = profile.proposed_max_pdu_size
+        self._configure_secure_client(client)
+        client.settings.resetFrameSequence()
+        self.client = client
+        self._replay_probe_counter = None
+
+    def _teardown_for_secure_recovery(self, *, attempt_release: bool) -> list[str]:
+        """Best-effort RLRQ, mandatory DISC, and local protocol/media reset."""
+
+        warnings: list[str] = []
+        if self._open and attempt_release and self._associated:
+            try:
+                release = _quiet_gurux(self.client.releaseRequest)
+                if release:
+                    reply = GXReplyData()
+                    self._read_blocks(
+                        release,
+                        reply,
+                        phase="invocation_counter_recovery",
+                        purpose="association_release",
+                        operation="RLRQ",
+                        attempt=1,
+                        tx_context={"message": "recovery-release-request"},
+                    )
+            except Exception as exc:
+                warnings.append(
+                    f"association release failed: {type(exc).__name__}: {exc}"
+                )
+        self._associated = False
+
+        # Always generate DISC with force=True. Besides notifying the meter,
+        # Gurux's disconnectRequest resets its HDLC sequence state.
+        if self._open:
+            try:
+                disconnect = _quiet_gurux(self.client.disconnectRequest, True)
+                if disconnect:
+                    reply = GXReplyData()
+                    self._exchange_packet(
+                        disconnect,
+                        reply,
+                        phase="invocation_counter_recovery",
+                        purpose="hdlc_disconnect",
+                        operation="DISC",
+                        attempt=1,
+                        tx_context={"message": "forced-recovery-disconnect"},
+                    )
+            except Exception as exc:
+                warnings.append(f"HDLC disconnect failed: {type(exc).__name__}: {exc}")
+        self._linked = False
+        try:
+            self.client.settings.resetFrameSequence()
+        except Exception as exc:
+            warnings.append(f"HDLC sequence reset failed: {type(exc).__name__}: {exc}")
+        try:
+            self.media.resetSynchronousBuffer()
+            self.media.close()
+        except Exception as exc:
+            warnings.append(f"serial close failed: {type(exc).__name__}: {exc}")
+        self._open = False
+        if self.config.transport.session_guard_ms:
+            time.sleep(self.config.transport.session_guard_ms / 1000)
+        return warnings
+
+    def reconnect(self) -> dict[str, Any]:
+        """Reconnect with a clean teardown and a fresh Gurux protocol client."""
+
+        self._teardown_for_secure_recovery(attempt_release=self._associated)
+        self._replace_secure_client()
+        try:
+            return self.connect()
+        except Exception:
+            try:
+                self._teardown_for_secure_recovery(attempt_release=False)
+            except Exception:
+                pass
+            raise
+
+    def _restore_after_failed_safe_get(
+        self,
+        progress: Callable[[dict[str, Any]], None],
+        recovery: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Restore association, waiting once if the meter rejects the fresh AARQ."""
+
+        recovery = recovery if recovery is not None else {}
+        recovery.update(
+            {
+                "cleanup_warnings": self._teardown_for_secure_recovery(
+                    attempt_release=True
+                ),
+                "fresh_client": True,
+                "waited_ms": 0,
+            }
+        )
+        self._replace_secure_client()
+        try:
+            self.connect()
+            recovery["reconnect_attempts"] = 1
+            return recovery
+        except Exception as first_error:
+            recovery["reconnect_attempts"] = 1
+            recovery["first_reconnect_error"] = (
+                f"{type(first_error).__name__}: {first_error}"
+            )
+            wait_ms = int(
+                self.config.profile.invocation_counter.recovery_wait_ms
+            )
+            if classify_exception(first_error) != Outcome.DLMS_ERROR or wait_ms <= 0:
+                raise
+
+        recovery["cleanup_warnings"].extend(
+            self._teardown_for_secure_recovery(attempt_release=False)
+        )
+        progress(
+            {
+                "phase": "invocation_counter_recovery_wait",
+                "wait_ms": wait_ms,
+                "message": (
+                    "Meter rejected the fresh secure association; waiting "
+                    f"{wait_ms} ms for its client association/security timeout"
+                ),
+            }
+        )
+        time.sleep(wait_ms / 1000)
+        recovery["waited_ms"] = wait_ms
+        self._replace_secure_client()
+        try:
+            self.connect()
+        except Exception as second_error:
+            recovery["reconnect_attempts"] = 2
+            recovery["second_reconnect_error"] = (
+                f"{type(second_error).__name__}: {second_error}"
+            )
+            try:
+                recovery["cleanup_warnings"].extend(
+                    self._teardown_for_secure_recovery(attempt_release=False)
+                )
+            except Exception:
+                pass
+            raise RuntimeError(
+                "meter still rejects the secure client after its configured recovery "
+                f"wait ({wait_ms} ms); wait longer or use an authorized meter "
+                "reset/admin unlock"
+            ) from second_error
+        recovery["reconnect_attempts"] = 2
+        return recovery
 
     def _endpoint_context(self) -> dict[str, Any]:
         context = super()._endpoint_context()
@@ -1074,12 +1260,63 @@ class GuruxSecureSession(GuruxSession):
                 self.client.ciphering.invocationCounter = safe_next
             result["probes"].append(probe)
 
+            if probe["accepted"]:
+                # An accepted replay is unsafe and must not share an
+                # association with the next diagnostic probe.
+                try:
+                    self.reconnect()
+                except Exception as exc:
+                    probe["reconnect_error"] = f"{type(exc).__name__}: {exc}"
+                    result["restore_error"] = probe["reconnect_error"]
+                    break
+                continue
+
+            # A conforming meter rejects the stale request. Before tearing down
+            # the association, prove whether it still accepts the next leased
+            # counter. This consumes and persists exactly one fresh counter.
+            safe_counter = max(
+                int(self.client.ciphering.invocationCounter),
+                int(self.counter_lease.next_counter),
+            )
+            self.client.ciphering.invocationCounter = safe_counter
+            recovery = {
+                "safe_counter": safe_counter,
+                "safe_get_attempted": True,
+                "safe_get_succeeded": False,
+            }
+            probe["recovery"] = recovery
+            progress(
+                {
+                    "phase": "invocation_counter_recovery_get",
+                    "attempt": sequence,
+                    "invocation_counter": recovery["safe_counter"],
+                    "message": (
+                        "Testing the existing association with the next safe "
+                        f"counter 0x{recovery['safe_counter']:08X}"
+                    ),
+                }
+            )
             try:
-                self.reconnect()
-            except Exception as exc:
-                probe["reconnect_error"] = f"{type(exc).__name__}: {exc}"
-                result["restore_error"] = probe["reconnect_error"]
-                break
+                self.read_attribute(
+                    target,
+                    1,
+                    1,
+                    phase="invocation_counter_recovery",
+                    purpose="safe_counter_get",
+                )
+            except Exception as safe_error:
+                recovery["safe_get_error"] = (
+                    f"{type(safe_error).__name__}: {safe_error}"
+                )
+                try:
+                    self._restore_after_failed_safe_get(progress, recovery)
+                except Exception as exc:
+                    probe["reconnect_error"] = f"{type(exc).__name__}: {exc}"
+                    result["restore_error"] = probe["reconnect_error"]
+                    break
+            else:
+                recovery["safe_get_succeeded"] = True
+                recovery["association_continued"] = True
 
         result["association_restored"] = self._associated
         result["attempted_probes"] = len(result["probes"])

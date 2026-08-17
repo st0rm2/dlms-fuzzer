@@ -3,7 +3,9 @@ import json
 import tempfile
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from gurux_dlms import GXReplyData
 from gurux_dlms.enums import Command
@@ -205,6 +207,7 @@ class SecureProtocolTests(unittest.TestCase):
         session.client = types.SimpleNamespace(
             ciphering=types.SimpleNamespace(invocationCounter=105)
         )
+        session.counter_lease = StubLease(next_counter=105)
         session.create_object = lambda *_args: object()
         generated = []
         session._generate_replay_get = (
@@ -261,6 +264,177 @@ class SecureProtocolTests(unittest.TestCase):
 
         self.assertEqual(generated, [0, 1])
         self.assertEqual(result["probes"][1]["source"], "second_session_counter")
+
+    def test_rejected_replay_uses_next_safe_counter_on_existing_association(self):
+        session = object.__new__(GuruxSecureSession)
+        session._associated = True
+        session._used_invocation_counters = [101, 102]
+        session._replay_probe_counter = None
+        session.client = types.SimpleNamespace(
+            ciphering=types.SimpleNamespace(invocationCounter=105)
+        )
+        session.counter_lease = StubLease(next_counter=106)
+        session.create_object = lambda *_args: object()
+        session._generate_replay_get = lambda *_args: [b"STALE"]
+        session._read_blocks = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("stale counter rejected")
+        )
+        safe_counters = []
+
+        def safe_read(*_args, **_kwargs):
+            safe_counters.append(session.client.ciphering.invocationCounter)
+            session.client.ciphering.invocationCounter += 1
+            return {"value": "0.0.40.0.0.255"}
+
+        session.read_attribute = safe_read
+        session.reconnect = lambda: self.fail("rejected replay must try safe GET first")
+
+        result = session.test_invocation_counter_reuse()
+
+        self.assertEqual(safe_counters, [106, 107])
+        self.assertEqual(result["status"], "reuse_not_observed")
+        self.assertTrue(result["association_restored"])
+        self.assertTrue(
+            all(item["recovery"]["safe_get_succeeded"] for item in result["probes"])
+        )
+
+    def test_failed_safe_get_uses_fresh_association_recovery(self):
+        session = object.__new__(GuruxSecureSession)
+        session._associated = True
+        session._used_invocation_counters = [101, 102]
+        session._replay_probe_counter = None
+        session.client = types.SimpleNamespace(
+            ciphering=types.SimpleNamespace(invocationCounter=105)
+        )
+        session.counter_lease = StubLease(next_counter=105)
+        session.create_object = lambda *_args: object()
+        session._generate_replay_get = lambda *_args: [b"STALE"]
+        session._read_blocks = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("stale counter rejected")
+        )
+        session.read_attribute = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("association no longer usable")
+        )
+        restorations = []
+
+        def restore(_progress, recovery):
+            restorations.append(True)
+            session._associated = True
+            recovery.update({"fresh_client": True, "reconnect_attempts": 1})
+            return recovery
+
+        session._restore_after_failed_safe_get = restore
+
+        result = session.test_invocation_counter_reuse()
+
+        self.assertEqual(len(restorations), 2)
+        self.assertTrue(result["association_restored"])
+        self.assertTrue(
+            all(item["recovery"]["fresh_client"] for item in result["probes"])
+        )
+
+    def test_secure_recovery_orders_release_disc_reset_and_close(self):
+        events = []
+        session = object.__new__(GuruxSecureSession)
+        session.config = secure_config(session_guard_ms=0)
+        session._open = True
+        session._linked = True
+        session._associated = True
+        session.client = types.SimpleNamespace(
+            releaseRequest=lambda: [b"release"],
+            disconnectRequest=lambda force: events.append(("FORCE", force)) or b"disconnect",
+            settings=types.SimpleNamespace(
+                resetFrameSequence=lambda: events.append("RESET_FRAME")
+            ),
+        )
+        session._read_blocks = lambda *_args, operation, **_kwargs: events.append(operation)
+        session._exchange_packet = (
+            lambda *_args, operation, **_kwargs: events.append(operation)
+        )
+        session.media = types.SimpleNamespace(
+            resetSynchronousBuffer=lambda: events.append("RESET_MEDIA"),
+            close=lambda: events.append("CLOSE"),
+        )
+
+        warnings = session._teardown_for_secure_recovery(attempt_release=True)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            events,
+            ["RLRQ", ("FORCE", True), "DISC", "RESET_FRAME", "RESET_MEDIA", "CLOSE"],
+        )
+        self.assertFalse(session._open)
+        self.assertFalse(session._linked)
+        self.assertFalse(session._associated)
+
+    def test_fresh_secure_client_resumes_from_leased_next_counter(self):
+        lease = StubLease(next_counter=129128)
+        session = GuruxSecureSession(
+            secure_config(),
+            9600,
+            NullTraffic(),
+            lease,
+            GAK,
+            GUEK,
+            server_logical_address=0,
+            server_physical_address=1,
+            server_address_size=1,
+        )
+        previous_client = session.client
+
+        session._replace_secure_client()
+
+        self.assertIsNot(session.client, previous_client)
+        self.assertEqual(session.client.ciphering.invocationCounter, 129128)
+        self.assertEqual(bytes(session.client.ciphering.systemTitle), b"CLIENT01")
+
+    def test_dlms_reconnect_rejection_waits_once_then_retries(self):
+        class GXDLMSExceptionResponseFake(Exception):
+            pass
+
+        session = object.__new__(GuruxSecureSession)
+        config = secure_config(session_guard_ms=0)
+        session.config = replace(
+            config,
+            profiles=(
+                replace(
+                    config.profile,
+                    invocation_counter=replace(
+                        config.profile.invocation_counter,
+                        recovery_wait_ms=250,
+                    ),
+                ),
+            ),
+        )
+        session._associated = False
+        teardowns = []
+        replacements = []
+        session._teardown_for_secure_recovery = (
+            lambda *, attempt_release: teardowns.append(attempt_release) or []
+        )
+        session._replace_secure_client = lambda: replacements.append(True)
+        attempts = []
+
+        def connect():
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise GXDLMSExceptionResponseFake("operation not possible")
+            session._associated = True
+            return {}
+
+        session.connect = connect
+        progress = []
+
+        with mock.patch("dlms_enum.gurux_adapter.time.sleep") as sleep:
+            recovery = session._restore_after_failed_safe_get(progress.append)
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(replacements), 2)
+        self.assertEqual(teardowns, [True, False])
+        sleep.assert_called_once_with(0.25)
+        self.assertEqual(recovery["waited_ms"], 250)
+        self.assertEqual(recovery["reconnect_attempts"], 2)
+        self.assertEqual(progress[0]["phase"], "invocation_counter_recovery_wait")
 
     def test_counter_is_persisted_before_media_send_and_cc_is_decoded(self):
         events = []

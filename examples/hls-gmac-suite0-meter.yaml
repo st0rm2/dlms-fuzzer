@@ -24,6 +24,10 @@ profiles:
         env: C4_GAK
       guek:
         env: C4_GUEK
+    invocation_counter:
+      # Retry once after this meter-side association/security timeout when a
+      # post-replay AARQ is rejected. Set to 0 to disable the delayed retry.
+      recovery_wait_ms: 60000
 
 # The public role is used for the mandatory preflight and may also be selected
 # for a full scan. Secure defaults provide logical-name referencing, public

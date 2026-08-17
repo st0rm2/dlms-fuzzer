@@ -66,10 +66,28 @@ class SecureConfigTests(unittest.TestCase):
         self.assertEqual(config.profile.client_system_title, b"METER001")
         self.assertEqual(config.profile.invocation_counter.public_client_address, 16)
         self.assertEqual(config.profile.invocation_counter.logical_name, "0.0.43.1.0.255")
+        self.assertEqual(config.profile.invocation_counter.recovery_wait_ms, 60_000)
         snapshot = config.redacted_dict()
         self.assertEqual(snapshot["profiles"][0]["authentication"]["mechanism"], "high_gmac")
         self.assertEqual(snapshot["profiles"][0]["security"]["suite"], 0)
         self.assertEqual(snapshot["profiles"][0]["security"]["policy"], "authentication_encryption")
+
+    def test_counter_recovery_wait_is_configurable_and_bounded(self):
+        config = parse_config(
+            secure_mapping(invocation_counter={"recovery_wait_ms": 90_000})
+        )
+
+        self.assertEqual(config.profile.invocation_counter.recovery_wait_ms, 90_000)
+
+        for invalid in (-1, True, 3_600_001):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ConfigError, "recovery_wait_ms"
+            ):
+                parse_config(
+                    secure_mapping(
+                        invocation_counter={"recovery_wait_ms": invalid}
+                    )
+                )
 
     def test_secure_profile_can_enable_public_union_testing(self):
         mapping = secure_mapping()
