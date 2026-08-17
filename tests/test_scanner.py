@@ -294,15 +294,21 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(
             report["transport"]["server_addressing_type"], "1-byte addressing"
         )
-        value_attribute = report["profiles"][0]["objects"][0]["attributes"][1]
+        attributes = report["profiles"][0]["objects"][0]["attributes"]
+        self.assertEqual([item["attribute_id"] for item in attributes], [2])
+        value_attribute = attributes[0]
         self.assertEqual(value_attribute["attempt_count"], 2)
         self.assertEqual(value_attribute["outcome"], "SUCCESS")
-        logical_name_attribute = report["profiles"][0]["objects"][0]["attributes"][0]
-        self.assertEqual(logical_name_attribute["lifecycle"], "derived")
-        self.assertEqual(logical_name_attribute["outcome"], "NOT_TESTED")
-        self.assertEqual(logical_name_attribute["value_source"], "association_view")
         self.assertEqual(
-            logical_name_attribute["decoded"]["value"], FakeObject.logicalName
+            report["profiles"][0]["objects"][0]["logical_name"],
+            FakeObject.logicalName,
+        )
+        self.assertFalse(
+            any(
+                row.get("attribute_id") == 1
+                for row in report["capability_matrix"]
+                if row["operation"] in {"GET", "SET"}
+            )
         )
 
     def test_retries_are_suppressed_after_consecutive_timeouts(self):
@@ -331,7 +337,6 @@ class ScannerTests(unittest.TestCase):
             attribute
             for obj in profile["objects"]
             for attribute in obj["attributes"]
-            if attribute["lifecycle"] != "derived"
         ]
         self.assertFalse(attributes[0]["retry_suppressed"])
         self.assertTrue(all(item["retry_suppressed"] for item in attributes[1:]))
@@ -457,14 +462,14 @@ class ScannerTests(unittest.TestCase):
         profile = report["profiles"][0]
         attributes = profile["objects"][0]["attributes"]
         self.assertEqual(WritableSession.read_attempts, [(2, 1)])
-        self.assertEqual(attributes[1]["advertised_operations"], ["GET", "SET"])
-        self.assertEqual(attributes[2]["advertised_operations"], ["SET"])
-        self.assertEqual(attributes[2]["lifecycle"], "not_readable")
-        self.assertFalse(attributes[2]["write_tested"])
+        self.assertEqual(attributes[0]["advertised_operations"], ["GET", "SET"])
+        self.assertEqual(attributes[1]["advertised_operations"], ["SET"])
+        self.assertEqual(attributes[1]["lifecycle"], "not_readable")
+        self.assertFalse(attributes[1]["write_tested"])
         self.assertEqual(profile["summary"]["advertised_set_attributes"], 2)
         self.assertEqual(profile["summary"]["advertised_action_methods"], 1)
         operations = [item["operation"] for item in report["capability_matrix"]]
-        self.assertEqual(operations.count("GET"), 2)
+        self.assertEqual(operations.count("GET"), 1)
         self.assertEqual(operations.count("SET"), 2)
         self.assertEqual(operations.count("ACTION"), 1)
 
@@ -543,13 +548,13 @@ class ScannerTests(unittest.TestCase):
         get_rows = [
             item for item in report["capability_matrix"] if item["operation"] == "GET"
         ]
-        self.assertEqual(len(get_rows), 24)
+        self.assertEqual(len(get_rows), 12)
         self.assertEqual(
             sum(
                 row["profiles"]["public"]["status"] == "NOT_TESTED"
                 for row in get_rows
             ),
-            14,
+            2,
         )
 
     def test_get_limit_tests_exact_budget_and_maps_remaining_gets(self):
@@ -573,15 +578,15 @@ class ScannerTests(unittest.TestCase):
         profile = report["profiles"][0]
         self.assertEqual(len(LimitedSession.read_objects), 5)
         self.assertEqual(profile["summary"]["get_attempted"], 5)
-        self.assertEqual(profile["summary"]["get_not_tested"], 19)
-        self.assertEqual(profile["scan_scope"]["mapped_gets"], 24)
-        self.assertEqual(profile["scan_scope"]["derived_gets"], 12)
+        self.assertEqual(profile["summary"]["get_not_tested"], 7)
+        self.assertEqual(profile["scan_scope"]["mapped_gets"], 12)
+        self.assertNotIn("derived_gets", profile["scan_scope"])
         self.assertEqual(profile["scan_scope"]["testable_gets"], 12)
         self.assertEqual(profile["scan_scope"]["selected_gets"], 5)
         get_rows = [
             item for item in report["capability_matrix"] if item["operation"] == "GET"
         ]
-        self.assertEqual(len(get_rows), 24)
+        self.assertEqual(len(get_rows), 12)
         self.assertEqual(
             sum(row["profiles"]["public"]["tested"] for row in get_rows),
             5,

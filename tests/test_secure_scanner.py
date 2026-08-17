@@ -255,7 +255,8 @@ class SecureScannerTests(unittest.TestCase):
             if row["operation"] == "GET"
             and row["logical_name"] == SecureOnlyObject.logicalName
         ]
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["attribute_id"], 2)
         probed_rows = [
             row
             for row in rows

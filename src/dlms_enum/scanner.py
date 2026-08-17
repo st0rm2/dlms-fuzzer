@@ -1244,19 +1244,13 @@ def scan_public(
             for attribute_id in _ordered_attribute_ids(
                 item["target"], item["attributes"]
             )
-            if item["attributes"][attribute_id].get("read")
-            or item["attributes"][attribute_id].get("catalogue_probe")
+            if attribute_id != 1
+            and (
+                item["attributes"][attribute_id].get("read")
+                or item["attributes"][attribute_id].get("catalogue_probe")
+            )
         ]
-        derived_get_capabilities = {
-            (key, 1)
-            for key, item in all_items
-            if "association_view" in item["sources"] and 1 in item["attributes"]
-        }
-        testable_get_capabilities = [
-            capability
-            for capability in all_get_capabilities
-            if capability not in derived_get_capabilities
-        ]
+        testable_get_capabilities = list(all_get_capabilities)
         association_view_get = ((15, "0.0.40.0.0.255"), 2)
         if association_view_get in testable_get_capabilities:
             testable_get_capabilities.remove(association_view_get)
@@ -1272,10 +1266,12 @@ def scan_public(
                     item["target"], item["attributes"]
                 )
                 if (
-                    item["attributes"][attribute_id].get("read")
-                    or item["attributes"][attribute_id].get("catalogue_probe")
+                    attribute_id != 1
+                    and (
+                        item["attributes"][attribute_id].get("read")
+                        or item["attributes"][attribute_id].get("catalogue_probe")
+                    )
                 )
-                and (key, attribute_id) not in derived_get_capabilities
             }
             if association_view_get in testable_get_capabilities:
                 selected_get_capabilities.add(association_view_get)
@@ -1350,7 +1346,6 @@ def scan_public(
                 "mapped_objects": len(all_items),
                 "selected_objects": len(selected_object_keys),
                 "mapped_gets": len(all_get_capabilities),
-                "derived_gets": len(derived_get_capabilities),
                 "testable_gets": len(testable_get_capabilities),
                 "selected_gets": len(selected_get_capabilities),
                 "get_with_list": {
@@ -1377,7 +1372,6 @@ def scan_public(
                 "object_limit": config.scan.object_limit,
                 "get_limit": config.scan.get_limit,
                 "mapped_gets": len(all_get_capabilities),
-                "derived_gets": len(derived_get_capabilities),
                 "testable_gets": len(testable_get_capabilities),
                 "selected_gets": len(selected_get_capabilities),
                 "get_attempted": 0,
@@ -1523,6 +1517,10 @@ def scan_public(
                     }
                 )
             for attribute_id in _ordered_attribute_ids(target, item["attributes"]):
+                # Attribute 1 repeats the logical name already stored on the
+                # object record. Omit it from all result and capability output.
+                if attribute_id == 1:
+                    continue
                 access_rights = item["attributes"][attribute_id]
                 advertised_operations = []
                 if access_rights.get("advertised", True) and access_rights.get("read"):
@@ -1550,20 +1548,6 @@ def scan_public(
                     "attempts": [],
                 }
                 object_result["attributes"].append(attribute_result)
-
-                if ((class_id, logical_name), attribute_id) in derived_get_capabilities:
-                    attribute_result.update(
-                        {
-                            "lifecycle": "derived",
-                            "outcome": Outcome.NOT_TESTED.value,
-                            "value_source": "association_view",
-                            "decoded": {
-                                "value": logical_name,
-                                "dlms_data_type": "octet_string",
-                            },
-                        }
-                    )
-                    continue
 
                 # Preserve write-only attributes as passive Association View
                 # capabilities, but never issue a modifying SET during enumeration.

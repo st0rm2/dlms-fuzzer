@@ -242,7 +242,7 @@ def render_summary_report(
             [
                 "### Decoded OBIS values",
                 "",
-                "One compact row is shown for every mapped GET attribute except the redundant logical-name attribute when other attributes exist. Untested rows remain mapped as `NOT_TESTED`. The encrypted-response column contains ciphertext only, excluding HDLC framing, security control, invocation counter, authentication tag, and CRC.",
+                "One compact row is shown for every mapped GET attribute except logical-name attribute 1, which duplicates the OBIS value already present on the object. Untested rows remain mapped as `NOT_TESTED`. The encrypted-response column contains ciphertext only, excluding HDLC framing, security control, invocation counter, authentication tag, and CRC.",
                 "",
                 "| OBIS | Class | Attribute | Name | Decoded value | Encoded value (hex) | Encrypted response (hex) | Result |",
                 "|---|---:|---:|---|---|---|---|---|",
@@ -257,8 +257,6 @@ def render_summary_report(
                 or item.get("access_rights", {}).get("catalogue_probe", False)
             ]
             display_attributes = [item for item in attributes if item.get("attribute_id") != 1]
-            if not display_attributes:
-                display_attributes = attributes or [{}]
             for attribute in display_attributes:
                 decoded = attribute.get("decoded", {})
                 value = decoded.get("value") if isinstance(decoded, dict) else None
@@ -298,6 +296,8 @@ def render_summary_report(
         )
         for obj in profile.get("objects", []):
             for attribute in obj.get("attributes", []):
+                if attribute.get("attribute_id") == 1:
+                    continue
                 rights = attribute.get("access_rights", {})
                 if rights.get("read", True) or rights.get("catalogue_probe", False):
                     lines.append(

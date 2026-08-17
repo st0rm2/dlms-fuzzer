@@ -129,6 +129,8 @@ class ResultAndTrafficTests(unittest.TestCase):
         self.assertIn("## Profile: hls_gmac_suite0", rendered)
         self.assertIn("First 1 objects (short test)", rendered)
         self.assertIn("| 0.0.96.1.0.255 | 1 | 2 | Value | 12345 | 3132333435 | — | SUCCESS |", rendered)
+        self.assertNotIn("| 0.0.96.1.0.255 | 1 | 1 |", rendered)
+        self.assertNotIn("| GET | 0.0.96.1.0.255 | 1 | 1 |", rendered)
 
     def test_write_report_links_compact_summary(self):
         with tempfile.TemporaryDirectory() as directory:
