@@ -182,13 +182,12 @@ def acquire_counter_lease(
         else:
             if not 0 <= meter_reported_counter <= 0xFFFFFFFF:
                 raise InvocationCounterError("meter returned an invalid invocation counter")
-            if persisted is not None and persisted < meter_reported_counter:
-                raise InvocationCounterError(
-                    "persisted invocation counter is lower than the meter-reported value; "
-                    "refusing to risk counter rollback"
-                )
             requested = meter_reported_counter + 1
 
+        # The persisted value protects counters generated locally, while the
+        # meter value includes counters accepted from any authorized process
+        # using this client identity. Advancing to the greater boundary is
+        # monotonic in either case and cannot reuse or roll back a counter.
         next_counter = max(requested, persisted or 0)
         if next_counter > 0xFFFFFFFF:
             raise InvocationCounterError("client invocation counter is exhausted")

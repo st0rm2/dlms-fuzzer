@@ -45,13 +45,23 @@ class CounterStateTests(unittest.TestCase):
             finally:
                 restarted.close()
 
-    def test_persisted_counter_lower_than_meter_is_refused(self):
+    def test_meter_ahead_of_persisted_state_advances_to_meter_plus_one(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "counters.json"
             lease = acquire_counter_lease(path, identity(), meter_reported_counter=10)
             lease.close()
-            with self.assertRaisesRegex(InvocationCounterError, "lower than the meter-reported"):
-                acquire_counter_lease(path, identity(), meter_reported_counter=20)
+
+            advanced = acquire_counter_lease(
+                path, identity(), meter_reported_counter=20
+            )
+            try:
+                self.assertEqual(advanced.next_counter, 21)
+                state = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    state["records"][advanced.identity_key]["next_counter"], 21
+                )
+            finally:
+                advanced.close()
 
     def test_persistence_is_atomic_json_and_backward_updates_are_refused(self):
         with tempfile.TemporaryDirectory() as directory:

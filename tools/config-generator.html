@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DLMS config generator</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font: 16px/1.45 system-ui, sans-serif;
+    }
+    body {
+      margin: 0;
+      color: #202124;
+      background: #f5f5f5;
+    }
+    main {
+      width: min(920px, calc(100% - 32px));
+      margin: 32px auto;
+    }
+    h1 { margin-bottom: 4px; font-size: 1.6rem; }
+    h2 { margin-top: 0; font-size: 1.1rem; }
+    .intro { margin-top: 0; color: #555; }
+    section {
+      margin: 16px 0;
+      padding: 20px;
+      border: 1px solid #d6d6d6;
+      border-radius: 6px;
+      background: white;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+    }
+    label { display: block; }
+    label > span { display: block; margin-bottom: 5px; font-weight: 600; }
+    input, select, textarea, button {
+      box-sizing: border-box;
+      font: inherit;
+    }
+    input[type="text"], input[type="password"], input[type="number"], select {
+      width: 100%;
+      min-height: 40px;
+      padding: 7px 9px;
+      border: 1px solid #aaa;
+      border-radius: 4px;
+      background: white;
+    }
+    input[type="checkbox"] { margin-right: 7px; }
+    .check { margin: 9px 0; }
+    .check label { display: inline; }
+    .profile-options {
+      margin: 10px 0 0 26px;
+      padding-left: 14px;
+      border-left: 3px solid #ddd;
+    }
+    .hint, .security-note { color: #666; font-size: .9rem; }
+    .security-note { margin-bottom: 0; }
+    .hidden { display: none !important; }
+    textarea {
+      width: 100%;
+      min-height: 460px;
+      padding: 12px;
+      border: 1px solid #aaa;
+      border-radius: 4px;
+      resize: vertical;
+      background: #fbfbfb;
+      font: 14px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    button {
+      padding: 9px 14px;
+      border: 1px solid #777;
+      border-radius: 4px;
+      cursor: pointer;
+      background: #fff;
+    }
+    button.primary { color: white; border-color: #1756a9; background: #1756a9; }
+    #message { min-height: 1.5em; margin: 10px 0 0; }
+    #message.error { color: #a40000; }
+    #message.ok { color: #176b2c; }
+    @media (max-width: 560px) {
+      main { width: min(100% - 20px, 920px); margin: 16px auto; }
+      section { padding: 15px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>DLMS config generator</h1>
+  <p class="intro">Choose the read-only scan features, enter the connection details, then download a YAML configuration.</p>
+
+  <form id="config-form" novalidate>
+    <section>
+      <h2>Connection</h2>
+      <div class="grid">
+        <label>
+          <span>Serial device</span>
+          <input id="device" type="text" value="/dev/ttyUSB0" required>
+        </label>
+        <label>
+          <span>Baud rate</span>
+          <select id="baudrate">
+            <option value="auto">Auto detect</option>
+            <option>9600</option>
+            <option>19200</option>
+            <option>4800</option>
+            <option>2400</option>
+            <option>1200</option>
+            <option>38400</option>
+            <option>57600</option>
+            <option>115200</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
+    <section>
+      <h2>Profiles and credentials</h2>
+
+      <div class="check">
+        <input id="public-enabled" type="checkbox" checked>
+        <label for="public-enabled"><strong>Public scan</strong> — unauthenticated discovery</label>
+      </div>
+      <div id="public-options" class="profile-options grid">
+        <label>
+          <span>Public client address</span>
+          <input id="public-client" type="number" min="1" max="16383" value="16">
+        </label>
+      </div>
+
+      <div class="check">
+        <input id="lls-enabled" type="checkbox">
+        <label for="lls-enabled"><strong>LLS scan</strong> — password-authenticated association</label>
+      </div>
+      <div id="lls-options" class="profile-options grid hidden">
+        <label>
+          <span>Role name</span>
+          <input id="lls-role" type="text" value="meter_reader">
+        </label>
+        <label>
+          <span>LLS client address</span>
+          <input id="lls-client" type="number" min="1" max="16383" value="32">
+        </label>
+        <label>
+          <span>Credential handling</span>
+          <select id="lls-source">
+            <option value="env">Environment variable</option>
+            <option value="inline">Inline password (laboratory only)</option>
+          </select>
+        </label>
+        <label>
+          <span id="lls-secret-label">Password variable</span>
+          <input id="lls-secret" type="text" value="DLMS_LLS_PASSWORD" autocomplete="off">
+        </label>
+      </div>
+
+      <div class="check">
+        <input id="hls-enabled" type="checkbox">
+        <label for="hls-enabled"><strong>HLS-GMAC Suite 0 scan</strong> — authenticated and encrypted</label>
+      </div>
+      <div id="hls-options" class="profile-options hidden">
+        <div class="grid">
+          <label>
+            <span>Role name</span>
+            <input id="hls-role" type="text" value="secure_client">
+          </label>
+          <label>
+            <span>Secure client address</span>
+            <input id="hls-client" type="number" min="1" max="16383" value="1">
+          </label>
+          <label>
+            <span>Client system title</span>
+            <input id="system-title" type="text" placeholder="16 hexadecimal characters" autocomplete="off">
+          </label>
+          <label>
+            <span>Key handling</span>
+            <select id="hls-source">
+              <option value="env">Environment variables</option>
+              <option value="inline">Inline keys (laboratory only)</option>
+              <option value="prompt">Prompt when scanning</option>
+            </select>
+          </label>
+          <label>
+            <span id="gak-label">GAK variable</span>
+            <input id="gak" type="text" value="DLMS_GAK" autocomplete="off">
+          </label>
+          <label>
+            <span id="guek-label">GUEK variable</span>
+            <input id="guek" type="text" value="DLMS_GUEK" autocomplete="off">
+          </label>
+          <label>
+            <span>Invocation counter OBIS</span>
+            <input id="counter-obis" type="text" value="0.0.43.1.0.255">
+          </label>
+        </div>
+        <p class="security-note">Environment references keep reusable credentials out of the YAML. Inline keys are accepted only for controlled laboratory use.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Scan features</h2>
+      <div class="check">
+        <input id="common-catalogue" type="checkbox" checked>
+        <label for="common-catalogue">Supplement the Association View with the common OBIS catalogue</label>
+      </div>
+      <div class="check">
+        <input id="union-test" type="checkbox" disabled>
+        <label for="union-test">Retest authenticated-only targets through the public client</label>
+      </div>
+      <div class="check">
+        <input id="auth-scan" type="checkbox">
+        <label for="auth-scan">Run the authentication-method matrix after normal scans</label>
+      </div>
+      <div id="auth-options" class="profile-options grid hidden">
+        <label>
+          <span>Credential handling</span>
+          <select id="auth-source">
+            <option value="env">Environment variable</option>
+            <option value="inline">Inline password (laboratory only)</option>
+          </select>
+        </label>
+        <label>
+          <span id="auth-secret-label">Password variable</span>
+          <input id="auth-secret" type="text" value="DLMS_PASSWORD" autocomplete="off">
+        </label>
+      </div>
+      <div class="grid">
+        <label>
+          <span>Scan scope</span>
+          <select id="scope">
+            <option value="full">Full scan</option>
+            <option value="short">First 10 objects</option>
+            <option value="get-limit">Limit attempted GETs</option>
+          </select>
+        </label>
+        <label id="get-limit-wrap" class="hidden">
+          <span>Maximum attempted GETs</span>
+          <input id="get-limit" type="number" min="1" max="1000000" value="100">
+        </label>
+        <label>
+          <span>GET batch size</span>
+          <select id="batch-size">
+            <option value="1">1 (disabled)</option>
+            <option value="2">2</option>
+            <option value="5">5</option>
+            <option value="10">10</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
+    <section>
+      <h2>Generated YAML</h2>
+      <textarea id="output" readonly spellcheck="false" aria-label="Generated YAML"></textarea>
+      <div class="actions">
+        <button class="primary" type="submit">Generate YAML</button>
+        <button id="copy" type="button">Copy</button>
+        <button id="download" type="button">Download config.yaml</button>
+      </div>
+      <p id="message" role="status" aria-live="polite"></p>
+    </section>
+  </form>
+</main>
+
+<script>
+  "use strict";
+
+  const byId = (id) => document.getElementById(id);
+  const quoted = (value) => JSON.stringify(String(value));
+  const checked = (id) => byId(id).checked;
+  const value = (id) => byId(id).value.trim();
+
+  function integer(id, label, minimum, maximum) {
+    const raw = value(id);
+    const parsed = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+      throw new Error(`${label} must be an integer from ${minimum} to ${maximum}.`);
+    }
+    return parsed;
+  }
+
+  function role(id, label) {
+    const result = value(id);
+    if (!result) throw new Error(`${label} is required.`);
+    return result;
+  }
+
+  function environmentName(secret, label) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(secret)) {
+      throw new Error(`${label} must be a valid environment-variable name.`);
+    }
+    return secret;
+  }
+
+  function inlinePassword(secret, label) {
+    const length = new TextEncoder().encode(secret).length;
+    if (length < 1 || length > 64) {
+      throw new Error(`${label} must encode to between 1 and 64 bytes.`);
+    }
+    if (/^hex:/i.test(secret) && (!/^hex:(?:[0-9a-fA-F]{2})+$/.test(secret))) {
+      throw new Error(`${label} has an invalid hex: value.`);
+    }
+    return secret;
+  }
+
+  function hex(valueToCheck, characters, label) {
+    const withoutPrefix = valueToCheck.replace(/^hex:/i, "");
+    const pattern = new RegExp(`^[0-9a-fA-F]{${characters}}$`);
+    if (!pattern.test(withoutPrefix)) {
+      throw new Error(`${label} must contain exactly ${characters} hexadecimal characters.`);
+    }
+    return `hex:${withoutPrefix.toUpperCase()}`;
+  }
+
+  function passwordSource(sourceId, secretId, label) {
+    const source = value(sourceId);
+    const secret = value(secretId);
+    return source === "env"
+      ? `env: ${quoted(environmentName(secret, label + " variable"))}`
+      : `inline: ${quoted(inlinePassword(secret, label))}`;
+  }
+
+  function buildYaml() {
+    const profiles = [];
+    const roles = new Set();
+
+    if (checked("public-enabled")) {
+      roles.add("public");
+      profiles.push([
+        "  - name: public",
+        "    role: public",
+        `    client_address: ${integer("public-client", "Public client address", 1, 16383)}`
+      ].join("\n"));
+    }
+
+    if (checked("lls-enabled")) {
+      const roleName = role("lls-role", "LLS role name");
+      if (roles.has(roleName)) throw new Error(`Role names must be unique: ${roleName}.`);
+      roles.add(roleName);
+      profiles.push([
+        "  - name: lls",
+        `    role: ${quoted(roleName)}`,
+        `    client_address: ${integer("lls-client", "LLS client address", 1, 16383)}`,
+        "    authentication:",
+        "      mechanism: low",
+        `      password: {${passwordSource("lls-source", "lls-secret", "LLS password")}}`
+      ].join("\n"));
+    }
+
+    if (checked("hls-enabled")) {
+      const roleName = role("hls-role", "HLS role name");
+      if (roles.has(roleName)) throw new Error(`Role names must be unique: ${roleName}.`);
+      roles.add(roleName);
+      const source = value("hls-source");
+      let gak;
+      let guek;
+      if (source === "env") {
+        gak = `{env: ${quoted(environmentName(value("gak"), "GAK variable"))}}`;
+        guek = `{env: ${quoted(environmentName(value("guek"), "GUEK variable"))}}`;
+      } else if (source === "inline") {
+        gak = `{inline: ${quoted(hex(value("gak"), 32, "GAK"))}}`;
+        guek = `{inline: ${quoted(hex(value("guek"), 32, "GUEK"))}}`;
+      } else {
+        gak = "{prompt: true}";
+        guek = "{prompt: true}";
+      }
+      const obis = value("counter-obis");
+      if (!/^\d+\.\d+\.\d+\.\d+\.\d+\.\d+$/.test(obis)) {
+        throw new Error("Invocation counter OBIS must be a six-part logical name.");
+      }
+      profiles.push([
+        "  - name: hls_gmac_suite0",
+        `    role: ${quoted(roleName)}`,
+        `    client_address: ${integer("hls-client", "Secure client address", 1, 16383)}`,
+        `    client_system_title: ${quoted(hex(value("system-title"), 16, "Client system title"))}`,
+        "    secrets:",
+        `      gak: ${gak}`,
+        `      guek: ${guek}`,
+        "    invocation_counter:",
+        `      logical_name: ${quoted(obis)}`
+      ].join("\n"));
+    }
+
+    if (!profiles.length) throw new Error("Select at least one profile.");
+
+    const lines = [
+      "version: 1",
+      "",
+      "transport:",
+      "  type: serial_hdlc",
+      `  device: ${quoted(value("device"))}`,
+      `  baudrate: ${value("baudrate") === "auto" ? "auto" : Number(value("baudrate"))}`,
+      "",
+      "scan:",
+      "  mode: get",
+      "  association_view_first: true",
+      `  common_catalogue: ${checked("common-catalogue")}`,
+      `  union_profile_test: ${checked("union-test")}`,
+      `  batch_size: ${integer("batch-size", "GET batch size", 1, 10)}`
+    ];
+
+    if (!value("device")) throw new Error("Serial device is required.");
+    const scope = value("scope");
+    if (scope === "short") lines.push("  object_limit: 10");
+    if (scope === "get-limit") {
+      lines.push(`  get_limit: ${integer("get-limit", "GET limit", 1, 1000000)}`);
+    }
+
+    lines.push("", "authentication_scan:");
+    if (checked("auth-scan")) {
+      lines.push(
+        "  enabled: true",
+        `  password: {${passwordSource("auth-source", "auth-secret", "Authentication password")}}`
+      );
+    } else {
+      lines.push("  enabled: false");
+    }
+
+    lines.push("", "profiles:", profiles.join("\n"), "", "output:", "  directory: ./runs", "  redact_secrets: true", "");
+    return lines.join("\n");
+  }
+
+  function showMessage(text, type = "") {
+    const message = byId("message");
+    message.textContent = text;
+    message.className = type;
+  }
+
+  function generate(event) {
+    if (event) event.preventDefault();
+    try {
+      byId("output").value = buildYaml();
+      showMessage("Configuration generated.", "ok");
+      return true;
+    } catch (error) {
+      showMessage(error.message, "error");
+      return false;
+    }
+  }
+
+  function toggleOptions() {
+    byId("public-options").classList.toggle("hidden", !checked("public-enabled"));
+    byId("lls-options").classList.toggle("hidden", !checked("lls-enabled"));
+    byId("hls-options").classList.toggle("hidden", !checked("hls-enabled"));
+    byId("auth-options").classList.toggle("hidden", !checked("auth-scan"));
+    byId("get-limit-wrap").classList.toggle("hidden", value("scope") !== "get-limit");
+    byId("union-test").disabled = !checked("hls-enabled");
+    if (!checked("hls-enabled")) byId("union-test").checked = false;
+  }
+
+  function updateCredentialLabel(prefix, environmentDefault) {
+    const inline = value(`${prefix}-source`) === "inline";
+    byId(`${prefix}-secret-label`).textContent = inline ? "Password" : "Password variable";
+    byId(`${prefix}-secret`).type = inline ? "password" : "text";
+    byId(`${prefix}-secret`).value = inline ? "" : environmentDefault;
+  }
+
+  function updateKeyLabels() {
+    const source = value("hls-source");
+    const hidden = source === "prompt";
+    byId("gak").parentElement.classList.toggle("hidden", hidden);
+    byId("guek").parentElement.classList.toggle("hidden", hidden);
+    byId("gak-label").textContent = source === "inline" ? "GAK (32 hex characters)" : "GAK variable";
+    byId("guek-label").textContent = source === "inline" ? "GUEK (32 hex characters)" : "GUEK variable";
+    byId("gak").type = source === "inline" ? "password" : "text";
+    byId("guek").type = source === "inline" ? "password" : "text";
+    if (source === "env") {
+      byId("gak").value = "DLMS_GAK";
+      byId("guek").value = "DLMS_GUEK";
+    } else if (source === "inline") {
+      byId("gak").value = "";
+      byId("guek").value = "";
+    }
+  }
+
+  ["public-enabled", "lls-enabled", "hls-enabled", "auth-scan", "scope"].forEach((id) => {
+    byId(id).addEventListener("change", toggleOptions);
+  });
+  byId("lls-source").addEventListener("change", () => {
+    updateCredentialLabel("lls", "DLMS_LLS_PASSWORD");
+  });
+  byId("auth-source").addEventListener("change", () => {
+    updateCredentialLabel("auth", "DLMS_PASSWORD");
+  });
+  byId("hls-source").addEventListener("change", updateKeyLabels);
+  byId("config-form").addEventListener("submit", generate);
+
+  byId("copy").addEventListener("click", async () => {
+    if (!generate()) return;
+    try {
+      await navigator.clipboard.writeText(byId("output").value);
+      showMessage("Configuration copied.", "ok");
+    } catch (_) {
+      byId("output").select();
+      showMessage("Select Copy from your browser to copy the highlighted YAML.");
+    }
+  });
+
+  byId("download").addEventListener("click", () => {
+    if (!generate()) return;
+    const blob = new Blob([byId("output").value], {type: "application/yaml;charset=utf-8"});
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "config.yaml";
+    link.click();
+    URL.revokeObjectURL(link.href);
+    showMessage("Configuration downloaded.", "ok");
+  });
+
+  toggleOptions();
+  generate();
+</script>
+</body>
+</html>

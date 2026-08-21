@@ -10,6 +10,12 @@ The LLS and secure profiles use Gurux DLMS for authentication; the secure profil
 
 Python 3.11 or newer is required.
 
+To create a configuration with a small standalone form, open
+[`tools/config-generator.html`](tools/config-generator.html) in a browser. It
+runs entirely in the browser, has no dependencies, and can copy or download a
+YAML file. Environment-variable credential references are selected by default;
+inline credentials are intended only for controlled laboratory use.
+
 ```shell
 python -m venv .venv
 . .venv/bin/activate
@@ -314,7 +320,7 @@ Client invocation-counter reuse with the same key and system title is cryptograp
 
 State is keyed by the public meter identity, server address, authenticated client address, and client system title. The file is process-locked for the complete secure session. Updates use a same-directory temporary file, `fsync`, and atomic replacement. Gurux increments counters while generating protected APDUs; `dlms-enum` persists the resulting next unused counter before calling the serial-media send operation. A timeout, partial send, rejected APDU, retry, failed HLS exchange, protected release, or process crash after persistence therefore consumes rather than reuses counters.
 
-On restart, the tool uses the greater safe value and never rolls state backward. If persisted state is lower than the meter-reported counter, the run is refused instead of silently repairing ambiguous state. Do not delete or copy an old state file back into place.
+On restart, the tool uses the greater safe boundary and never rolls state backward. If persisted state is lower than the meter-reported counter, the tool advances to one greater than the meter value. This safely reconciles counters accepted from another authorized process using the same client identity. Do not delete or copy an old state file back into place.
 
 If the public counter read fails, the default is a hard failure. An expert who has independently established a safe next value can use the explicit advanced override:
 
@@ -377,7 +383,7 @@ Gurux internally labels Suite 0 security-control bit `0x20` as “Encryption is 
 
 ## Troubleshooting
 
-- **Persisted counter below meter value:** verify that the configured client system title, authenticated SAP, meter, and state file belong together. Restore a known newer state only if its provenance is certain; otherwise reprovision keys/system title according to the meter vendor's process.
+- **Persisted counter below meter value:** the tool advances to `meter + 1` and persists that value before transmission. If this happens unexpectedly, verify that the configured counter object, client system title, authenticated SAP, meter, and state file belong together; another authorized process may be using the same client identity.
 - **Public counter read fails:** confirm public client SAP 16, invocation-counter OBIS/class/attribute, and public access rights. Use `unsafe_override` only with a separately verified safe value.
 - **HLS rejected:** check the authenticated client SAP, exact client system title, GAK, GUEK, and the meter's assigned Security Suite. HLS completion is mandatory; no GET is attempted after failure.
 - **LLS rejected:** check that the configured client SAP selects the intended LLS Association LN and that the environment or inline password has the exact expected byte representation. LLS passwords are case-sensitive; `hex:` values are decoded as bytes rather than sent as ASCII.
