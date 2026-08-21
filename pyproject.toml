@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 dlms-enum = "dlms_enum.cli:main"
+dlms-autodiscover = "dlms_enum.autodiscover:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

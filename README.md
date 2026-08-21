@@ -24,6 +24,62 @@ python -m dlms_enum validate-config meter-public.yaml
 python -m dlms_enum scan --config meter-public.yaml
 ```
 
+### Standalone public connection discovery
+
+If the serial-HDLC connection parameters are unknown, run the separate
+read-only discovery tool with only the device path:
+
+```shell
+dlms-autodiscover /dev/ttyUSB0
+```
+
+It can also be started directly from the source tree after installing the
+project:
+
+```shell
+python scripts/dlms_autodiscover.py /dev/ttyUSB0
+```
+
+The default sweep tries common baud rates using 8N1, public client SAP 16,
+one-byte server addresses and two-byte server addresses with physical values
+0 through 31. It prioritizes common server forms, including logical address 1
+with physical address 17 (combined server address 145). If an HDLC endpoint
+answers but rejects SAP 16, the tool tries a bounded list of alternative public
+client SAPs on that proven endpoint. Use `--deep` to expand physical addresses
+through 127, or use `--clients`, `--logical-addresses`, `--physical-range`,
+`--baud-rates`, and the serial-format options to override the bounded defaults.
+Common endpoints are tried first; exhausting the complete default or deep
+scope can take several minutes because every silent address must time out.
+
+Each run writes `discovery.json`, complete `traffic.jsonl` evidence, and—after
+a successful association—`suggested-public-meter.yaml` under
+`./discovery-runs/<timestamp>/`. The report includes the confirmed baud rate,
+serial format, client and server addresses, address encoding, negotiated DLMS
+version, Association LN version, conformance, PDU and HDLC limits, logical
+device name, public-readable invocation-counter candidates, and server/client
+system titles when the public AARE or a readable Security Setup object exposes
+them.
+
+System-title retrieval first checks the public AARE and Association
+View-advertised Security Setup objects. If no server title is found, it also
+sends bounded public GETs for attribute 5 of common class-64 logical names
+`0.0.43.0.0.255` through `0.0.43.0.15.255`. This can find a Security Setup
+object that is addressable but omitted from the public Association View.
+Explicit access denials are retained as negative evidence; two consecutive
+timeouts stop the direct sweep. Use `--security-setup-range MIN-MAX` to adjust
+the instances or `--no-direct-system-title-probes` to disable these extra GETs.
+Any returned value must be exactly eight octets and is reported as a verified
+public read—the tool does not manufacture or guess a title from the meter
+serial number.
+
+Discovery uses logical-name referencing over direct serial HDLC and transmits
+only SNRM, unauthenticated AARQ, public GET, RLRQ, and DISC. It does not try
+credentials, protected associations, SET, or arbitrary ACTION requests. A
+secure client's SAP, system title, keys, security suite and invocation-counter
+mapping are provisioned role data and cannot in general be inferred from the
+public profile. IEC 62056-21 optical sign-on, WRAPPER/TCP, PLC and HDLC-over-IP
+are outside this script's scope.
+
 At startup, interactive runs list all configured roles and select all of them by default. A mandatory public preflight then discovers the working serial interface, baud rate, server address, public Association View and meter identity, reports negotiated capabilities, and validates readable invocation-counter candidates before the final READ-only plan is confirmed. The same role and scope choices can be supplied without prompts:
 
 ```shell
