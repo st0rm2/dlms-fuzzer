@@ -180,8 +180,56 @@ def render_summary_report(
         "",
     ]
 
+    authentication_matrix = report.get("authentication_matrix", {})
+    matrix_roles = authentication_matrix.get("roles", [])
+    if matrix_roles:
+        lines.extend(
+            [
+                "## Authentication result matrix",
+                "",
+                "| Mechanism | "
+                + " | ".join(
+                    "{} (client {})".format(
+                        _markdown(role.get("role", "unknown")),
+                        _markdown(role.get("client_address", "—")),
+                    )
+                    for role in matrix_roles
+                )
+                + " |",
+                "|---|" + "---|" * len(matrix_roles),
+            ]
+        )
+        for row in authentication_matrix.get("rows", []):
+            lines.append(
+                "| {} | {} |".format(
+                    _markdown(
+                        row.get("display_name", row.get("mechanism", "unknown"))
+                    ),
+                    " | ".join(
+                        _markdown(
+                            row.get("roles", {})
+                            .get(role.get("role"), {})
+                            .get("status", "—")
+                        )
+                        for role in matrix_roles
+                    ),
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "`authenticated` means the complete association succeeded; for HLS "
+                "this includes the challenge-response validation.",
+                "",
+            ]
+        )
+
     for profile in profiles:
         association = profile.get("association", {})
+        authentication_enumeration = profile.get("authentication_enumeration", {})
+        observed_authentication = ", ".join(
+            authentication_enumeration.get("observed_methods", [])
+        ) or "none observed"
         summary = profile.get("summary", {})
         scan_scope = profile.get("scan_scope", {})
         list_scope = scan_scope.get("get_with_list", {})
@@ -194,6 +242,48 @@ def render_summary_report(
                 f"{list_scope.get('fallback_batches', 0)} fallbacks"
             )
         profile_name = str(profile.get("name", "unknown"))
+        authentication_scan = profile.get("authentication_scan")
+        if isinstance(authentication_scan, dict):
+            if matrix_roles:
+                continue
+            results = authentication_scan.get("results", [])
+            lines.extend(
+                [
+                    f"## Profile: {_markdown(profile_name)}",
+                    "",
+                    f"Client SAP: {_markdown(association.get('client_address', '—'))}",
+                    "",
+                    "### Authentication scan",
+                    "",
+                    "| Mechanism | Attempted | AARQ accepted | Fully authenticated | Security | Status |",
+                    "|---|---:|---:|---:|---|---|",
+                ]
+            )
+            for item in results:
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} |".format(
+                        _markdown(item.get("mechanism", "unknown")),
+                        _markdown(item.get("attempted", False)),
+                        _markdown(item.get("aarq_accepted", "—")),
+                        _markdown(item.get("fully_authenticated", "—")),
+                        _markdown(item.get("security_policy", "—")),
+                        _markdown(item.get("status", "unknown")),
+                    )
+                )
+            lines.extend(
+                [
+                    "",
+                    "Accepted mechanisms: "
+                    + _markdown(
+                        ", ".join(
+                            authentication_scan.get("accepted_mechanisms", [])
+                        )
+                        or "none"
+                    ),
+                    "",
+                ]
+            )
+            continue
         lines.extend(
             [
                 f"## Profile: {_markdown(profile_name)}",
@@ -202,6 +292,8 @@ def render_summary_report(
                 "|---|---|",
                 f"| Client address | {_markdown(association.get('client_address', '—'))} |",
                 f"| Authentication | {_markdown(association.get('authentication', 'none'))} |",
+                f"| Authentication methods observed | {_markdown(observed_authentication)} |",
+                f"| Advertised Association LNs | {_markdown(len(authentication_enumeration.get('advertised_associations', [])))} |",
                 f"| Security | {_markdown(association.get('security', 'none'))} |",
                 f"| Security suite | {_markdown(association.get('security_suite', '—'))} |",
                 f"| HLS validated | {_markdown(association.get('hls_validated', '—'))} |",
@@ -238,6 +330,37 @@ def render_summary_report(
                 ]
             )
         lines.append("")
+
+        advertised_associations = authentication_enumeration.get(
+            "advertised_associations", []
+        )
+        if advertised_associations:
+            lines.extend(
+                [
+                    "### Authentication enumeration",
+                    "",
+                    "| Association LN | Client SAP | Server SAP | Mechanism ID | Mechanism | Evidence |",
+                    "|---|---:|---:|---:|---|---|",
+                ]
+            )
+            for item in advertised_associations:
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} |".format(
+                        _markdown(item.get("logical_name", "—")),
+                        _markdown(item.get("client_sap", "—")),
+                        _markdown(item.get("server_sap", "—")),
+                        _markdown(item.get("mechanism_id", "—")),
+                        _markdown(item.get("mechanism", "unknown")),
+                        _markdown(item.get("evidence", "—")),
+                    )
+                )
+            lines.extend(
+                [
+                    "",
+                    _markdown(authentication_enumeration.get("limitation", "")),
+                    "",
+                ]
+            )
 
         if isinstance(reuse_test, dict) and reuse_test.get("enabled"):
             lines.extend(["### Invocation-counter reuse test", ""])
@@ -593,6 +716,23 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
         f"Errors: {len(report.get('errors', []))}",
     ]
     association = profile.get("association", {})
+    authentication = profile.get("authentication_enumeration", {})
+    authentication_scan = profile.get("authentication_scan", {})
+    if authentication_scan:
+        accepted = ", ".join(
+            authentication_scan.get("accepted_mechanisms", [])
+        ) or "none"
+        lines.insert(2, f"Authenticated mechanisms: {accepted}")
+        lines.insert(
+            3,
+            f"Mechanisms attempted: {summary.get('mechanisms_attempted', 0)}",
+        )
+    if authentication:
+        lines.insert(
+            2,
+            "Authentication methods observed: "
+            + (", ".join(authentication.get("observed_methods", [])) or "none"),
+        )
     if profile.get("type", profile.get("name")) == "hls_gmac_suite0":
         lines.insert(2, f"HLS-GMAC validated: {association.get('hls_validated', False)}")
         lines.insert(3, f"Security: Suite 0 / {association.get('security', 'not established')}")

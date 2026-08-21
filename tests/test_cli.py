@@ -104,6 +104,130 @@ class CliWorkflowTests(unittest.TestCase):
         self.assertEqual(runtime.profile.server_physical_address, 3)
         self.assertEqual(runtime.profile.server_address_size, 2)
 
+    def test_authentication_matrix_runs_after_all_normal_role_scans(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "authentication_scan": {
+                    "enabled": True,
+                    "password": {"inline": "00000000"},
+                },
+                "profiles": [
+                    {"name": "public", "role": "public", "client_address": 16},
+                    {
+                        "name": "lls",
+                        "role": "reader",
+                        "client_address": 32,
+                        "authentication": {
+                            "mechanism": "low",
+                            "password": {"inline": "00000000"},
+                        },
+                    },
+                ],
+            }
+        )
+        preflight = PublicPreflight(
+            transport={
+                "device": "/dev/null",
+                "selected_baudrate": 9600,
+                "selected_server_address": 1,
+                "selected_server_logical_address": 0,
+                "selected_server_physical_address": 1,
+                "server_address_size": 1,
+                "server_addressing_type": "1-byte addressing",
+            },
+            association={"negotiated_conformance": ["get"]},
+            meter_identity="METER-1",
+            association_view_objects=1,
+            counter_candidates=(),
+        )
+        args = argparse.Namespace(
+            config=Path("meter.yaml"),
+            roles=None,
+            short=False,
+            full=True,
+            get_limit=None,
+        )
+        calls = []
+        written = []
+
+        def fake_scan(runtime_config, *_args, **_kwargs):
+            calls.append(("normal", runtime_config.profile.role))
+            return {
+                "run": {"id": runtime_config.profile.role, "status": "completed"},
+                "transport": {},
+                "profiles": [],
+                "errors": [],
+            }
+
+        def fake_auth(runtime_config, *_args, **_kwargs):
+            role = runtime_config.profile.role
+            calls.append(("authentication", role))
+            results = [
+                {
+                    "mechanism": mechanism,
+                    "attempted": mechanism != "high_ecdsa",
+                    "status": "authenticated" if mechanism == "none" else "rejected",
+                    "fully_authenticated": mechanism == "none",
+                }
+                for mechanism in (
+                    "none", "low", "high", "high_md5", "high_sha1",
+                    "high_gmac", "high_sha256", "high_ecdsa",
+                )
+            ]
+            return {
+                "name": runtime_config.profile.name,
+                "role": role,
+                "client_address": runtime_config.profile.client_address,
+                "authentication_scan": {
+                    "results": results,
+                    "accepted_mechanisms": ["none"],
+                },
+                "errors": [],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_directory = Path(directory) / "run"
+            run_directory.mkdir()
+            with (
+                patch("dlms_enum.cli.load_config", return_value=config),
+                patch("dlms_enum.cli._run_directory", return_value=run_directory),
+                patch("dlms_enum.cli.TrafficLogger", NullLogger),
+                patch("dlms_enum.cli.run_public_preflight", return_value=preflight),
+                patch("dlms_enum.cli.scan", side_effect=fake_scan),
+                patch("dlms_enum.cli.run_authentication_scan", side_effect=fake_auth),
+                patch(
+                    "dlms_enum.cli.write_report",
+                    side_effect=lambda report, path, *_args: written.append((path.name, report)),
+                ),
+            ):
+                status = _scan(
+                    args,
+                    Console(file=io.StringIO(), color_system=None, width=160),
+                )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            calls,
+            [
+                ("normal", "public"),
+                ("normal", "reader"),
+                ("authentication", "public"),
+                ("authentication", "reader"),
+            ],
+        )
+        authentication_report = next(
+            report for name, report in written if name == "authentication-report.json"
+        )
+        self.assertEqual(
+            [item["role"] for item in authentication_report["authentication_matrix"]["roles"]],
+            ["public", "reader"],
+        )
+        self.assertEqual(
+            set(authentication_report["authentication_matrix"]["rows"][0]["roles"]),
+            {"public", "reader"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

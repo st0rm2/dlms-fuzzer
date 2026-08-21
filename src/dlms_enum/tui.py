@@ -108,6 +108,15 @@ class ScanUI:
         if phase == "invocation_counter_recovery_wait":
             self.console.print(message)
             return
+        if phase == "authentication_scan_attempt":
+            self.close()
+            self.console.print(f"[cyan]→[/cyan] {message}")
+            return
+        if phase == "authentication_scan_result":
+            status = str(event.get("status", "unknown"))
+            style = "green" if status == "authenticated" else "yellow"
+            self.console.print(f"[{style}]← {message}[/{style}]")
+            return
         if phase == "baud_detection":
             self._update(
                 stage="Discovery",
@@ -118,6 +127,7 @@ class ScanUI:
             "server_address_detection",
             "server_address_detected",
             "invocation_counter_bootstrap",
+            "lls_association",
             "secure_link_setup",
             "secure_association",
             "hls_authentication",
@@ -135,6 +145,7 @@ class ScanUI:
                 "server_address_detection": "Discovery",
                 "server_address_detected": "Discovery",
                 "invocation_counter_bootstrap": "Bootstrap",
+                "lls_association": "LLS",
                 "secure_link_setup": "Secure link",
                 "secure_association": "HLS-GMAC",
                 "hls_authentication": "HLS-GMAC",
@@ -278,6 +289,35 @@ def show_public_preflight(
     console.print(f"Public objects: {preflight.association_view_objects}")
     conformance = association.get("negotiated_conformance", [])
     console.print("Conformance: " + (", ".join(conformance) or "not reported"))
+
+
+def show_authentication_matrix(
+    report: dict[str, Any], console: Console | None = None
+) -> None:
+    """Render one role-by-mechanism result matrix after all probes finish."""
+
+    console = console or Console()
+    matrix = report.get("authentication_matrix", {})
+    roles = matrix.get("roles", [])
+    table = Table(title="Authentication result matrix")
+    table.add_column("Mechanism")
+    for role in roles:
+        table.add_column(
+            f"{role['role']}\nclient {role['client_address']}",
+            justify="center",
+        )
+    for row in matrix.get("rows", []):
+        display_name = row.get("display_name") or str(
+            row.get("mechanism", "unknown")
+        ).upper()
+        table.add_row(
+            str(display_name),
+            *[
+                str(row.get("roles", {}).get(role["role"], {}).get("status", "—"))
+                for role in roles
+            ],
+        )
+    console.print(table)
 
 
 def _counter_table(candidates: tuple[CounterCandidate, ...]) -> Table:
@@ -481,18 +521,27 @@ def interactive_config(console: Console | None = None) -> AppConfig:
         default=False,
         console=console,
     )
+    authentication_scan = Confirm.ask(
+        "Run an authentication-method matrix after the normal scan",
+        default=False,
+        console=console,
+    )
     profile_name = Prompt.ask(
-        "Profile", choices=("public", "hls_gmac_suite0"), default="public", console=console
+        "Profile",
+        choices=("public", "lls", "hls_gmac_suite0"),
+        default="public",
+        console=console,
     )
     secure = profile_name == "hls_gmac_suite0"
+    lls = profile_name == "lls"
     union_profile_test = secure and Confirm.ask(
         "Test authenticated-only GET targets through the public client",
         default=False,
         console=console,
     )
     client_address = IntPrompt.ask(
-        "Authenticated client address" if secure else "Public client address",
-        default=1 if secure else 16,
+        "Authenticated client address" if secure or lls else "Public client address",
+        default=1 if secure else 32 if lls else 16,
         console=console,
     )
     logical_address = IntPrompt.ask("Server logical address", default=0 if secure else 1, console=console)
@@ -522,6 +571,17 @@ def interactive_config(console: Console | None = None) -> AppConfig:
                 },
             }
         )
+    elif lls:
+        profile["authentication"] = {
+            "mechanism": "low",
+            "password": {
+                "env": Prompt.ask(
+                    "Environment variable containing the LLS password",
+                    default="DLMS_LLS_PASSWORD",
+                    console=console,
+                )
+            },
+        }
     config = parse_config(
         {
             "transport": {"device": device, "baudrate": baudrate},
@@ -529,6 +589,20 @@ def interactive_config(console: Console | None = None) -> AppConfig:
                 "object_limit": 10 if short_test else None,
                 "union_profile_test": union_profile_test,
             },
+            "authentication_scan": (
+                {
+                    "enabled": True,
+                    "password": {
+                        "env": Prompt.ask(
+                            "Environment variable containing the authentication password",
+                            default="DLMS_PASSWORD",
+                            console=console,
+                        )
+                    },
+                }
+                if authentication_scan
+                else {"enabled": False}
+            ),
             "profiles": [profile],
         }
     )

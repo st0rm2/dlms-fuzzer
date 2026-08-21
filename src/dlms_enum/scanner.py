@@ -1,4 +1,4 @@
-"""Public and HLS-GMAC association discovery and GET-only scan orchestration."""
+"""DLMS association, authentication, and GET-only scan orchestration."""
 
 from __future__ import annotations
 
@@ -12,12 +12,39 @@ from typing import Any
 
 from . import __version__
 from .catalogues import COMMON_OBIS
-from .config import AppConfig, SERVER_ADDRESSING_TYPES, SecureProfile, resolve_secure_keys
+from .config import (
+    AppConfig,
+    LlsProfile,
+    SERVER_ADDRESSING_TYPES,
+    SecureProfile,
+    resolve_lls_password,
+    resolve_secure_keys,
+)
 from .counter_state import acquire_counter_lease, counter_identity
 from .result_model import Outcome, classify_exception, enum_name, error_record, utc_now
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 CONSECUTIVE_TIMEOUTS_BEFORE_RETRY_SUPPRESSION = 2
+AUTHENTICATION_MECHANISMS = {
+    0: "none",
+    1: "low",
+    2: "high",
+    3: "high_md5",
+    4: "high_sha1",
+    5: "high_gmac",
+    6: "high_sha256",
+    7: "high_ecdsa",
+}
+AUTHENTICATION_DISPLAY_NAMES = {
+    "none": "NONE (no authentication)",
+    "low": "LLS / LOW",
+    "high": "HLS / HIGH",
+    "high_md5": "HLS-MD5",
+    "high_sha1": "HLS-SHA1",
+    "high_gmac": "HLS-GMAC (Suite 0, authenticated + encrypted)",
+    "high_sha256": "HLS-SHA256",
+    "high_ecdsa": "HLS-ECDSA",
+}
 
 
 class _GetRetryPolicy:
@@ -74,6 +101,113 @@ def _set_session_timeout(session: Any, timeout_ms: int) -> bool:
         return False
     setter(timeout_ms)
     return True
+
+
+def _successful_attribute(
+    object_record: dict[str, Any], attribute_id: int
+) -> dict[str, Any] | None:
+    for attribute in object_record.get("attributes", []):
+        if (
+            attribute.get("attribute_id") == attribute_id
+            and attribute.get("outcome") == Outcome.SUCCESS.value
+        ):
+            return attribute
+    return None
+
+
+def _authentication_mechanism_id(attribute: dict[str, Any] | None) -> int | None:
+    if attribute is None:
+        return None
+    decoded = attribute.get("decoded", {})
+    raw = decoded.get("raw_value", {})
+    raw_hex = raw.get("hex") if isinstance(raw, dict) else None
+    if isinstance(raw_hex, str):
+        try:
+            value = bytes.fromhex(raw_hex)
+        except ValueError:
+            value = b""
+        # COSEM authentication-mechanism-name OID:
+        # 2.16.756.5.8.2.<mechanism-id>
+        if len(value) == 7 and value[:6] == bytes.fromhex("608574050802"):
+            return int(value[-1])
+    display = decoded.get("value", {})
+    if isinstance(display, dict):
+        display = display.get("display")
+    if isinstance(display, str):
+        try:
+            parts = [int(item) for item in display.split()]
+        except ValueError:
+            return None
+        if len(parts) == 7 and parts[:6] == [0, 0, 0, 5, 8, 2]:
+            return parts[-1]
+    return None
+
+
+def _associated_partners(
+    attribute: dict[str, Any] | None,
+) -> tuple[int | None, int | None]:
+    if attribute is None:
+        return None, None
+    value = attribute.get("decoded", {}).get("value")
+    if (
+        isinstance(value, list)
+        and len(value) >= 2
+        and all(isinstance(item, int) and not isinstance(item, bool) for item in value[:2])
+    ):
+        return int(value[0]), int(value[1])
+    return None, None
+
+
+def _authentication_enumeration(
+    object_records: list[dict[str, Any]], association: dict[str, Any]
+) -> dict[str, Any]:
+    """Summarize verified and Association-LN-advertised authentication methods."""
+
+    advertised: list[dict[str, Any]] = []
+    observed: set[str] = set()
+    for obj in object_records:
+        if int(obj.get("class_id", -1)) != 15:
+            continue
+        mechanism_attribute = _successful_attribute(obj, 6)
+        mechanism_id = _authentication_mechanism_id(mechanism_attribute)
+        if mechanism_id is None:
+            continue
+        mechanism = AUTHENTICATION_MECHANISMS.get(
+            mechanism_id, f"unknown_{mechanism_id}"
+        )
+        client_sap, server_sap = _associated_partners(
+            _successful_attribute(obj, 3)
+        )
+        advertised.append(
+            {
+                "logical_name": obj.get("logical_name"),
+                "client_sap": client_sap,
+                "server_sap": server_sap,
+                "mechanism_id": mechanism_id,
+                "mechanism": mechanism,
+                "evidence": "association_ln_attribute_6",
+            }
+        )
+        observed.add(mechanism)
+
+    active_mechanism = str(association.get("authentication", "unknown"))
+    if active_mechanism != "unknown":
+        observed.add(active_mechanism)
+    return {
+        "active_verification": {
+            "mechanism": active_mechanism,
+            "client_sap": association.get("client_address"),
+            "association_established": True,
+            "hls_validated": association.get("hls_validated"),
+        },
+        "advertised_associations": advertised,
+        "observed_methods": sorted(observed),
+        "complete": False,
+        "limitation": (
+            "Only the active association and readable Association LN objects are "
+            "reported; hidden client SAPs and mechanisms are not guessed."
+        ),
+    }
 
 
 def _timeout_policy_scope(
@@ -872,6 +1006,301 @@ def _server_address_candidates(config: AppConfig) -> tuple[dict[str, Any], ...]:
     return tuple(unique)
 
 
+def _authentication_probe_record(
+    mechanism: str,
+    *,
+    session: Any | None = None,
+    association: dict[str, Any] | None = None,
+    error: BaseException | None = None,
+    supported: bool = True,
+    attempted: bool | None = None,
+    security_policy: str = "none",
+) -> dict[str, Any]:
+    attempted = supported if attempted is None else attempted
+    aarq_accepted = bool(
+        association is not None or getattr(session, "aarq_accepted", False)
+    )
+    if not supported:
+        status = "unsupported"
+    elif not attempted:
+        status = "prerequisite_failed"
+    elif association is not None:
+        status = "authenticated"
+    elif aarq_accepted:
+        status = "hls_validation_failed"
+    else:
+        status = "rejected"
+    return {
+        "mechanism": mechanism,
+        "supported_by_tool": supported,
+        "attempted": attempted,
+        "status": status,
+        "aarq_accepted": aarq_accepted if attempted else None,
+        "fully_authenticated": association is not None if attempted else None,
+        "security_policy": security_policy,
+        "outcome": (
+            Outcome.SUCCESS.value
+            if association is not None
+            else Outcome.NOT_TESTED.value
+            if not attempted
+            else classify_exception(error or RuntimeError(status)).value
+        ),
+        "association": association,
+        "error": (
+            f"{type(error).__name__}: {error}" if error is not None else None
+        ),
+    }
+
+
+def run_authentication_scan(
+    config: AppConfig,
+    traffic: Any,
+    *,
+    transport: dict[str, Any],
+    meter_identity: str | None,
+    counter_candidates: tuple[Any, ...] | list[Any],
+    progress: ProgressCallback,
+) -> dict[str, Any]:
+    """Probe one configured role after its ordinary scan has completed."""
+
+    from gurux_dlms.enums import Authentication
+
+    from .gurux_adapter import (
+        GuruxAuthenticationProbeSession,
+        GuruxSecureSession,
+        GuruxSession,
+    )
+
+    profile = config.profile
+    if not config.authentication_scan.enabled:
+        raise ValueError("authentication scanning is not enabled")
+    password = resolve_lls_password(config.authentication_scan)
+
+    endpoint = {
+        "server_logical_address": int(
+            transport["selected_server_logical_address"]
+        ),
+        "server_physical_address": int(
+            transport["selected_server_physical_address"]
+        ),
+        "server_address_size": int(transport["server_address_size"]),
+    }
+    baudrate = int(transport["selected_baudrate"])
+    report: dict[str, Any] = {"errors": []}
+    meter_counter: int | None = None
+    counter_error: BaseException | None = None
+    if isinstance(profile, SecureProfile):
+        configured_counter = profile.invocation_counter
+        selected_counter = next(
+            (
+                item
+                for item in counter_candidates
+                if int(item.class_id) == configured_counter.class_id
+                and item.logical_name == configured_counter.logical_name
+                and int(item.attribute_id) == configured_counter.attribute_id
+            ),
+            None,
+        )
+        if selected_counter is not None:
+            meter_counter = int(selected_counter.value)
+        elif configured_counter.unsafe_override is None:
+            counter_error = RuntimeError(
+                "validated public invocation-counter value is unavailable"
+            )
+
+    results: list[dict[str, Any]] = []
+    mechanisms = (
+        ("none", None),
+        ("low", Authentication.LOW),
+        ("high", Authentication.HIGH),
+        ("high_md5", Authentication.HIGH_MD5),
+        ("high_sha1", Authentication.HIGH_SHA1),
+        ("high_sha256", Authentication.HIGH_SHA256),
+    )
+    for mechanism, authentication in mechanisms:
+        display_name = AUTHENTICATION_DISPLAY_NAMES[mechanism]
+        progress(
+            {
+                "phase": "authentication_scan_attempt",
+                "role": profile.role,
+                "client_address": profile.client_address,
+                "mechanism": mechanism,
+                "message": (
+                    f"Testing {profile.role} / client {profile.client_address} / "
+                    f"{display_name}"
+                ),
+            }
+        )
+        probe = None
+        try:
+            if authentication is None:
+                probe = GuruxSession(
+                    config,
+                    baudrate,
+                    traffic,
+                    client_address=profile.client_address,
+                    profile_name=profile.role,
+                    **endpoint,
+                )
+            else:
+                probe = GuruxAuthenticationProbeSession(
+                    config,
+                    baudrate,
+                    traffic,
+                    authentication,
+                    client_address=profile.client_address,
+                    profile_name=profile.role,
+                    password=password,
+                    client_system_title=(
+                        profile.client_system_title
+                        if isinstance(profile, SecureProfile)
+                        else None
+                    ),
+                    **endpoint,
+                )
+            association = probe.connect()
+            result = _authentication_probe_record(
+                mechanism, session=probe, association=association
+            )
+        except Exception as exc:
+            result = _authentication_probe_record(
+                mechanism, session=probe, error=exc
+            )
+        finally:
+            if probe is not None:
+                _record_cleanup_warnings(
+                    report,
+                    probe.close(),
+                    phase=f"authentication_scan_{mechanism}_finalization",
+                )
+        results.append(result)
+        progress(
+            {
+                "phase": "authentication_scan_result",
+                "role": profile.role,
+                "client_address": profile.client_address,
+                "mechanism": mechanism,
+                "status": result["status"],
+                "message": (
+                    f"{profile.role} / client {profile.client_address} / "
+                    f"{display_name}: {result['status']}"
+                ),
+            }
+        )
+
+    progress(
+        {
+            "phase": "authentication_scan_attempt",
+            "role": profile.role,
+            "client_address": profile.client_address,
+            "mechanism": "high_gmac",
+            "message": (
+                f"Testing {profile.role} / client {profile.client_address} / "
+                f"{AUTHENTICATION_DISPLAY_NAMES['high_gmac']}"
+            ),
+        }
+    )
+    gmac_session = None
+    counter_lease = None
+    try:
+        if not isinstance(profile, SecureProfile):
+            raise RuntimeError(
+                "HIGH_GMAC requires an hls_gmac_suite0 role with system title and keys"
+            )
+        if counter_error is not None and profile.invocation_counter.unsafe_override is None:
+            raise RuntimeError(
+                "public invocation-counter bootstrap failed; high_gmac cannot be tested"
+            ) from counter_error
+        if meter_identity is None:
+            raise RuntimeError(
+                "meter identity is unavailable; high_gmac counter state cannot be isolated"
+            )
+        identity = counter_identity(
+            meter_identity=meter_identity,
+            client_system_title=profile.client_system_title,
+            client_address=profile.client_address,
+            server_address=int(transport["selected_server_address"]),
+        )
+        counter_lease = acquire_counter_lease(
+            profile.invocation_counter.state_file,
+            identity,
+            meter_reported_counter=meter_counter,
+            unsafe_override=profile.invocation_counter.unsafe_override,
+        )
+        gak, guek = resolve_secure_keys(profile)
+        gmac_session = GuruxSecureSession(
+            config,
+            baudrate,
+            traffic,
+            counter_lease,
+            gak,
+            guek,
+            **endpoint,
+        )
+        association = gmac_session.connect()
+        gmac_result = _authentication_probe_record(
+            "high_gmac",
+            session=gmac_session,
+            association=association,
+            security_policy="authentication_encryption",
+        )
+    except Exception as exc:
+        gmac_result = _authentication_probe_record(
+            "high_gmac",
+            session=gmac_session,
+            error=exc,
+            attempted=isinstance(profile, SecureProfile) and gmac_session is not None,
+            security_policy="authentication_encryption",
+        )
+    finally:
+        if gmac_session is not None:
+            _record_cleanup_warnings(
+                report,
+                gmac_session.close(),
+                phase="authentication_scan_high_gmac_finalization",
+            )
+        if counter_lease is not None:
+            counter_lease.close()
+    results.append(gmac_result)
+    progress(
+        {
+            "phase": "authentication_scan_result",
+            "role": profile.role,
+            "client_address": profile.client_address,
+            "mechanism": "high_gmac",
+            "status": gmac_result["status"],
+            "message": (
+                f"{profile.role} / client {profile.client_address} / "
+                f"{AUTHENTICATION_DISPLAY_NAMES['high_gmac']}: "
+                f"{gmac_result['status']}"
+            ),
+        }
+    )
+
+    results.append(
+        _authentication_probe_record(
+            "high_ecdsa", supported=False, security_policy="implementation_defined"
+        )
+    )
+    accepted = [
+        item["mechanism"] for item in results if item["fully_authenticated"] is True
+    ]
+    return {
+        "name": profile.name,
+        "role": profile.role,
+        "client_address": profile.client_address,
+        "authentication_scan": {
+            "results": results,
+            "accepted_mechanisms": accepted,
+            "complete": True,
+            "high_ecdsa_limitation": (
+                "Not attempted because signing-key and certificate credentials are not supported."
+            ),
+        },
+        "errors": report["errors"],
+    }
+
+
 def scan_public(
     config: AppConfig,
     traffic: Any,
@@ -879,7 +1308,7 @@ def scan_public(
     progress: ProgressCallback | None = None,
     invocation_counter_reuse_test: bool = False,
 ) -> dict[str, Any]:
-    """Run the configured public or secure read-only scan."""
+    """Run the configured public, LLS, or secure read-only scan."""
 
     progress = progress or (lambda _: None)
     started_at = utc_now()
@@ -958,7 +1387,16 @@ def scan_public(
                             "profile_name": "public",
                         }
                     )
-                candidate = GuruxSession(config, baudrate, traffic, **candidate_arguments)
+                if isinstance(config.profile, LlsProfile):
+                    from .gurux_adapter import GuruxLlsSession
+
+                    candidate = GuruxLlsSession(
+                        config, baudrate, traffic, **candidate_arguments
+                    )
+                else:
+                    candidate = GuruxSession(
+                        config, baudrate, traffic, **candidate_arguments
+                    )
                 try:
                     association = candidate.connect()
                 except Exception as exc:
@@ -1036,7 +1474,10 @@ def scan_public(
             )
 
         if session is None:
-            raise RuntimeError("no baud rate and server-address combination produced a valid public DLMS association")
+            raise RuntimeError(
+                "no baud rate and server-address combination produced a valid "
+                f"{config.profile.name} DLMS association"
+            )
 
         profile_name = config.profile.role
         if isinstance(config.profile, SecureProfile):
@@ -1261,6 +1702,21 @@ def scan_public(
         if association_view_get in testable_get_capabilities:
             testable_get_capabilities.remove(association_view_get)
             testable_get_capabilities.insert(0, association_view_get)
+        # Read the associated-partners and authentication-mechanism attributes
+        # early for every Association LN visible in this association. This
+        # produces a bounded, evidence-based mechanism inventory without
+        # guessing client SAPs, passwords, HLS secrets, keys, or certificates.
+        authentication_capabilities = [
+            capability
+            for capability in testable_get_capabilities
+            if capability[0][0] == 15 and capability[1] in (3, 6)
+        ]
+        for capability in reversed(authentication_capabilities):
+            testable_get_capabilities.remove(capability)
+            testable_get_capabilities.insert(
+                1 if association_view_get in testable_get_capabilities else 0,
+                capability,
+            )
 
         if config.scan.object_limit is not None:
             selected_inventory_items = association_order_items[: config.scan.object_limit]
@@ -1803,6 +2259,9 @@ def scan_public(
                     break
 
         profile_result["identification"] = identification
+        profile_result["authentication_enumeration"] = _authentication_enumeration(
+            object_records, association
+        )
         profile_result["summary"].update(
             {
                 "objects": len(object_records),

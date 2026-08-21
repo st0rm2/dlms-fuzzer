@@ -1,0 +1,38 @@
+version: 1
+
+transport:
+  type: serial_hdlc
+  device: /dev/ttyUSB0
+  baudrate: auto
+  response_timeout_ms: 3000
+  inter_request_delay_ms: 100
+
+scan:
+  mode: get
+  association_view_first: true
+  common_catalogue: true
+  enumeration_timeout_ms: 1000
+
+profiles:
+  - name: lls
+    role: meter_reader
+    client_address: 32
+    public_client_address: 16
+    server:
+      logical_address: 1
+      physical_address: 17
+    hdlc:
+      address_size: 2
+    authentication:
+      mechanism: low
+      password:
+        env: DLMS_LLS_PASSWORD
+    security:
+      policy: none
+
+output:
+  directory: ./runs
+  report_file: report.json
+  summary_file: summary.md
+  traffic_file: traffic.jsonl
+  redact_secrets: true

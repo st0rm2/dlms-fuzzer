@@ -1,4 +1,4 @@
-"""Gurux-backed serial HDLC sessions for public and HLS-GMAC profiles."""
+"""Gurux-backed serial HDLC sessions for discovery and authentication scans."""
 
 from __future__ import annotations
 
@@ -22,7 +22,13 @@ from gurux_dlms.objects.enums import SecuritySuite
 from gurux_dlms.secure.GXDLMSSecureClient import GXDLMSSecureClient
 from gurux_serial import GXSerial
 
-from .config import AppConfig, SERVER_ADDRESSING_TYPES, SecureProfile
+from .config import (
+    AppConfig,
+    LlsProfile,
+    SERVER_ADDRESSING_TYPES,
+    SecureProfile,
+    resolve_lls_password,
+)
 from .counter_state import InvocationCounterLease
 from .result_model import Outcome, classify_exception, enum_name, normalize_value
 from .traffic_logger import TrafficLogger
@@ -189,6 +195,8 @@ class GuruxSession:
         self.profile_name = profile_name or profile.role
         self.authentication_name = "none"
         self.security_name = "none"
+        self.association_phase = "endpoint_discovery"
+        self.association_purpose = "public_association"
         self.server_logical_address = (
             profile.server_logical_address
             if server_logical_address is None
@@ -397,6 +405,13 @@ class GuruxSession:
                 }
             context = self._endpoint_context()
             context.update(object_context or {})
+            logged_tx_frames = [raw_tx] if raw_tx else []
+            if getattr(self, "authentication_name", None) == "low" and operation == "AARQ":
+                # LLS carries the reusable password in the ACSE AARQ. Preserve
+                # the redacted translator output and all response evidence, but
+                # never serialize the credential-bearing raw request frame.
+                logged_tx_frames = []
+                tx_decoded["credential_bearing_raw_frame_omitted"] = True
             self.traffic.log(
                 profile=self.profile_name,
                 phase=phase,
@@ -404,7 +419,7 @@ class GuruxSession:
                 object_context=context,
                 operation=operation,
                 attempt=attempt,
-                tx_frames=[raw_tx] if raw_tx else [],
+                tx_frames=logged_tx_frames,
                 tx_decoded=tx_decoded,
                 rx_frames=raw_rx,
                 rx_decoded=rx_decoded,
@@ -486,13 +501,13 @@ class GuruxSession:
         self._read_blocks(
             _quiet_gurux(self.client.aarqRequest),
             reply,
-            phase="endpoint_discovery",
-            purpose="public_association",
+            phase=self.association_phase,
+            purpose=self.association_purpose,
             operation="AARQ",
             attempt=1,
             tx_context={
                 "message": "application-association-request",
-                "authentication": "none",
+                "authentication": self.authentication_name,
                 "referencing": "logical-name",
             },
         )
@@ -824,6 +839,137 @@ class GuruxSession:
             raise
 
 
+class GuruxLlsSession(GuruxSession):
+    """LLS password association without xDLMS APDU ciphering."""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        baudrate: int,
+        traffic: TrafficLogger,
+        *,
+        server_logical_address: int,
+        server_physical_address: int,
+        server_address_size: int,
+    ):
+        profile = config.profile
+        if not isinstance(profile, LlsProfile):
+            raise TypeError("GuruxLlsSession requires lls configuration")
+        super().__init__(
+            config,
+            baudrate,
+            traffic,
+            server_logical_address=server_logical_address,
+            server_physical_address=server_physical_address,
+            server_address_size=server_address_size,
+            client_address=profile.client_address,
+            profile_name=profile.role,
+        )
+        self.authentication_name = "low"
+        self.association_phase = "lls_association"
+        self.association_purpose = "password_association"
+        self.client.authentication = Authentication.LOW
+        self.client.password = bytearray(resolve_lls_password(profile))
+
+
+class GuruxAuthenticationProbeSession(GuruxSession):
+    """One LOW or password-based HLS authentication probe."""
+
+    _SUPPORTED = {
+        Authentication.LOW: "low",
+        Authentication.HIGH: "high",
+        Authentication.HIGH_MD5: "high_md5",
+        Authentication.HIGH_SHA1: "high_sha1",
+        Authentication.HIGH_SHA256: "high_sha256",
+    }
+
+    def __init__(
+        self,
+        config: AppConfig,
+        baudrate: int,
+        traffic: TrafficLogger,
+        authentication: Authentication,
+        *,
+        client_address: int,
+        profile_name: str,
+        password: bytes,
+        client_system_title: bytes | None = None,
+        server_logical_address: int,
+        server_physical_address: int,
+        server_address_size: int,
+    ):
+        if authentication not in self._SUPPORTED:
+            raise ValueError("unsupported password authentication probe")
+        super().__init__(
+            config,
+            baudrate,
+            traffic,
+            server_logical_address=server_logical_address,
+            server_physical_address=server_physical_address,
+            server_address_size=server_address_size,
+            client_address=client_address,
+            profile_name=profile_name,
+        )
+        self.authentication = authentication
+        self.aarq_accepted = False
+        self.authentication_name = self._SUPPORTED[authentication]
+        self.association_phase = "authentication_scan"
+        self.association_purpose = f"probe_{self.authentication_name}"
+        self.client.authentication = authentication
+        self.client.password = bytearray(password)
+        if client_system_title is not None:
+            self.client.ciphering.systemTitle = bytearray(client_system_title)
+
+    def connect(self) -> dict[str, Any]:
+        details = super().connect()
+        self.aarq_accepted = True
+        if self.authentication == Authentication.LOW:
+            return details
+        if not self.client.isAuthenticationRequired:
+            self._associated = False
+            raise RuntimeError(
+                f"{self.authentication_name} AARE did not require the HLS exchange"
+            )
+
+        # AARE acceptance is only phase one of HLS. Validate the server's
+        # challenge response before reporting this mechanism as successful.
+        self._associated = False
+        reply = GXReplyData()
+        self._read_blocks(
+            _quiet_gurux(self.client.getApplicationAssociationRequest),
+            reply,
+            phase="authentication_scan",
+            purpose=f"validate_{self.authentication_name}",
+            operation="HLS_ACTION",
+            attempt=1,
+            object_context={
+                "class_id": 15,
+                "logical_name": "0.0.40.0.0.255",
+                "method_id": 1,
+                "only_permitted_action": True,
+            },
+            tx_context={"service": "action-request", "challenge": "<redacted>"},
+        )
+        try:
+            _quiet_gurux(
+                self.client.parseApplicationAssociationResponse, reply.data
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"{self.authentication_name} server challenge validation failed "
+                f"({type(exc).__name__})"
+            ) from None
+        self._associated = True
+        return self.association_details()
+
+    def association_details(self) -> dict[str, Any]:
+        details = super().association_details()
+        details["hls_validated"] = (
+            self._associated if self.authentication != Authentication.LOW else None
+        )
+        return details
+
+
 class GuruxSecureSession(GuruxSession):
     """HLS-GMAC Security Suite 0 association with protected xDLMS services."""
 
@@ -857,6 +1003,7 @@ class GuruxSecureSession(GuruxSession):
         self._gak = bytes(gak)
         self._guek = bytes(guek)
         self.authentication_name = "high_gmac"
+        self.aarq_accepted = False
         self.security_name = "authentication_encryption"
         self._configure_secure_client(self.client)
         self._used_invocation_counters: list[int] = []
@@ -1379,6 +1526,7 @@ class GuruxSecureSession(GuruxSession):
             },
         )
         _quiet_gurux(self.client.parseAareResponse, reply.data)
+        self.aarq_accepted = True
         if not self.client.isAuthenticationRequired:
             raise RuntimeError("HLS-GMAC AARE did not require the HLS authentication exchange")
         server_title = self.client.settings.sourceSystemTitle

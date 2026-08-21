@@ -90,6 +90,14 @@ class PreflightTimeoutSession(PreflightSession):
         raise TimeoutError("meter did not reply")
 
 
+class RecordingPreflightSession(PreflightSession):
+    client_addresses = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__class__.client_addresses.append(kwargs.get("client_address"))
+
+
 def multi_role_config():
     secure = {
         "name": "hls_gmac_suite0",
@@ -161,6 +169,35 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(policy["successful_health_checks"], 1)
         self.assertEqual(policy["recoveries_without_reconnect"], 1)
         self.assertFalse(policy["stopped"])
+
+    def test_lls_only_preflight_uses_public_client_address(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null", "baudrate": 9600},
+                "profiles": [
+                    {
+                        "name": "lls",
+                        "client_address": 32,
+                        "public_client_address": 16,
+                        "authentication": {
+                            "mechanism": "low",
+                            "password": {"env": "TEST_DLMS_LLS_PASSWORD"},
+                        },
+                    }
+                ],
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = RecordingPreflightSession
+        RecordingPreflightSession.client_addresses = []
+
+        with (
+            patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}),
+            patch("dlms_enum.workflow.validate_serial_device"),
+        ):
+            run_public_preflight(config, object())
+
+        self.assertEqual(RecordingPreflightSession.client_addresses, [16])
 
     def test_counter_confirmation_updates_only_runtime_secure_role(self):
         config = multi_role_config()

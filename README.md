@@ -1,10 +1,10 @@
 # DLMS Smart Meter Enumeration Tool
 
-`dlms-enum` performs authorized, read-only DLMS/COSEM discovery over direct serial HDLC. It supports either an unauthenticated public association or an HLS-GMAC Security Suite 0 association with authenticated-and-encrypted xDLMS traffic. Both profiles use logical-name referencing, read the Association LN object list, supplement it with a conservative OBIS catalogue, perform GET operations only, and write a canonical JSON report plus side-by-side JSONL traffic. Secure scans can additionally retest authenticated-only targets through the public client to identify unadvertised public access.
+`dlms-enum` performs authorized, read-only DLMS/COSEM discovery over direct serial HDLC. It supports unauthenticated public associations, password-authenticated LLS associations, and HLS-GMAC Security Suite 0 associations with authenticated-and-encrypted xDLMS traffic. All profiles use logical-name referencing, read the Association LN object list, supplement it with a conservative OBIS catalogue, perform GET operations only, and write a canonical JSON report plus side-by-side JSONL traffic. Secure scans can additionally retest authenticated-only targets through the public client to identify unadvertised public access.
 
 Logical-name attribute 1 is not read or emitted as a separate result because it duplicates the OBIS logical name already stored on every object record.
 
-The secure profile uses Gurux DLMS 1.0.201 for HLS-GMAC and AES-GCM. It does not implement cryptography itself. Association View access rights for SET and ACTION are reported passively, but no modifying SET, arbitrary ACTION, key transfer, key rotation, password authentication, manufacturer catalogue, or fuzzing is performed. The sole ACTION sent is Association LN method 1, which is required to complete HLS authentication.
+The LLS and secure profiles use Gurux DLMS for authentication; the secure profile also uses Gurux for HLS-GMAC and AES-GCM. The tool does not implement cryptography itself. Association View access rights for SET and ACTION are reported passively, but no modifying SET, arbitrary ACTION, key transfer, key rotation, password guessing, manufacturer catalogue, or fuzzing is performed. The sole ACTION sent is Association LN method 1, which is required to complete configured HLS authentication.
 
 ## Install and run
 
@@ -23,6 +23,44 @@ cp examples/public-meter.yaml meter-public.yaml
 python -m dlms_enum validate-config meter-public.yaml
 python -m dlms_enum scan --config meter-public.yaml
 ```
+
+LLS password scan:
+
+```shell
+cp examples/lls-meter.yaml meter-lls.yaml
+export DLMS_LLS_PASSWORD='replace-with-the-provisioned-password'
+python -m dlms_enum validate-config meter-lls.yaml
+python -m dlms_enum scan --config meter-lls.yaml
+```
+
+The LLS password may instead be written inline as `password: {inline: "..."}`
+or `password: "..."`. Prefix a binary password with `hex:`. Inline passwords
+are accepted for laboratory configurations, are redacted from effective
+configuration and reports, and are replaced with an environment reference if
+the configuration is re-saved. The raw credential-bearing LLS AARQ is omitted
+from `traffic.jsonl`; its decoded XML remains available with the authentication
+value redacted.
+
+Authentication-mechanism scan:
+
+```shell
+export DLMS_PASSWORD='replace-with-the-provisioned-password'
+export DLMS_GAK='00112233445566778899AABBCCDDEEFF'
+export DLMS_GUEK='FFEEDDCCBBAA99887766554433221100'
+dlms-enum scan --config examples/authentication-enumeration.yaml
+```
+
+`authentication_scan` is an optional top-level final phase, not a profile. The
+normal public/LLS/HLS role scans, GET enumeration, optional public cross-profile
+tests, and optional invocation-counter replay diagnostic finish first. The tool
+then tries NONE, LOW, HIGH, HIGH-MD5, HIGH-SHA1, HIGH-SHA256, and HIGH-GMAC in
+fresh associations for every selected role. The configured password is shared
+by the password probes; each secure role keeps its own system title, keys, and
+counter state. HIGH-GMAC is reported as a prerequisite failure for roles without
+those secure credentials. Results distinguish an AARQ rejection from a completed
+HLS challenge. HIGH-ECDSA is listed as unsupported because this release has no
+signing-key/certificate credential support. A rejected mechanism does not stop
+the remaining probes.
 
 ### Standalone public connection discovery
 
@@ -105,7 +143,25 @@ python -m dlms_enum scan --config meter-secure.yaml
 
 This example configures the mandatory public preflight role plus secure role `c4` at client SAP 4. Do not use the placeholder keys shown above. The client system title in the example is also a placeholder and must be replaced with the eight-byte value provisioned for that client.
 
-Guided setup is available with `python -m dlms_enum scan`. Secure keys entered there are masked. If that configuration is saved, inline key values are replaced with masked interactive prompts rather than written to disk.
+Guided setup is available with `python -m dlms_enum scan`. During initial setup,
+the tool asks whether to append the authentication matrix and, when enabled, for
+the password environment-variable name. The LLS setup separately asks for its
+normal association password variable. Secure keys entered there are masked. If
+that configuration is saved, inline key values are replaced with masked
+interactive prompts rather than written to disk.
+
+## Authentication enumeration
+
+Every successful role scan reports two kinds of authentication evidence:
+
+- `active_verification` records the mechanism and client SAP that actually established the current association (`none`, `low`, or `high_gmac` in this release).
+- `advertised_associations` decodes attributes 3 and 6 of every readable Association LN object: associated client/server SAPs and the authentication-mechanism OID. Mechanism IDs 0 through 7 are named as none, low, high, high-MD5, high-SHA1, high-GMAC, high-SHA256, and high-ECDSA.
+
+Association metadata GETs are prioritized early in the scan. The passive result
+is intentionally marked incomplete because a meter can hide other Association LN
+objects from the current client. When the final authentication scan is enabled,
+the tool actively probes the selected configured client SAPs only. It does not
+guess passwords or sweep unconfigured client addresses.
 
 ## Multiple roles and public preflight
 
@@ -120,6 +176,14 @@ transport:
 profiles:
   - name: public
     role: public
+
+  - name: lls
+    role: meter_reader
+    client_address: 32
+    public_client_address: 16
+    authentication:
+      mechanism: low
+      password: {env: DLMS_LLS_PASSWORD}
 
   - name: hls_gmac_suite0
     role: client1
@@ -292,15 +356,22 @@ Serial framing, validation response timeout, inter-request delay, and session gu
 
 Each run gets a UTC-named directory under `./runs` unless overridden:
 
-- `report.json` contains the selected endpoint, addressing type, redacted effective configuration, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, optional public cross-profile findings, a complete per-role GET/SET/ACTION capability matrix, cleanup warnings, and a traffic-file hash. Each matrix row is `SUCCESS`, a normalized failure category, or `NOT_TESTED`.
+- `report.json` contains the selected endpoint, addressing type, redacted effective configuration, active, probed, and Association-LN-advertised authentication mechanisms, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, optional public cross-profile findings, a complete per-role GET/SET/ACTION capability matrix, cleanup warnings, and a traffic-file hash. Each matrix row is `SUCCESS`, a normalized failure category, or `NOT_TESTED`.
 - `summary.md` is the human-readable report. It contains connection and role details, a decoded OBIS table, the public cross-profile access findings when enabled, and the complete operation capability matrix. In secure scans the decoded table places the encrypted RX payload immediately to the right of the encoded value; only ciphertext is shown, without HDLC framing, security control, invocation counter, authentication tag, or CRC. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent. The separate protected-APDU table retains command, counter, ciphertext, and authentication-tag evidence.
-- `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators.
+- `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators. The reusable LLS password is never written as decoded data, and the raw LLS AARQ is omitted because it contains that password.
+- When `authentication_scan.enabled` is true, `authentication-report.json`,
+  `authentication-summary.md`, and `authentication-traffic.jsonl` are written at
+  the run root. The summary and terminal show one role-by-mechanism matrix.
 
 GET uses at most two attempts. Explicit DLMS errors such as access denied are not retried. Timeouts, transport failures, and malformed responses can receive one retry; each protected retry gets a new persisted invocation counter. After two consecutive timeout responses, retries are suppressed while that timeout run continues. After four consecutive timeouts by default, a circuit breaker reads the last successfully read attribute (or the proven Association View if no smaller GET has succeeded). If the health check fails, the scanner drops the link, reconnects once, and checks again. A successful check resets the breaker and resumes scanning; another failure stops that GET phase without sending the remaining requests and reports those operations as `INCONCLUSIVE`. Configure the threshold from 3 through 10 with `scan.timeout_breaker_threshold`.
 
 ### Terminal progress and secure-status messages
 
 During a scan, the terminal uses one Rich progress display rather than printing every request on a new line. Once the Association View is known, it shows the completed/total readable attributes and replaces the current action in place, for example `GET 1.0.1.8.0.255 class 3 attribute 2 attempt 1`.
+
+The terminal announces every normal role and its enabled phases. During the final
+authentication scan it prints every attempt and outcome explicitly, for example
+`Testing client4 / client 4 / HIGH_GMAC`, before rendering the combined matrix.
 
 Gurux internally labels Suite 0 security-control bit `0x20` as “Encryption is applied” and bit `0x10` as “Authentication is applied.” Together they form the configured `0x30` authentication-and-encryption policy. Those repeated low-level diagnostics are suppressed. They did not indicate two additional operations: encryption protects confidentiality, while authentication is the AES-GCM integrity/authenticity tag. A successfully decoded protected response means Gurux verified that tag; tag failure is reported as a scan error.
 
@@ -309,6 +380,7 @@ Gurux internally labels Suite 0 security-control bit `0x20` as “Encryption is 
 - **Persisted counter below meter value:** verify that the configured client system title, authenticated SAP, meter, and state file belong together. Restore a known newer state only if its provenance is certain; otherwise reprovision keys/system title according to the meter vendor's process.
 - **Public counter read fails:** confirm public client SAP 16, invocation-counter OBIS/class/attribute, and public access rights. Use `unsafe_override` only with a separately verified safe value.
 - **HLS rejected:** check the authenticated client SAP, exact client system title, GAK, GUEK, and the meter's assigned Security Suite. HLS completion is mandatory; no GET is attempted after failure.
+- **LLS rejected:** check that the configured client SAP selects the intended LLS Association LN and that the environment or inline password has the exact expected byte representation. LLS passwords are case-sensitive; `hex:` values are decoded as bytes rather than sent as ASCII.
 - **Authentication-tag failure:** usually indicates a wrong GAK/GUEK, wrong system title, wrong server identity, damaged frames, or counter mismatch. The tool does not fall back to plaintext.
 - **Access denied after successful HLS:** the association is valid, but that authenticated role lacks read access to the requested object/attribute. The tool records the DLMS error and does not attempt SET/ACTION workarounds.
 - **No endpoint found:** confirm serial permissions and wiring. Automatic discovery tries 9600 first, then configured candidates, and tests common one-byte and two-byte server addressing with public communication only.
@@ -319,10 +391,11 @@ Gurux internally labels Suite 0 security-control bit `0x20` as “Encryption is 
 ```shell
 python -m unittest discover -s tests -v
 python -m dlms_enum validate-config examples/public-meter.yaml
+DLMS_LLS_PASSWORD=example python -m dlms_enum validate-config examples/lls-meter.yaml
 python -m dlms_enum validate-config examples/hls-gmac-suite0-meter.yaml
 python -m dlms_enum validate-config examples/multi-role-meter.yaml
 ```
 
 Protocol tests use fakes, the real Gurux request generator, and sanitized structural expectations derived from the supplied captures; they need no physical meter and embed no keys. Live validation is still required for the target meter, particularly its role provisioning, counter object access, server system title, association-view size, and protected-release behavior.
 
-This release accepts multiple named `public` and `hls_gmac_suite0` roles and scans each selected role independently after one public planning preflight. A secure role can also perform the bounded public cross-profile test described above. Negotiated GET-with-list batching is available for Association View-advertised reads, with bounded groups and individual fallback. Security Suites 1/2, dedicated keys, signing, key agreement, key management, and arbitrary ACTION/SET execution are intentionally unsupported.
+This release accepts multiple named `public`, `lls`, and `hls_gmac_suite0` roles and scans each selected role independently after one public planning preflight. The LLS profile currently uses unprotected xDLMS messages after password authentication. A secure role can also perform the bounded public cross-profile test described above. Negotiated GET-with-list batching is available for Association View-advertised reads, with bounded groups and individual fallback. The optional final authentication phase probes the supported password-based HLS variants and Suite 0 HLS-GMAC only on configured client SAPs. LLS combined with APDU ciphering, Security Suites 1/2, dedicated keys, signing, key agreement, key management, unconfigured client-address sweeps, and arbitrary ACTION/SET execution are intentionally unsupported.

@@ -1,4 +1,4 @@
-"""Strict configuration and secret handling for public and HLS-GMAC scans."""
+"""Strict configuration and secret handling for public, LLS, and HLS-GMAC scans."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping
 
 DEFAULT_BAUD_RATES = (9600, 19200, 4800, 2400, 1200, 600, 300, 38400, 57600, 115200)
 SECURE_PROFILE_NAME = "hls_gmac_suite0"
+LLS_PROFILE_NAME = "lls"
 SERVER_ADDRESSING_TYPES = {
     1: "1-byte addressing",
     2: "2-byte addressing",
@@ -55,6 +56,14 @@ class ScanConfig:
 
 
 @dataclass(frozen=True)
+class AuthenticationScanConfig:
+    """Optional credential sweep performed after all normal role scans."""
+
+    enabled: bool = False
+    password: SecretSource | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
 class PublicProfile:
     name: str = "public"
     role: str = "public"
@@ -80,6 +89,21 @@ class SecretSource:
         if self.kind == "inline":
             return {"source": "inline", "warning": "laboratory use only"}
         return {"source": "interactive_masked"}
+
+
+@dataclass(frozen=True)
+class LlsProfile:
+    """A password-authenticated, otherwise unprotected LLS association."""
+
+    password: SecretSource = field(repr=False)
+    name: str = LLS_PROFILE_NAME
+    role: str = LLS_PROFILE_NAME
+    client_address: int = 32
+    public_client_address: int = 16
+    server_logical_address: int = 1
+    server_physical_address: int = 1
+    server_address_size: int | str = "auto"
+    proposed_max_pdu_size: int = 0xFFFF
 
 
 @dataclass(frozen=True)
@@ -114,7 +138,8 @@ class SecureProfile:
     role: str = SECURE_PROFILE_NAME
 
 
-ProfileConfig = PublicProfile | SecureProfile
+CounterProfile = SecureProfile
+ProfileConfig = PublicProfile | LlsProfile | SecureProfile
 
 
 @dataclass(frozen=True)
@@ -131,6 +156,7 @@ class AppConfig:
     version: int
     transport: TransportConfig
     scan: ScanConfig
+    authentication_scan: AuthenticationScanConfig
     profiles: tuple[ProfileConfig, ...]
     output: OutputConfig
     warnings: tuple[str, ...] = field(default=(), repr=False)
@@ -188,6 +214,17 @@ class AppConfig:
                         "invocation_counter": asdict(configured_profile.invocation_counter),
                     }
                 )
+            elif isinstance(configured_profile, LlsProfile):
+                profile.update(
+                    {
+                        "public_client_address": configured_profile.public_client_address,
+                        "authentication": {
+                            "mechanism": "low",
+                            "password": configured_profile.password.descriptor(),
+                        },
+                        "security": {"policy": "none"},
+                    }
+                )
             else:
                 profile.update(
                     {
@@ -196,10 +233,18 @@ class AppConfig:
                     }
                 )
             profiles.append(profile)
+        authentication_scan: dict[str, Any] = {
+            "enabled": self.authentication_scan.enabled,
+        }
+        if self.authentication_scan.password is not None:
+            authentication_scan["password"] = (
+                self.authentication_scan.password.descriptor()
+            )
         return {
             "version": self.version,
             "transport": transport,
             "scan": asdict(self.scan),
+            "authentication_scan": authentication_scan,
             "profiles": profiles,
             "output": asdict(self.output),
         }
@@ -340,6 +385,24 @@ def _parse_scan(raw: Any) -> ScanConfig:
     )
 
 
+def _parse_authentication_scan(raw: Any) -> AuthenticationScanConfig:
+    data = _mapping(raw, "authentication_scan")
+    _only_keys(data, {"enabled", "password"}, "authentication_scan")
+    enabled = data.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("authentication_scan.enabled must be boolean")
+    password = None
+    if "password" in data:
+        password = _parse_lls_password_source(
+            data["password"], "authentication_scan.password"
+        )
+    if enabled and password is None:
+        raise ConfigError(
+            "authentication_scan.password is required when authentication scanning is enabled"
+        )
+    return AuthenticationScanConfig(enabled=enabled, password=password)
+
+
 def with_object_limit(config: AppConfig, limit: int | None) -> AppConfig:
     """Return a runtime copy with a bounded post-association object scan."""
 
@@ -427,6 +490,46 @@ def _parse_secret_source(raw: Any, label: str, base_directory: Path | None) -> S
     return SecretSource(kind, locator)
 
 
+def _decode_lls_password(value: Any, label: str) -> bytes:
+    """Decode an LLS password without including its value in validation errors."""
+
+    if not isinstance(value, str):
+        raise ConfigError(f"{label} must be a string")
+    if value.lower().startswith("hex:"):
+        candidate = value[4:]
+        try:
+            decoded = bytes.fromhex(candidate)
+        except ValueError:
+            raise ConfigError(
+                f"{label} hex value must contain an even number of hexadecimal characters"
+            ) from None
+    else:
+        decoded = value.encode("utf-8")
+    if not 1 <= len(decoded) <= 64:
+        raise ConfigError(f"{label} must encode to between 1 and 64 bytes")
+    return decoded
+
+
+def _parse_lls_password_source(raw: Any, label: str) -> SecretSource:
+    """Accept an inline YAML password or the name of an environment variable."""
+
+    if isinstance(raw, str):
+        _decode_lls_password(raw, label)
+        return SecretSource("inline", raw)
+    data = _mapping(raw, label)
+    _only_keys(data, {"env", "inline"}, label)
+    selected = [key for key in ("env", "inline") if key in data]
+    if len(selected) != 1:
+        raise ConfigError(f"{label} must select exactly one of env or inline")
+    kind = selected[0]
+    value = data[kind]
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{label}.{kind} must be a non-empty string")
+    if kind == "inline":
+        _decode_lls_password(value, label)
+    return SecretSource(kind, value)
+
+
 def _parse_invocation_counter(
     raw: Any, base_directory: Path | None, *, label: str
 ) -> InvocationCounterConfig:
@@ -493,14 +596,18 @@ def _parse_profiles(
         _only_keys(
             data,
             {
-                "name", "role", "client_address", "client_system_title", "secrets", "server",
-                "authentication", "security", "proposed_max_pdu_size", "hdlc", "invocation_counter",
+                "name", "role", "client_address", "public_client_address",
+                "client_system_title", "secrets", "server",
+                "authentication", "security", "password", "proposed_max_pdu_size", "hdlc", "invocation_counter",
             },
             label,
         )
         name = data.get("name", "public")
-        if name not in ("public", SECURE_PROFILE_NAME):
-            raise ConfigError(f"{label}.name must be public or hls_gmac_suite0")
+        if name not in ("public", LLS_PROFILE_NAME, SECURE_PROFILE_NAME):
+            raise ConfigError(
+                f"{label}.name must be public, lls, or hls_gmac_suite0; "
+                "authentication_scan is a top-level final workflow phase"
+            )
         role = data.get("role", name)
         if not isinstance(role, str) or not role.strip():
             raise ConfigError(f"{label}.role must be a non-empty string")
@@ -509,19 +616,28 @@ def _parse_profiles(
             raise ConfigError(f"profile role names must be unique: {role}")
         roles.add(role)
         logical, physical, address_size = _parse_server_and_hdlc(
-            data, secure=name == SECURE_PROFILE_NAME, label=label
+            data,
+            secure=name == SECURE_PROFILE_NAME,
+            label=label,
         )
         max_pdu = _integer(
             data.get("proposed_max_pdu_size", 0xFFFF), f"{label}.proposed_max_pdu_size", 64, 0xFFFF
         )
         if name == "public":
+            if "public_client_address" in data:
+                raise ConfigError("public_client_address is only valid for an lls profile")
             auth = _mapping(data.get("authentication"), f"{label}.authentication")
             if auth.get("mechanism", "none") != "none" or set(auth) - {"mechanism"}:
                 raise ConfigError("the public profile must use authentication.mechanism: none")
             security = _mapping(data.get("security"), f"{label}.security")
             if security.get("policy", "none") != "none" or set(security) - {"policy"}:
                 raise ConfigError("the public profile must use security.policy: none")
-            if "client_system_title" in data or "secrets" in data or "invocation_counter" in data:
+            if (
+                "client_system_title" in data
+                or "secrets" in data
+                or "invocation_counter" in data
+                or "password" in data
+            ):
                 raise ConfigError("secure credentials and invocation-counter settings require hls_gmac_suite0")
             parsed.append(
                 PublicProfile(
@@ -535,7 +651,68 @@ def _parse_profiles(
             )
             continue
 
+        if name == LLS_PROFILE_NAME:
+            if "password" in data:
+                raise ConfigError(
+                    "lls password belongs under authentication.password"
+                )
+            auth = _mapping(data.get("authentication"), f"{label}.authentication")
+            _only_keys(auth, {"mechanism", "password"}, f"{label}.authentication")
+            if auth.get("mechanism", "low") != "low":
+                raise ConfigError("the lls profile must use authentication.mechanism: low")
+            if "password" not in auth:
+                raise ConfigError(
+                    f"{label}.authentication.password must be provided inline or from env"
+                )
+            security = _mapping(data.get("security"), f"{label}.security")
+            if security.get("policy", "none") != "none" or set(security) - {"policy"}:
+                raise ConfigError("the lls profile currently requires security.policy: none")
+            if "client_system_title" in data or "secrets" in data or "invocation_counter" in data:
+                raise ConfigError(
+                    "client system titles, cipher keys, and invocation counters require hls_gmac_suite0"
+                )
+            password = _parse_lls_password_source(
+                auth["password"], f"{label}.authentication.password"
+            )
+            if password.kind == "inline":
+                warnings.append(
+                    f"Role {role}: an inline LLS password is for laboratory use only "
+                    "and will be redacted from all output."
+                )
+            parsed.append(
+                LlsProfile(
+                    role=role,
+                    client_address=_integer(
+                        data.get("client_address", 32),
+                        f"{label}.client_address",
+                        1,
+                        0x3FFF,
+                    ),
+                    public_client_address=_integer(
+                        data.get("public_client_address", 16),
+                        f"{label}.public_client_address",
+                        1,
+                        0x3FFF,
+                    ),
+                    password=password,
+                    server_logical_address=logical,
+                    server_physical_address=physical,
+                    server_address_size=address_size,
+                    proposed_max_pdu_size=max_pdu,
+                )
+            )
+            continue
+
         auth = _mapping(data.get("authentication"), f"{label}.authentication")
+        if "password" in data:
+            raise ConfigError(
+                "authentication-scan password belongs under top-level authentication_scan.password"
+            )
+        if "public_client_address" in data:
+            raise ConfigError(
+                "hls_gmac_suite0 configures the bootstrap SAP as "
+                "invocation_counter.public_client_address"
+            )
         if auth and (auth.get("mechanism") != "high_gmac" or set(auth) - {"mechanism"}):
             raise ConfigError("hls_gmac_suite0 implies authentication.mechanism: high_gmac")
         security = _mapping(data.get("security"), f"{label}.security")
@@ -597,11 +774,26 @@ def _parse_output(raw: Any) -> OutputConfig:
 
 def parse_config(data: Any, *, base_directory: str | Path | None = None) -> AppConfig:
     root = _mapping(data, "configuration")
-    _only_keys(root, {"version", "transport", "scan", "profiles", "output"}, "configuration")
+    _only_keys(
+        root,
+        {"version", "transport", "scan", "authentication_scan", "profiles", "output"},
+        "configuration",
+    )
     profiles, warnings = _parse_profiles(
         root.get("profiles"), Path(base_directory) if base_directory is not None else None
     )
     scan = _parse_scan(root.get("scan"))
+    authentication_scan = _parse_authentication_scan(
+        root.get("authentication_scan")
+    )
+    if (
+        authentication_scan.password is not None
+        and authentication_scan.password.kind == "inline"
+    ):
+        warnings = warnings + (
+            "The inline authentication-scan password is for laboratory use only "
+            "and will be redacted from all output.",
+        )
     if scan.union_profile_test and not any(
         isinstance(profile, SecureProfile) for profile in profiles
     ):
@@ -610,6 +802,7 @@ def parse_config(data: Any, *, base_directory: str | Path | None = None) -> AppC
         version=_integer(root.get("version", 1), "version", 1, 1),
         transport=_parse_transport(root.get("transport")),
         scan=scan,
+        authentication_scan=authentication_scan,
         profiles=profiles,
         output=_parse_output(root.get("output")),
         warnings=warnings,
@@ -670,11 +863,33 @@ def resolve_secret(
         raise ConfigError(f"cannot resolve {label}: {type(exc).__name__}") from None
 
 
-def resolve_secure_keys(profile: SecureProfile) -> tuple[bytes, bytes]:
+def resolve_secure_keys(profile: CounterProfile) -> tuple[bytes, bytes]:
     return (
         resolve_secret(profile.secrets.gak, "GAK"),
         resolve_secret(profile.secrets.guek, "GUEK"),
     )
+
+
+def resolve_lls_password(
+    profile: LlsProfile | AuthenticationScanConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> bytes:
+    """Resolve an LLS password from inline YAML or an environment variable."""
+
+    environ = os.environ if environ is None else environ
+    source = profile.password
+    if source is None:
+        raise ConfigError("authentication scan password is not configured")
+    if source.kind == "inline":
+        value = source.locator
+    elif source.kind == "env":
+        value = environ.get(str(source.locator))
+        if value is None:
+            raise ConfigError("LLS password environment variable is not set")
+    else:
+        raise ConfigError("LLS password uses an unsupported secret source")
+    return _decode_lls_password(value, "LLS password")
 
 
 def dump_config(config: AppConfig, path: str | Path) -> None:
@@ -692,10 +907,24 @@ def dump_config(config: AppConfig, path: str | Path) -> None:
         # loaded saved configuration will ask for it with masked input.
         return {"prompt": True}
 
+    password = config.authentication_scan.password
+    if password is not None:
+        data["authentication_scan"]["password"] = (
+            {"env": password.locator}
+            if password.kind == "env"
+            else {"env": "DLMS_PASSWORD"}
+        )
     for index, profile in enumerate(config.profiles):
         if isinstance(profile, SecureProfile):
             data["profiles"][index]["secrets"] = {
                 "gak": serializable_source(profile.secrets.gak),
                 "guek": serializable_source(profile.secrets.guek),
             }
+        elif isinstance(profile, LlsProfile):
+            password = profile.password
+            data["profiles"][index]["authentication"]["password"] = (
+                {"env": password.locator}
+                if password.kind == "env"
+                else {"env": "DLMS_LLS_PASSWORD"}
+            )
     Path(path).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")

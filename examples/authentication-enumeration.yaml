@@ -1,0 +1,22 @@
+version: 1
+
+transport:
+  device: /dev/ttyUSB0
+
+authentication_scan:
+  enabled: true
+  password: {env: DLMS_PASSWORD}
+
+profiles:
+  - name: public
+    role: public
+
+  - name: hls_gmac_suite0
+    role: client4
+    client_address: 4
+    client_system_title: "hex:0011223344556677"
+    secrets:
+      gak: {env: DLMS_GAK}
+      guek: {env: DLMS_GUEK}
+    invocation_counter:
+      logical_name: 0.0.43.1.1.255

@@ -14,9 +14,21 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from .catalogues import COMMON_OBIS
-from .config import ConfigError, SecureProfile, load_config, with_get_limit, with_object_limit
+from .config import (
+    ConfigError,
+    PublicProfile,
+    SecureProfile,
+    load_config,
+    with_get_limit,
+    with_object_limit,
+)
 from .reporter import load_report, summary_lines, write_report
-from .scanner import scan
+from .scanner import (
+    AUTHENTICATION_DISPLAY_NAMES,
+    AUTHENTICATION_MECHANISMS,
+    run_authentication_scan,
+    scan,
+)
 from .traffic_logger import TrafficLogger
 from .tui import (
     ScanUI,
@@ -24,6 +36,7 @@ from .tui import (
     choose_invocation_counter_reuse_test,
     interactive_config,
     select_roles,
+    show_authentication_matrix,
     show_public_preflight,
     verify_counter_source,
 )
@@ -31,9 +44,14 @@ from .workflow import apply_preflight_endpoint, run_public_preflight, select_cou
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="dlms-enum", description="Read-only public or HLS-GMAC DLMS/COSEM serial-HDLC enumeration")
+    parser = argparse.ArgumentParser(
+        prog="dlms-enum",
+        description="Read-only DLMS/COSEM enumeration and authentication scanning over serial HDLC",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    scan_parser = subparsers.add_parser("scan", help="run a public or secure GET-only scan")
+    scan_parser = subparsers.add_parser(
+        "scan", help="run normal GET-only role scans and an optional final authentication matrix"
+    )
     scan_parser.add_argument("--config", type=Path, help="YAML configuration; omit for guided setup")
     scan_parser.add_argument(
         "--roles",
@@ -105,7 +123,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         (
             profile
             for profile in loaded_config.profiles
-            if not isinstance(profile, SecureProfile)
+            if isinstance(profile, PublicProfile)
         ),
         selected[0],
     )
@@ -194,7 +212,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             )
             counter_reuse_tests[profile.role] = (
                 choose_invocation_counter_reuse_test(verified_profile, console)
-                if interactive
+                if interactive and isinstance(profile, SecureProfile)
                 else False
             )
             continue
@@ -225,7 +243,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         )
         counter_reuse_tests[profile.role] = (
             choose_invocation_counter_reuse_test(verified_profile, console)
-            if interactive
+            if interactive and isinstance(profile, SecureProfile)
             else False
         )
     config = replace(config, profiles=tuple(verified_profiles))
@@ -259,6 +277,16 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         used_directory_names.add(directory_name)
         role_directory_names[profile.role] = directory_name
     for profile in config.profiles:
+        console.rule(f"Normal scan — {profile.role}")
+        console.print(
+            f"Profile: {profile.name} | Client SAP: {profile.client_address} | "
+            "phases: association, Association View, GET enumeration"
+            + (
+                ", invocation-counter replay diagnostic"
+                if counter_reuse_tests.get(profile.role, False)
+                else ""
+            )
+        )
         role_directory = (
             run_directory / role_directory_names[profile.role]
             if multiple_roles
@@ -311,6 +339,126 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             }
         )
 
+    authentication_report = None
+    if config.authentication_scan.enabled:
+        console.rule("Final authentication scan")
+        console.print(
+            "Normal role scans are complete. Each authentication attempt now uses "
+            "a fresh association; rejected methods do not stop later tests."
+        )
+        authentication_traffic_path = run_directory / "authentication-traffic.jsonl"
+        authentication_report_path = run_directory / "authentication-report.json"
+        authentication_summary_path = run_directory / "authentication-summary.md"
+        authentication_logger = TrafficLogger(authentication_traffic_path)
+        authentication_ui = ScanUI(console)
+        authentication_profiles = []
+        try:
+            for profile in config.profiles:
+                result = run_authentication_scan(
+                    config.for_profile(profile),
+                    authentication_logger,
+                    transport=preflight.transport,
+                    meter_identity=preflight.meter_identity,
+                    counter_candidates=preflight.counter_candidates,
+                    progress=authentication_ui.progress,
+                )
+                authentication_profiles.append(
+                    {
+                        "name": result["name"],
+                        "role": result["role"],
+                        "association": {
+                            "client_address": result["client_address"],
+                            "server_address": preflight.transport[
+                                "selected_server_address"
+                            ],
+                        },
+                        "authentication_scan": result["authentication_scan"],
+                        "objects": [],
+                        "summary": {
+                            "mechanisms_total": len(
+                                result["authentication_scan"]["results"]
+                            ),
+                            "mechanisms_attempted": sum(
+                                item["attempted"]
+                                for item in result["authentication_scan"]["results"]
+                            ),
+                            "mechanisms_authenticated": len(
+                                result["authentication_scan"][
+                                    "accepted_mechanisms"
+                                ]
+                            ),
+                            "objects": 0,
+                        },
+                        "errors": result["errors"],
+                    }
+                )
+        finally:
+            authentication_ui.close()
+            authentication_logger.close()
+
+        mechanism_names = [
+            AUTHENTICATION_MECHANISMS[index]
+            for index in sorted(AUTHENTICATION_MECHANISMS)
+        ]
+        matrix_rows = []
+        for mechanism in mechanism_names:
+            cells = {}
+            for profile_result in authentication_profiles:
+                record = next(
+                    item
+                    for item in profile_result["authentication_scan"]["results"]
+                    if item["mechanism"] == mechanism
+                )
+                cells[profile_result["role"]] = record
+            matrix_rows.append(
+                {
+                    "mechanism": mechanism,
+                    "display_name": AUTHENTICATION_DISPLAY_NAMES[mechanism],
+                    "roles": cells,
+                }
+            )
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        authentication_report = {
+            "schema_version": 1,
+            "type": "authentication_matrix",
+            "run": {
+                "id": run_directory.name + "-authentication",
+                "started_at": now,
+                "finished_at": now,
+                "status": "completed",
+            },
+            "effective_configuration": config.redacted_dict(),
+            "transport": preflight.transport,
+            "profiles": authentication_profiles,
+            "authentication_matrix": {
+                "roles": [
+                    {
+                        "role": item["role"],
+                        "profile": item["name"],
+                        "client_address": item["association"]["client_address"],
+                    }
+                    for item in authentication_profiles
+                ],
+                "rows": matrix_rows,
+            },
+            "capability_matrix": [],
+            "errors": [
+                error
+                for item in authentication_profiles
+                for error in item.get("errors", [])
+            ],
+        }
+        write_report(
+            authentication_report,
+            authentication_report_path,
+            authentication_traffic_path,
+            authentication_summary_path,
+        )
+        show_authentication_matrix(authentication_report, console)
+        console.print(
+            f"Authentication report: [green]{authentication_report_path.resolve()}[/green]"
+        )
+
     workflow_report = {
         "schema_version": 1,
         "type": "multi_role_read_workflow",
@@ -320,6 +468,18 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         "role_runs": role_results,
         "verified_counter_sources": verified_counter_sources,
         "invocation_counter_reuse_tests_requested": counter_reuse_tests,
+        "authentication_scan": (
+            {
+                "enabled": True,
+                "status": authentication_report["run"]["status"],
+                "report": "authentication-report.json",
+                "traffic": "authentication-traffic.jsonl",
+                "summary": "authentication-summary.md",
+                "matrix": authentication_report["authentication_matrix"],
+            }
+            if authentication_report is not None
+            else {"enabled": False, "status": "disabled"}
+        ),
     }
     (run_directory / "workflow.json").write_text(
         json.dumps(workflow_report, indent=2, ensure_ascii=False) + "\n",

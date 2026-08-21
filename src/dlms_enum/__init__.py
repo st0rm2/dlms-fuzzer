@@ -1,3 +1,3 @@
-"""Read-only public and HLS-GMAC DLMS/COSEM enumeration."""
+"""Read-only DLMS/COSEM enumeration and authentication scanning."""
 
-__version__ = "0.2.1"
+__version__ = "0.4.0"

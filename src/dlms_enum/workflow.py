@@ -7,6 +7,8 @@ from typing import Any, Callable
 
 from .config import (
     AppConfig,
+    CounterProfile,
+    LlsProfile,
     ProfileConfig,
     SecureProfile,
 )
@@ -71,7 +73,7 @@ def run_public_preflight(
     traffic: Any,
     *,
     progress: Callable[[dict[str, Any]], None] | None = None,
-    counter_profiles: tuple[SecureProfile, ...] | None = None,
+    counter_profiles: tuple[CounterProfile, ...] | None = None,
 ) -> PublicPreflight:
     """Discover the public endpoint and readable counter candidates."""
 
@@ -81,11 +83,15 @@ def run_public_preflight(
 
     role = config.profile
     counter_profiles = counter_profiles or (
-        (role,) if isinstance(role, SecureProfile) else ()
+        (role,)
+        if isinstance(role, SecureProfile)
+        else ()
     )
     public_client = (
         role.invocation_counter.public_client_address
         if isinstance(role, SecureProfile)
+        else role.public_client_address
+        if isinstance(role, LlsProfile)
         else role.client_address
     )
     selected_session = None
@@ -317,11 +323,11 @@ def run_public_preflight(
 
 
 def select_counter_source(
-    profile: SecureProfile,
+    profile: CounterProfile,
     candidate: CounterCandidate,
     *,
     meter_identity: str | None,
-) -> SecureProfile:
+) -> CounterProfile:
     """Return a secure role using the verified public counter source."""
 
     counter = replace(

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dlms-enum"
-version = "0.2.1"
-description = "Read-only public and HLS-GMAC DLMS/COSEM serial-HDLC enumeration tool"
+version = "0.4.0"
+description = "Read-only DLMS/COSEM serial-HDLC enumeration and authentication scanner"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

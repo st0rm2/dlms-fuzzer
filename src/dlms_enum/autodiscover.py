@@ -23,6 +23,7 @@ from rich.console import Console
 from .config import (
     DEFAULT_BAUD_RATES,
     AppConfig,
+    AuthenticationScanConfig,
     OutputConfig,
     PublicProfile,
     ScanConfig,
@@ -157,6 +158,7 @@ def _runtime_config(
             common_catalogue=False,
             enumeration_timeout_ms=options.inspection_timeout_ms,
         ),
+        authentication_scan=AuthenticationScanConfig(),
         profiles=(
             PublicProfile(
                 client_address=client_address,
