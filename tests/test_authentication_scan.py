@@ -54,6 +54,9 @@ class FakeSession:
     def connect(self):
         return {"authentication": "none", "client_address": self.client_address}
 
+    def read_invocation_counter(self, _profile):
+        return 129127
+
     def close(self):
         return []
 
@@ -83,8 +86,21 @@ class FakeGmacSession(FakeSession):
 class FakeLease:
     next_counter = 129128
 
+    def persist_next(self, value):
+        self.next_counter = value
+
     def close(self):
         pass
+
+
+class RetryGmacSession(FakeGmacSession):
+    connect_calls = 0
+
+    def connect(self):
+        type(self).connect_calls += 1
+        if type(self).connect_calls == 1:
+            raise RuntimeError("fresh association temporarily rejected")
+        return super().connect()
 
 
 TRANSPORT = {
@@ -216,6 +232,43 @@ class AuthenticationScanTests(unittest.TestCase):
         )
         self.assertEqual(gmac["status"], "prerequisite_failed")
 
+    def test_gmac_refreshes_counter_and_retries_an_aarq_rejection_once(self):
+        full = parse_config(authentication_scan_mapping())
+        config = full.for_profile(full.profiles[1])
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = FakeSession
+        module.GuruxAuthenticationProbeSession = FakePasswordSession
+        module.GuruxSecureSession = RetryGmacSession
+        RetryGmacSession.connect_calls = 0
+
+        with (
+            patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}),
+            patch.dict(os.environ, {"TEST_DLMS_PASSWORD": "00000000"}),
+            patch("dlms_enum.scanner.acquire_counter_lease", return_value=FakeLease()),
+            patch("dlms_enum.scanner.resolve_secure_keys", return_value=(b"A" * 16, b"B" * 16)),
+        ):
+            result = run_authentication_scan(
+                config,
+                object(),
+                transport=TRANSPORT,
+                meter_identity="METER-1",
+                counter_candidates=(CounterCandidate(1, "0.0.43.1.1.255", 2, 10),),
+                progress=lambda _event: None,
+            )
+
+        gmac = next(
+            item
+            for item in result["authentication_scan"]["results"]
+            if item["mechanism"] == "high_gmac"
+        )
+        self.assertEqual(gmac["status"], "authenticated")
+        self.assertEqual(gmac["attempt_count"], 2)
+        self.assertEqual(
+            [item["status"] for item in gmac["attempts"]],
+            ["rejected", "authenticated"],
+        )
+        self.assertEqual(len(gmac["counter_refreshes"]), 2)
+
     def test_role_by_mechanism_matrix_renders_in_markdown_and_terminal(self):
         records = {
             "client4": {"status": "authenticated"},
@@ -244,24 +297,30 @@ class AuthenticationScanTests(unittest.TestCase):
         self.assertIn("client4", output.getvalue())
         self.assertIn("HIGH_GMAC", output.getvalue())
 
-    def test_live_ui_prints_each_authentication_attempt_and_result(self):
+    def test_live_ui_reuses_one_progress_line_for_authentication(self):
         output = io.StringIO()
         ui = ScanUI(Console(file=output, color_system=None, width=120))
         ui.progress(
             {
                 "phase": "authentication_scan_attempt",
+                "sequence": 1,
+                "total": 7,
                 "message": "Testing client4 / client 4 / HIGH_GMAC",
             }
         )
         ui.progress(
             {
                 "phase": "authentication_scan_result",
+                "sequence": 1,
+                "total": 7,
                 "status": "rejected",
                 "message": "client4 / client 4 / HIGH_GMAC: rejected",
             }
         )
-        self.assertIn("Testing client4 / client 4 / HIGH_GMAC", output.getvalue())
+        ui.close()
+        self.assertNotIn("Testing client4 / client 4 / HIGH_GMAC\n", output.getvalue())
         self.assertIn("rejected", output.getvalue())
+        self.assertIn("1/7", output.getvalue())
 
 
 if __name__ == "__main__":

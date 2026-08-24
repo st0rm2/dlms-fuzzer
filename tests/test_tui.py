@@ -89,7 +89,7 @@ class ScanUITests(unittest.TestCase):
         )
 
         rendered = output.getvalue()
-        self.assertIn("Scan", rendered)
+        self.assertIn("Opening DLMS association", rendered)
         self.assertIn("Retry Invocation Counter", rendered)
         self.assertIn("Attempt 0x00000000 as invocation counter", rendered)
         self.assertIn("Attempt 0x12345678 as invocation counter", rendered)

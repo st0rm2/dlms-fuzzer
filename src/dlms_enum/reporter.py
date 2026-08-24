@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,96 @@ def _hex_value(raw_value: Any) -> str:
     if isinstance(raw_value, float) and math.isfinite(raw_value):
         return raw_value.hex()
     return "—"
+
+
+def _profile_buffer_value(
+    obj: dict[str, Any], attribute: dict[str, Any]
+) -> list[Any] | None:
+    if int(obj.get("class_id", -1)) != 7 or int(
+        attribute.get("attribute_id", -1)
+    ) != 2:
+        return None
+    if attribute.get("outcome") != Outcome.SUCCESS.value:
+        return None
+    decoded = attribute.get("decoded", {})
+    value = decoded.get("value") if isinstance(decoded, dict) else None
+    return value if isinstance(value, list) else None
+
+
+def _profile_row_columns(rows: list[Any]) -> list[str]:
+    width = max(
+        (
+            len(row) if isinstance(row, (list, tuple)) else 1
+            for row in rows
+        ),
+        default=0,
+    )
+    if width == 0:
+        return []
+    if width == 1:
+        return ["Value"]
+    first_values = [
+        row[0]
+        for row in rows[:10]
+        if isinstance(row, (list, tuple)) and row
+    ]
+    timestamped = bool(first_values) and sum(
+        bool(
+            re.search(
+                r"(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}:\d{2})",
+                _compact_value(value),
+            )
+        )
+        for value in first_values
+    ) >= max(1, len(first_values) // 2)
+    if timestamped:
+        return ["Timestamp", "Event / description"] + [
+            f"Value {index}" for index in range(3, width + 1)
+        ]
+    return [f"Value {index}" for index in range(1, width + 1)]
+
+
+def _render_profile_buffers(profile: dict[str, Any]) -> list[str]:
+    sections: list[str] = []
+    for obj in profile.get("objects", []):
+        for attribute in obj.get("attributes", []):
+            rows = _profile_buffer_value(obj, attribute)
+            if rows is None:
+                continue
+            columns = _profile_row_columns(rows)
+            sections.extend(
+                [
+                    "#### {} (`{}`)".format(
+                        _markdown(obj.get("description") or "Profile Generic"),
+                        _markdown(obj.get("logical_name", "—")),
+                    ),
+                    "",
+                    f"{len(rows)} row(s), decoded after complete DLMS block reassembly.",
+                    "",
+                ]
+            )
+            if not columns:
+                sections.extend(["The buffer is empty.", ""])
+                continue
+            sections.extend(
+                [
+                    "| " + " | ".join(columns) + " |",
+                    "|" + "---|" * len(columns),
+                ]
+            )
+            for row in rows:
+                values = list(row) if isinstance(row, (list, tuple)) else [row]
+                values.extend([None] * (len(columns) - len(values)))
+                sections.append(
+                    "| "
+                    + " | ".join(
+                        _markdown(_compact_value(value, limit=240))
+                        for value in values[: len(columns)]
+                    )
+                    + " |"
+                )
+            sections.append("")
+    return sections
 
 
 def _protected_traffic_entries(path: str | Path) -> list[dict[str, Any]]:
@@ -302,6 +393,7 @@ def render_summary_report(
                 f"| Objects | {_markdown(summary.get('objects', 0))} |",
                 f"| Scan scope | {_markdown(_scan_scope_label(scan_scope))} |",
                 f"| Association View objects | {_markdown(scan_scope.get('association_view_objects', profile.get('association_view_object_count', '—')))} |",
+                f"| Association View source | {_markdown(report.get('association_view', {}).get('mode', profile.get('association_view_source', 'live')))} |",
                 f"| GET results | {_markdown(summary.get('get_success', 0))} successful / {_markdown(summary.get('get_failed', 0))} failed / {_markdown(summary.get('get_inconclusive', 0))} inconclusive |",
                 f"| GET transmissions | {_markdown(summary.get('get_transmissions', 0))} |",
                 f"| GET-with-list | {_markdown(list_label)} |",
@@ -330,6 +422,47 @@ def render_summary_report(
                 ]
             )
         lines.append("")
+
+        view_comparison = report.get("association_view", {}).get("comparison")
+        if isinstance(view_comparison, dict):
+            lines.extend(
+                [
+                    "### Association View comparison",
+                    "",
+                    "Result: **{}** — {} added, {} removed, {} changed object(s).".format(
+                        "match" if view_comparison.get("matches") else "changed",
+                        len(view_comparison.get("added", [])),
+                        len(view_comparison.get("removed", [])),
+                        len(view_comparison.get("changed", [])),
+                    ),
+                    "",
+                ]
+            )
+            differences = [
+                (label, item)
+                for key, label in (
+                    ("added", "Added on meter"),
+                    ("removed", "Missing from meter"),
+                    ("changed", "Version/access changed"),
+                )
+                for item in view_comparison.get(key, [])
+            ]
+            if differences:
+                lines.extend(
+                    [
+                        "| Difference | Class | Logical name |",
+                        "|---|---:|---|",
+                    ]
+                )
+                for label, item in differences:
+                    lines.append(
+                        "| {} | {} | {} |".format(
+                            _markdown(label),
+                            _markdown(item.get("class_id", "—")),
+                            _markdown(item.get("logical_name", "—")),
+                        )
+                    )
+                lines.append("")
 
         advertised_associations = authentication_enumeration.get(
             "advertised_associations", []
@@ -441,6 +574,18 @@ def render_summary_report(
                 lines.append(f"| {_markdown(key)} | {_markdown(_compact_value(value))} |")
             lines.append("")
 
+        profile_buffers = _render_profile_buffers(profile)
+        if profile_buffers:
+            lines.extend(
+                [
+                    "### Profile Generic logs and rows",
+                    "",
+                    "Rows from multi-block responses are shown after the complete response has been reassembled. The canonical values remain in `report.json`.",
+                    "",
+                    *profile_buffers,
+                ]
+            )
+
         lines.extend(
             [
                 "### Decoded OBIS values",
@@ -464,6 +609,10 @@ def render_summary_report(
                 decoded = attribute.get("decoded", {})
                 value = decoded.get("value") if isinstance(decoded, dict) else None
                 raw = decoded.get("raw_value") if isinstance(decoded, dict) else None
+                profile_rows = _profile_buffer_value(obj, attribute)
+                if profile_rows is not None:
+                    value = f"{len(profile_rows)} rows — see Profile Generic table above"
+                    raw = None
                 result = attribute.get("outcome") or attribute.get("lifecycle") or "not scanned"
                 encrypted = encrypted_rx.get(
                     (
@@ -473,6 +622,11 @@ def render_summary_report(
                     ),
                     [],
                 )
+                encrypted_display = "<br>".join(encrypted) if encrypted else "—"
+                if profile_rows is not None and encrypted:
+                    encrypted_display = (
+                        f"{len(encrypted)} protected response fragment(s) — see traffic.jsonl"
+                    )
                 lines.append(
                     "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
                         _markdown(obj.get("logical_name", "—")),
@@ -481,7 +635,7 @@ def render_summary_report(
                         _markdown(attribute.get("name") or "—"),
                         _markdown(_compact_value(value)),
                         _markdown(_hex_value(raw)),
-                        _markdown("<br>".join(encrypted) if encrypted else "—"),
+                        _markdown(encrypted_display),
                         _markdown(result),
                     )
                 )

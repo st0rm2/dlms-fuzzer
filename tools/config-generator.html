@@ -271,6 +271,7 @@
   const quoted = (value) => JSON.stringify(String(value));
   const checked = (id) => byId(id).checked;
   const value = (id) => byId(id).value.trim();
+  const rawValue = (id) => byId(id).value;
 
   function integer(id, label, minimum, maximum) {
     const raw = value(id);
@@ -295,12 +296,19 @@
   }
 
   function inlinePassword(secret, label) {
-    const length = new TextEncoder().encode(secret).length;
-    if (length < 1 || length > 64) {
-      throw new Error(`${label} must encode to between 1 and 64 bytes.`);
-    }
-    if (/^hex:/i.test(secret) && (!/^hex:(?:[0-9a-fA-F]{2})+$/.test(secret))) {
-      throw new Error(`${label} has an invalid hex: value.`);
+    if (/^hex:/i.test(secret)) {
+      if (!/^hex:(?:[0-9a-fA-F]{2})+$/.test(secret)) {
+        throw new Error(`${label} has an invalid hex: value.`);
+      }
+      const decodedLength = (secret.length - 4) / 2;
+      if (decodedLength < 1 || decodedLength > 64) {
+        throw new Error(`${label} must decode to between 1 and 64 bytes.`);
+      }
+    } else {
+      const encodedLength = new TextEncoder().encode(secret).length;
+      if (encodedLength < 1 || encodedLength > 64) {
+        throw new Error(`${label} must encode to between 1 and 64 bytes.`);
+      }
     }
     return secret;
   }
@@ -316,7 +324,7 @@
 
   function passwordSource(sourceId, secretId, label) {
     const source = value(sourceId);
-    const secret = value(secretId);
+    const secret = source === "inline" ? rawValue(secretId) : value(secretId);
     return source === "env"
       ? `env: ${quoted(environmentName(secret, label + " variable"))}`
       : `inline: ${quoted(inlinePassword(secret, label))}`;
@@ -325,13 +333,16 @@
   function buildYaml() {
     const profiles = [];
     const roles = new Set();
+    const publicClientAddress = integer(
+      "public-client", "Public client address", 1, 16383
+    );
 
     if (checked("public-enabled")) {
       roles.add("public");
       profiles.push([
         "  - name: public",
         "    role: public",
-        `    client_address: ${integer("public-client", "Public client address", 1, 16383)}`
+        `    client_address: ${publicClientAddress}`
       ].join("\n"));
     }
 
@@ -343,6 +354,7 @@
         "  - name: lls",
         `    role: ${quoted(roleName)}`,
         `    client_address: ${integer("lls-client", "LLS client address", 1, 16383)}`,
+        `    public_client_address: ${publicClientAddress}`,
         "    authentication:",
         "      mechanism: low",
         `      password: {${passwordSource("lls-source", "lls-secret", "LLS password")}}`
@@ -379,6 +391,7 @@
         `      gak: ${gak}`,
         `      guek: ${guek}`,
         "    invocation_counter:",
+        `      public_client_address: ${publicClientAddress}`,
         `      logical_name: ${quoted(obis)}`
       ].join("\n"));
     }

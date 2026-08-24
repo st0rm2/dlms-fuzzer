@@ -64,7 +64,11 @@ fresh associations for every selected role. The configured password is shared
 by the password probes; each secure role keeps its own system title, keys, and
 counter state. HIGH-GMAC is reported as a prerequisite failure for roles without
 those secure credentials. Results distinguish an AARQ rejection from a completed
-HLS challenge. HIGH-ECDSA is listed as unsupported because this release has no
+HLS challenge. Immediately before HIGH-GMAC, the tool refreshes that role's
+public invocation-counter object. If the meter rejects the first secure AARQ,
+the tool refreshes the counter again and makes one monotonic retry; an accepted
+AARQ with a failed HLS challenge is not retried. HIGH-ECDSA is listed as
+unsupported because this release has no
 signing-key/certificate credential support. A rejected mechanism does not stop
 the remaining probes.
 
@@ -131,11 +135,25 @@ python -m dlms_enum scan --config meter-public.yaml --short
 python -m dlms_enum scan --config meter-public.yaml --full
 python -m dlms_enum scan --config meter-public.yaml --get-limit 100
 python -m dlms_enum scan --config meter-profiles.yaml --roles public,client1 --get-limit 100
+python -m dlms_enum scan --config meter-profiles.yaml --association-view-mode reuse
+python -m dlms_enum scan --config meter-profiles.yaml --association-view-mode compare
 ```
 
-`--get-limit 100` tests exactly the first 100 mapped GET capabilities while retaining every other GET, SET, and ACTION capability in the report as `NOT_TESTED`. In a secure scan, the same limit also caps the optional cross-profile public GET test. For unattended configuration-driven runs, use `scan.get_limit: 100`; the older object-based short scope remains available as `scan.object_limit: 10`. The two limits are mutually exclusive. If neither limit nor a command-line switch is supplied and standard input is not an interactive terminal, the default remains a full scan.
+`--get-limit 100` tests exactly 100 mapped GET capabilities while retaining every other GET, SET, and ACTION capability in the report as `NOT_TESTED`. Association and authentication metadata are prioritized, and—when advertised and the budget permits—one likely event-log Profile Generic buffer is reserved within that same budget so block-transfer decoding and row rendering are exercised without selecting every potentially large profile. In a secure scan, the same limit also caps the optional cross-profile public GET test. For unattended configuration-driven runs, use `scan.get_limit: 100`; the older object-based short scope remains available as `scan.object_limit: 10`. The two limits are mutually exclusive. If neither limit nor a command-line switch is supplied and standard input is not an interactive terminal, the default remains a full scan.
 
 When the public preflight reports the negotiated `multiple_references` conformance bit, an interactive run offers GET-with-list batching. The operator chooses a maximum from 1 through 10 attributes; the effective size is additionally reduced to fit the negotiated PDU. Scaler and unit attributes remain ahead of their value attribute. If a list request is rejected, malformed, or contains an item error, the whole list is retried as individual GETs so every attribute keeps an independent outcome. For unattended runs, set `scan.batch_size`; its safe default is `1` (disabled).
+
+Every successful role scan exports `association-view.json`, containing object
+identities, interface versions, and advertised attribute/method rights. It does
+not contain read values or credentials. Interactive setup can save this view in
+the local state directory, keyed separately by serial device and role. On a
+later run choose `reuse` to skip the potentially long, multi-block Association
+View download, `live` to read it normally, or `compare` to read it and report
+added, removed, and access-changed objects. For unattended runs use
+`--association-view-mode live|reuse|compare`; add `--save-association-view` to
+update the reusable snapshot after a live read. A reused view is inventory
+metadata, so its Association LN object-list GET is reported as `NOT_TESTED`, not
+as a new meter response.
 
 Secure scan:
 
@@ -210,7 +228,7 @@ profiles:
       logical_name: 0.0.43.1.1.255
 ```
 
-The public preflight always runs, even when the public role is not selected for a full scan. For every selected secure role, the operator sees its SAP and system title together with the full list of validated public-readable unsigned counter candidates, the configured counter object, and its decoded current value. The operator can accept it, select another candidate, enter an OBIS from that list, redisplay the list, or abort. The chosen mapping affects only the runtime configuration; the source YAML is not rewritten. Immediately before the secure association, the counter is read again and combined with crash-safe local state as described below.
+The public preflight always runs, even when the public role is not selected for a full scan. For every selected secure role, the operator sees its SAP and system title together with a numbered list of validated public-readable unsigned counter candidates and their decoded current values. A single prompt accepts either a displayed row number or an arbitrary six-part counter-object logical name, then asks for confirmation. An unlisted logical name is clearly marked as operator-supplied and is attempted with a direct public read before secure association. The chosen mapping affects only the runtime configuration; the source YAML is not rewritten. Immediately before the secure association, the counter is read again and combined with crash-safe local state as described below.
 
 After confirming each secure role's counter source, an interactive run optionally offers a two-request invocation-counter reuse diagnostic (default: no). This laboratory check runs after the other scan tests and replays `0x00000000` plus the first counter actually transmitted in that secure session against a small Association LN GET. If that first counter is also zero, the second transmitted counter is used instead. After a rejected replay, the tool sends one protected GET with the next persisted safe counter on the existing association. If that recovery GET fails, it attempts a protected release, always sends HDLC DISC, resets all local HDLC state, and reconnects with a fresh Gurux client. A meter-side AARQ rejection is retried once after `invocation_counter.recovery_wait_ms` (default: 60000 ms); a meter-specific reset or administrative unlock is never attempted automatically. The persistent counter is never rolled back. Any accepted replay is reported explicitly; timeouts and protocol errors retain their individual outcomes.
 
@@ -364,6 +382,11 @@ Each run gets a UTC-named directory under `./runs` unless overridden:
 
 - `report.json` contains the selected endpoint, addressing type, redacted effective configuration, active, probed, and Association-LN-advertised authentication mechanisms, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, optional public cross-profile findings, a complete per-role GET/SET/ACTION capability matrix, cleanup warnings, and a traffic-file hash. Each matrix row is `SUCCESS`, a normalized failure category, or `NOT_TESTED`.
 - `summary.md` is the human-readable report. It contains connection and role details, a decoded OBIS table, the public cross-profile access findings when enabled, and the complete operation capability matrix. In secure scans the decoded table places the encrypted RX payload immediately to the right of the encoded value; only ciphertext is shown, without HDLC framing, security control, invocation counter, authentication tag, or CRC. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent. The separate protected-APDU table retains command, counter, ciphertext, and authentication-tag evidence.
+- `association-view.json` is the portable per-role inventory snapshot. Profile
+  Generic buffers that arrive across multiple DLMS blocks are reassembled before
+  reporting; `summary.md` renders them as row-preserving tables with timestamp
+  and event/description-oriented columns while `report.json` retains canonical
+  decoded values.
 - `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators. The reusable LLS password is never written as decoded data, and the raw LLS AARQ is omitted because it contains that password.
 - When `authentication_scan.enabled` is true, `authentication-report.json`,
   `authentication-summary.md`, and `authentication-traffic.jsonl` are written at
@@ -375,9 +398,11 @@ GET uses at most two attempts. Explicit DLMS errors such as access denied are no
 
 During a scan, the terminal uses one Rich progress display rather than printing every request on a new line. Once the Association View is known, it shows the completed/total readable attributes and replaces the current action in place, for example `GET 1.0.1.8.0.255 class 3 attribute 2 attempt 1`.
 
-The terminal announces every normal role and its enabled phases. During the final
-authentication scan it prints every attempt and outcome explicitly, for example
-`Testing client4 / client 4 / HIGH_GMAC`, before rendering the combined matrix.
+The terminal announces every normal role and its enabled phases. Each completed
+role is summarized in a highlighted status panel with endpoint, Association View
+source, GET outcomes, passive SET/ACTION findings, Profile Generic row counts,
+and artifact paths. The final authentication scan advances one progress line
+instead of printing every attempt, then renders a colored combined matrix.
 
 Gurux internally labels Suite 0 security-control bit `0x20` as “Encryption is applied” and bit `0x10` as “Authentication is applied.” Together they form the configured `0x30` authentication-and-encryption policy. Those repeated low-level diagnostics are suppressed. They did not indicate two additional operations: encryption protects confidentiality, while authentication is the AES-GCM integrity/authenticity tag. A successfully decoded protected response means Gurux verified that tag; tag failure is reported as a scan error.
 

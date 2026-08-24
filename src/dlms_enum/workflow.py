@@ -33,7 +33,7 @@ class CounterCandidate:
     class_id: int
     logical_name: str
     attribute_id: int
-    value: int
+    value: int | None
     description: str | None = None
     source: str = "public_association_view"
 

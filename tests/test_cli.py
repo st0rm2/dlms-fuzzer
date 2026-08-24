@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +22,109 @@ class NullLogger:
 
 
 class CliWorkflowTests(unittest.TestCase):
+    def test_live_association_export_updates_report_snapshot_timestamp(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "profiles": [{"name": "public", "role": "public"}],
+            }
+        )
+        preflight = PublicPreflight(
+            transport={
+                "device": "/dev/null",
+                "selected_baudrate": 9600,
+                "selected_server_address": 1,
+                "selected_server_logical_address": 0,
+                "selected_server_physical_address": 1,
+                "server_address_size": 1,
+                "server_addressing_type": "1-byte addressing",
+            },
+            association={"negotiated_conformance": ["get"]},
+            meter_identity="METER-1",
+            association_view_objects=1,
+            counter_candidates=(),
+        )
+        args = argparse.Namespace(
+            config=Path("meter.yaml"),
+            roles=None,
+            short=False,
+            full=True,
+            get_limit=None,
+            association_view_mode="live",
+            save_association_view=False,
+        )
+        written = []
+
+        def fake_scan(runtime_config, *_args, **_kwargs):
+            return {
+                "run": {"id": "public", "status": "completed"},
+                "effective_configuration": runtime_config.redacted_dict(),
+                "transport": {
+                    "device": "/dev/null",
+                    "selected_server_address": 1,
+                },
+                "profiles": [
+                    {
+                        "name": "public",
+                        "type": "public",
+                        "association": {"client_address": 16},
+                        "objects": [
+                            {
+                                "class_id": 1,
+                                "logical_name": "0.0.96.1.0.255",
+                                "object_version": 0,
+                                "description": "Serial number",
+                                "discovery_sources": ["association_view"],
+                                "attributes": [],
+                                "methods": [],
+                            }
+                        ],
+                        "summary": {},
+                    }
+                ],
+                "errors": [],
+                "association_view": {
+                    "mode": "live",
+                    "source": "meter",
+                    "snapshot_saved_at": None,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_directory = Path(directory) / "run"
+            run_directory.mkdir()
+            cache_path = Path(directory) / "cache.json"
+            with (
+                patch("dlms_enum.cli.load_config", return_value=config),
+                patch("dlms_enum.cli._run_directory", return_value=run_directory),
+                patch("dlms_enum.cli.default_cache_path", return_value=cache_path),
+                patch("dlms_enum.cli.TrafficLogger", NullLogger),
+                patch("dlms_enum.cli.run_public_preflight", return_value=preflight),
+                patch("dlms_enum.cli.scan", side_effect=fake_scan),
+                patch("dlms_enum.cli.ScanUI.summary"),
+                patch(
+                    "dlms_enum.cli.write_report",
+                    side_effect=lambda report, path, *_args: written.append(
+                        (path.name, report)
+                    ),
+                ),
+            ):
+                status = _scan(
+                    args,
+                    Console(file=io.StringIO(), color_system=None),
+                )
+
+            exported = json.loads(
+                (run_directory / "association-view.json").read_text()
+            )
+
+        role_report = next(report for name, report in written if name == "report.json")
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            role_report["association_view"]["snapshot_saved_at"],
+            exported["saved_at"],
+        )
+
     def test_unselected_public_role_still_drives_preflight_and_pins_secure_scan(self):
         config = parse_config(
             {

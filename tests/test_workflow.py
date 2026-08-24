@@ -213,7 +213,10 @@ class WorkflowTests(unittest.TestCase):
         )
         console = Console(file=io.StringIO(), color_system=None)
 
-        with patch("dlms_enum.tui.Prompt.ask", return_value="yes"):
+        with (
+            patch("dlms_enum.tui.Prompt.ask", return_value="1") as prompt,
+            patch("dlms_enum.tui.Confirm.ask", return_value=True) as confirm,
+        ):
             chosen = verify_counter_source(
                 select_counter_source(profile, candidate, meter_identity="METER-1"),
                 preflight,
@@ -229,6 +232,40 @@ class WorkflowTests(unittest.TestCase):
         rendered = console.file.getvalue()
         self.assertIn("Public-readable unsigned counter candidates", rendered)
         self.assertIn(candidate.logical_name, rendered)
+        self.assertIn("Decoded current value: 900", rendered)
+        self.assertNotIn("manual", rendered)
+        prompt.assert_called_once()
+        self.assertNotIn("choices", prompt.call_args.kwargs)
+        confirm.assert_called_once()
+
+    def test_counter_selection_accepts_unlisted_logical_name_after_confirmation(self):
+        config = multi_role_config()
+        profile = config.profiles[1]
+        self.assertIsInstance(profile, SecureProfile)
+        preflight = PublicPreflight(
+            transport={},
+            association={},
+            meter_identity="METER-1",
+            association_view_objects=0,
+            counter_candidates=(),
+        )
+        console = Console(file=io.StringIO(), color_system=None)
+
+        with (
+            patch(
+                "dlms_enum.tui.Prompt.ask",
+                return_value="0.0.43.1.99.255",
+            ),
+            patch("dlms_enum.tui.Confirm.ask", return_value=True),
+        ):
+            chosen = verify_counter_source(profile, preflight, console)
+
+        updated = select_counter_source(profile, chosen, meter_identity="METER-1")
+        self.assertEqual(chosen.value, None)
+        self.assertEqual(chosen.source, "operator_supplied")
+        self.assertEqual(updated.invocation_counter.logical_name, "0.0.43.1.99.255")
+        self.assertIn("No public-readable counter candidates", console.file.getvalue())
+        self.assertIn("not read during preflight", console.file.getvalue())
 
     def test_counter_reuse_prompt_defaults_to_no(self):
         profile = multi_role_config().profiles[1]

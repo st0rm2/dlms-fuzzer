@@ -700,6 +700,54 @@ def _discover_association_view(
     return objects, attempts, last_error
 
 
+def _objects_from_association_snapshot(
+    session: Any, snapshot: dict[str, Any]
+) -> tuple[list[Any], dict[tuple[int, str], dict[int, dict[str, Any]]]]:
+    """Rebuild Gurux objects and access metadata from a saved view."""
+
+    objects: list[Any] = []
+    advertised: dict[tuple[int, str], dict[int, dict[str, Any]]] = {}
+    association_version = next(
+        (
+            int(item.get("object_version", 0))
+            for item in snapshot.get("objects", [])
+            if int(item.get("class_id", -1)) == 15
+            and item.get("logical_name") == "0.0.40.0.0.255"
+        ),
+        2,
+    )
+    for item in snapshot.get("objects", []):
+        class_id = int(item["class_id"])
+        logical_name = str(item["logical_name"])
+        target = session.create_object(class_id, logical_name)
+        target.version = int(item.get("object_version", 0))
+        target.description = str(item.get("description", "") or "")
+        rights_by_attribute: dict[int, dict[str, Any]] = {}
+        for attribute in item.get("attributes", []):
+            attribute_id = int(attribute["attribute_id"])
+            rights = dict(attribute.get("access_rights", {}))
+            rights_by_attribute[attribute_id] = rights
+            raw = rights.get("raw")
+            if raw is not None:
+                setter_name = "setAccess3" if association_version >= 3 else "setAccess"
+                setter = getattr(target, setter_name, None)
+                if callable(setter):
+                    setter(attribute_id, int(raw))
+        for method in item.get("methods", []):
+            method_id = int(method["method_id"])
+            raw = method.get("access_rights", {}).get("raw")
+            if raw is not None:
+                setter_name = (
+                    "setMethodAccess3" if association_version >= 3 else "setMethodAccess"
+                )
+                setter = getattr(target, setter_name, None)
+                if callable(setter):
+                    setter(method_id, int(raw))
+        objects.append(target)
+        advertised[(class_id, logical_name)] = rights_by_attribute
+    return objects, advertised
+
+
 def _public_access_rights(
     objects: list[Any],
 ) -> tuple[set[tuple[int, str]], dict[tuple[tuple[int, str], int], dict[str, Any]]]:
@@ -1117,7 +1165,8 @@ def run_authentication_scan(
         ("high_sha1", Authentication.HIGH_SHA1),
         ("high_sha256", Authentication.HIGH_SHA256),
     )
-    for mechanism, authentication in mechanisms:
+    authentication_probe_total = len(mechanisms) + 1
+    for sequence, (mechanism, authentication) in enumerate(mechanisms, 1):
         display_name = AUTHENTICATION_DISPLAY_NAMES[mechanism]
         progress(
             {
@@ -1125,6 +1174,8 @@ def run_authentication_scan(
                 "role": profile.role,
                 "client_address": profile.client_address,
                 "mechanism": mechanism,
+                "sequence": sequence,
+                "total": authentication_probe_total,
                 "message": (
                     f"Testing {profile.role} / client {profile.client_address} / "
                     f"{display_name}"
@@ -1181,6 +1232,8 @@ def run_authentication_scan(
                 "client_address": profile.client_address,
                 "mechanism": mechanism,
                 "status": result["status"],
+                "sequence": sequence,
+                "total": authentication_probe_total,
                 "message": (
                     f"{profile.role} / client {profile.client_address} / "
                     f"{display_name}: {result['status']}"
@@ -1194,6 +1247,8 @@ def run_authentication_scan(
             "role": profile.role,
             "client_address": profile.client_address,
             "mechanism": "high_gmac",
+            "sequence": authentication_probe_total,
+            "total": authentication_probe_total,
             "message": (
                 f"Testing {profile.role} / client {profile.client_address} / "
                 f"{AUTHENTICATION_DISPLAY_NAMES['high_gmac']}"
@@ -1202,11 +1257,60 @@ def run_authentication_scan(
     )
     gmac_session = None
     counter_lease = None
+    counter_refreshes: list[dict[str, Any]] = []
+    gmac_attempts: list[dict[str, Any]] = []
+
+    def refresh_meter_counter() -> int | None:
+        if not isinstance(profile, SecureProfile):
+            return None
+        refresh_session = None
+        progress(
+            {
+                "phase": "authentication_counter_refresh",
+                "role": profile.role,
+                "message": (
+                    f"Refreshing the public invocation counter for {profile.role}"
+                ),
+            }
+        )
+        try:
+            refresh_session = GuruxSession(
+                config,
+                baudrate,
+                traffic,
+                client_address=profile.invocation_counter.public_client_address,
+                profile_name=f"{profile.role}_counter_refresh",
+                **endpoint,
+            )
+            refresh_session.connect()
+            value = refresh_session.read_invocation_counter(profile)
+            counter_refreshes.append({"status": "success", "value": value})
+            return value
+        except Exception as exc:
+            counter_refreshes.append(
+                {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            return None
+        finally:
+            if refresh_session is not None:
+                _record_cleanup_warnings(
+                    report,
+                    refresh_session.close(),
+                    phase="authentication_counter_refresh_finalization",
+                )
+
     try:
         if not isinstance(profile, SecureProfile):
             raise RuntimeError(
                 "HIGH_GMAC requires an hls_gmac_suite0 role with system title and keys"
             )
+        refreshed_counter = refresh_meter_counter()
+        if refreshed_counter is not None:
+            meter_counter = refreshed_counter
+            counter_error = None
         if counter_error is not None and profile.invocation_counter.unsafe_override is None:
             raise RuntimeError(
                 "public invocation-counter bootstrap failed; high_gmac cannot be tested"
@@ -1228,20 +1332,68 @@ def run_authentication_scan(
             unsafe_override=profile.invocation_counter.unsafe_override,
         )
         gak, guek = resolve_secure_keys(profile)
-        gmac_session = GuruxSecureSession(
-            config,
-            baudrate,
-            traffic,
-            counter_lease,
-            gak,
-            guek,
-            **endpoint,
-        )
-        association = gmac_session.connect()
+        association = None
+        gmac_error = None
+        for attempt in (1, 2):
+            if attempt > 1:
+                progress(
+                    {
+                        "phase": "authentication_scan_retry",
+                        "role": profile.role,
+                        "mechanism": "high_gmac",
+                        "attempt": attempt,
+                        "message": (
+                            f"Retrying {profile.role} HLS-GMAC with a freshly "
+                            "bootstrapped counter"
+                        ),
+                    }
+                )
+            gmac_session = GuruxSecureSession(
+                config,
+                baudrate,
+                traffic,
+                counter_lease,
+                gak,
+                guek,
+                **endpoint,
+            )
+            try:
+                association = gmac_session.connect()
+            except Exception as exc:
+                gmac_error = exc
+                aarq_accepted = bool(getattr(gmac_session, "aarq_accepted", False))
+                gmac_attempts.append(
+                    {
+                        "attempt": attempt,
+                        "status": (
+                            "hls_validation_failed" if aarq_accepted else "rejected"
+                        ),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                if aarq_accepted or attempt == 2:
+                    break
+                _record_cleanup_warnings(
+                    report,
+                    gmac_session.close(),
+                    phase="authentication_scan_high_gmac_retry_finalization",
+                )
+                gmac_session = None
+                refreshed_counter = refresh_meter_counter()
+                if refreshed_counter is not None:
+                    counter_lease.persist_next(
+                        max(counter_lease.next_counter, refreshed_counter + 1)
+                    )
+            else:
+                gmac_attempts.append(
+                    {"attempt": attempt, "status": "authenticated", "error": None}
+                )
+                break
         gmac_result = _authentication_probe_record(
             "high_gmac",
             session=gmac_session,
             association=association,
+            error=gmac_error if association is None else None,
             security_policy="authentication_encryption",
         )
     except Exception as exc:
@@ -1261,6 +1413,9 @@ def run_authentication_scan(
             )
         if counter_lease is not None:
             counter_lease.close()
+    gmac_result["attempt_count"] = len(gmac_attempts)
+    gmac_result["attempts"] = gmac_attempts
+    gmac_result["counter_refreshes"] = counter_refreshes
     results.append(gmac_result)
     progress(
         {
@@ -1269,6 +1424,8 @@ def run_authentication_scan(
             "client_address": profile.client_address,
             "mechanism": "high_gmac",
             "status": gmac_result["status"],
+            "sequence": authentication_probe_total,
+            "total": authentication_probe_total,
             "message": (
                 f"{profile.role} / client {profile.client_address} / "
                 f"{AUTHENTICATION_DISPLAY_NAMES['high_gmac']}: "
@@ -1307,12 +1464,18 @@ def scan_public(
     *,
     progress: ProgressCallback | None = None,
     invocation_counter_reuse_test: bool = False,
+    association_view_mode: str = "live",
+    association_view_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the configured public, LLS, or secure read-only scan."""
 
     progress = progress or (lambda _: None)
     started_at = utc_now()
     run_id = started_at.replace("-", "").replace(":", "").replace(".", "")
+    if association_view_mode not in {"live", "reuse", "compare"}:
+        raise ValueError("association_view_mode must be live, reuse, or compare")
+    if association_view_mode in {"reuse", "compare"} and association_view_snapshot is None:
+        raise ValueError(f"Association View mode {association_view_mode!r} requires a snapshot")
     report: dict[str, Any] = {
         "schema_version": 1,
         "tool": {"name": "dlms-enum", "version": __version__},
@@ -1334,6 +1497,15 @@ def scan_public(
             "enumeration_response_timeout_ms": config.scan.enumeration_timeout_ms,
         },
         "profiles": [],
+        "association_view": {
+            "mode": association_view_mode,
+            "source": "saved_snapshot" if association_view_mode == "reuse" else "meter",
+            "snapshot_saved_at": (
+                association_view_snapshot.get("saved_at")
+                if association_view_snapshot is not None
+                else None
+            ),
+        },
         "capability_matrix": [],
         "public_union_test": {
             "enabled": config.scan.union_profile_test,
@@ -1350,6 +1522,7 @@ def scan_public(
     public_objects: set[tuple[int, str]] | None = None
     public_capabilities: dict[tuple[tuple[int, str], int], dict[str, Any]] | None = None
     union_candidates: list[dict[str, Any]] | None = None
+    cached_access: dict[tuple[int, str], dict[int, dict[str, Any]]] = {}
 
     try:
         progress({"phase": "scan_start"})
@@ -1607,16 +1780,29 @@ def scan_public(
                 "status": "not_requested",
             }
 
-        progress({"phase": "association_view", "message": "Reading Association LN object list"})
-        objects, association_view_attempts, discovery_error = _discover_association_view(
-            session,
-            config,
-            report,
-            progress,
-            error_phase=f"{profile_name}_reconnaissance",
-        )
-        if discovery_error is not None:
-            raise RuntimeError(f"association-view discovery failed: {discovery_error}")
+        if association_view_mode == "reuse":
+            progress(
+                {
+                    "phase": "association_view",
+                    "message": "Loading saved Association View; meter download skipped",
+                }
+            )
+            objects, cached_access = _objects_from_association_snapshot(
+                session, association_view_snapshot or {}
+            )
+            association_view_attempts = 0
+            discovery_error = None
+        else:
+            progress({"phase": "association_view", "message": "Reading Association LN object list"})
+            objects, association_view_attempts, discovery_error = _discover_association_view(
+                session,
+                config,
+                report,
+                progress,
+                error_phase=f"{profile_name}_reconnaissance",
+            )
+            if discovery_error is not None:
+                raise RuntimeError(f"association-view discovery failed: {discovery_error}")
 
         enumeration_timeout_applied = _set_session_timeout(
             session, config.scan.enumeration_timeout_ms
@@ -1640,7 +1826,11 @@ def scan_public(
             inventory[key] = {
                 "target": target,
                 "sources": {"association_view"},
-                "attributes": _advertised_attributes(target, version),
+                "attributes": (
+                    cached_access.get(key, {})
+                    if association_view_mode == "reuse"
+                    else _advertised_attributes(target, version)
+                ),
             }
 
         if config.scan.common_catalogue:
@@ -1699,7 +1889,10 @@ def scan_public(
         ]
         testable_get_capabilities = list(all_get_capabilities)
         association_view_get = ((15, "0.0.40.0.0.255"), 2)
-        if association_view_get in testable_get_capabilities:
+        if association_view_mode == "reuse":
+            if association_view_get in testable_get_capabilities:
+                testable_get_capabilities.remove(association_view_get)
+        elif association_view_get in testable_get_capabilities:
             testable_get_capabilities.remove(association_view_get)
             testable_get_capabilities.insert(0, association_view_get)
         # Read the associated-partners and authentication-mechanism attributes
@@ -1717,6 +1910,49 @@ def scan_public(
                 1 if association_view_get in testable_get_capabilities else 0,
                 capability,
             )
+
+        # A class-7 buffer is otherwise typically thousands of capabilities
+        # into a large Association View. Reserve one short-test slot for a
+        # likely event log so block-transfer decoding and row rendering are
+        # exercised without adding to the operator's GET budget or downloading
+        # every potentially large profile buffer.
+        prioritized_profile_buffer = None
+        if config.scan.get_limit is not None:
+            profile_buffers = [
+                capability
+                for capability in testable_get_capabilities
+                if capability[0][0] == 7 and capability[1] == 2
+            ]
+            if profile_buffers:
+                prioritized_profile_buffer = next(
+                    (
+                        capability
+                        for capability in profile_buffers
+                        if "event" in str(
+                            getattr(
+                                inventory[capability[0]]["target"],
+                                "description",
+                                "",
+                            )
+                        ).lower()
+                        or "log" in str(
+                            getattr(
+                                inventory[capability[0]]["target"],
+                                "description",
+                                "",
+                            )
+                        ).lower()
+                    ),
+                    profile_buffers[0],
+                )
+                testable_get_capabilities.remove(prioritized_profile_buffer)
+                priority_index = (
+                    (1 if association_view_get in testable_get_capabilities else 0)
+                    + len(authentication_capabilities)
+                )
+                testable_get_capabilities.insert(
+                    priority_index, prioritized_profile_buffer
+                )
 
         if config.scan.object_limit is not None:
             selected_inventory_items = association_order_items[: config.scan.object_limit]
@@ -1776,6 +2012,12 @@ def scan_public(
             selected_get_capabilities = set(testable_get_capabilities)
             selected_object_keys = {key for key, _ in all_items}
 
+        if association_view_mode == "reuse":
+            # The saved object list is inventory evidence, not a fresh GET.
+            # This also covers object-limited scans, whose selection is built
+            # directly from inventory rather than from testable capabilities.
+            selected_get_capabilities.discard(association_view_get)
+
         planned_attributes = len(selected_get_capabilities)
         progress(
             {
@@ -1796,6 +2038,9 @@ def scan_public(
             "identification": {},
             "association_view_object_count": len(objects),
             "association_view_attempt_count": association_view_attempts,
+            "association_view_source": (
+                "saved_snapshot" if association_view_mode == "reuse" else "meter"
+            ),
             "scan_scope": {
                 "short_test": (
                     config.scan.object_limit is not None
@@ -1810,6 +2055,15 @@ def scan_public(
                 "mapped_gets": len(all_get_capabilities),
                 "testable_gets": len(testable_get_capabilities),
                 "selected_gets": len(selected_get_capabilities),
+                "prioritized_profile_buffer": (
+                    {
+                        "class_id": prioritized_profile_buffer[0][0],
+                        "logical_name": prioritized_profile_buffer[0][1],
+                        "attribute_id": prioritized_profile_buffer[1],
+                    }
+                    if prioritized_profile_buffer in selected_get_capabilities
+                    else None
+                ),
                 "get_with_list": {
                     "requested_batch_size": config.scan.batch_size,
                     "negotiated": "multiple_references"
@@ -2284,6 +2538,23 @@ def scan_public(
                     bool(method.get("access_rights", {}).get("action"))
                     for obj in object_records
                     for method in obj.get("methods", [])
+                ),
+                "profile_buffers_read": sum(
+                    int(obj.get("class_id", -1)) == 7
+                    and attribute.get("attribute_id") == 2
+                    and attribute.get("outcome") == Outcome.SUCCESS.value
+                    and isinstance(attribute.get("decoded", {}).get("value"), list)
+                    for obj in object_records
+                    for attribute in obj.get("attributes", [])
+                ),
+                "profile_rows_read": sum(
+                    len(attribute.get("decoded", {}).get("value", []))
+                    for obj in object_records
+                    for attribute in obj.get("attributes", [])
+                    if int(obj.get("class_id", -1)) == 7
+                    and attribute.get("attribute_id") == 2
+                    and attribute.get("outcome") == Outcome.SUCCESS.value
+                    and isinstance(attribute.get("decoded", {}).get("value"), list)
                 ),
             }
         )

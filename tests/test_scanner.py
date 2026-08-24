@@ -98,6 +98,12 @@ class ManyObject(FakeObject):
         self.logicalName = f"1.0.{index}.8.0.255"
 
 
+class EventLogObject(FakeObject):
+    objectType = 7
+    logicalName = "0.0.99.98.0.255"
+    description = "Event log"
+
+
 class LimitedSession(FakeSession):
     read_objects = []
 
@@ -106,6 +112,20 @@ class LimitedSession(FakeSession):
 
     def read_attribute(self, target, attribute_id, attempt):
         self.read_objects.append((target.logicalName, attribute_id))
+        return {"value": target.logicalName, "dlms_data_type": "visible_string"}
+
+
+class ProfilePrioritySession(LimitedSession):
+    def discover_objects(self, attempt):
+        return [ManyObject(index) for index in range(1, 13)] + [EventLogObject()]
+
+    def read_attribute(self, target, attribute_id, attempt):
+        self.read_objects.append((target.logicalName, attribute_id))
+        if target.objectType == 7 and attribute_id == 2:
+            return {
+                "value": [["2026-08-24T11:45:00Z", 42]],
+                "dlms_data_type": "array",
+            }
         return {"value": target.logicalName, "dlms_data_type": "visible_string"}
 
 
@@ -231,7 +251,97 @@ class WritableSession(FakeSession):
         return {"value": "decoded", "dlms_data_type": "visible_string"}
 
 
+class SnapshotObject(FakeObject):
+    def __init__(self, class_id, logical_name):
+        self.objectType = class_id
+        self.logicalName = logical_name
+        self.version = 2 if class_id == 15 else 0
+        self.description = ""
+        self.attributes = []
+        self.methodAttributes = []
+
+    def setAccess(self, index, access):
+        self.attributes.append(Attribute(index))
+
+    def setMethodAccess(self, index, access):
+        self.methodAttributes.append(Method(index, access))
+
+
+class ReusedViewSession(FakeSession):
+    read_objects = []
+
+    def discover_objects(self, attempt):
+        raise AssertionError("saved Association View must skip meter discovery")
+
+    def create_object(self, class_id, logical_name):
+        return SnapshotObject(class_id, logical_name)
+
+    def read_attribute(self, target, attribute_id, attempt):
+        self.read_objects.append((target.objectType, target.logicalName, attribute_id))
+        return {"value": "decoded", "dlms_data_type": "visible_string"}
+
+
 class ScannerTests(unittest.TestCase):
+    def test_saved_association_view_skips_object_list_download(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null", "baudrate": 9600},
+                "scan": {"common_catalogue": False},
+            }
+        )
+        snapshot = {
+            "saved_at": "2026-08-24T10:00:00Z",
+            "objects": [
+                {
+                    "class_id": 15,
+                    "logical_name": "0.0.40.0.0.255",
+                    "object_version": 2,
+                    "attributes": [
+                        {"attribute_id": 2, "access_rights": {"read": True, "raw": 1}}
+                    ],
+                    "methods": [],
+                },
+                {
+                    "class_id": 1,
+                    "logical_name": "0.0.96.1.0.255",
+                    "object_version": 0,
+                    "attributes": [
+                        {"attribute_id": 2, "access_rights": {"read": True, "raw": 1}}
+                    ],
+                    "methods": [],
+                },
+            ],
+        }
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = ReusedViewSession
+        ReusedViewSession.read_objects = []
+        previous = sys.modules.get("dlms_enum.gurux_adapter")
+        sys.modules["dlms_enum.gurux_adapter"] = module
+        try:
+            report = scan_public(
+                config,
+                object(),
+                association_view_mode="reuse",
+                association_view_snapshot=snapshot,
+            )
+        finally:
+            if previous is None:
+                sys.modules.pop("dlms_enum.gurux_adapter", None)
+            else:
+                sys.modules["dlms_enum.gurux_adapter"] = previous
+
+        profile = report["profiles"][0]
+        self.assertEqual(profile["association_view_attempt_count"], 0)
+        self.assertEqual(profile["association_view_source"], "saved_snapshot")
+        self.assertNotIn(
+            (15, "0.0.40.0.0.255", 2), ReusedViewSession.read_objects
+        )
+        association_object = next(
+            item for item in profile["objects"] if item["class_id"] == 15
+        )
+        association_attribute = association_object["attributes"][0]
+        self.assertEqual(association_attribute["outcome"], "NOT_TESTED")
+
     def test_serial_permission_message_recommends_device_group(self):
         device_stat = types.SimpleNamespace(st_mode=0o20660, st_uid=0, st_gid=986)
         group = types.SimpleNamespace(gr_name="uucp")
@@ -590,6 +700,40 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(
             sum(row["profiles"]["public"]["tested"] for row in get_rows),
             5,
+        )
+
+    def test_get_limit_reserves_one_slot_for_an_event_log_buffer(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {"common_catalogue": False, "get_limit": 5},
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = ProfilePrioritySession
+        ProfilePrioritySession.read_objects = []
+
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        profile = report["profiles"][0]
+        self.assertEqual(len(ProfilePrioritySession.read_objects), 5)
+        self.assertIn(
+            ("0.0.99.98.0.255", 2), ProfilePrioritySession.read_objects
+        )
+        self.assertEqual(profile["summary"]["profile_buffers_read"], 1)
+        self.assertEqual(profile["summary"]["profile_rows_read"], 1)
+        self.assertEqual(
+            profile["scan_scope"]["prioritized_profile_buffer"],
+            {
+                "class_id": 7,
+                "logical_name": "0.0.99.98.0.255",
+                "attribute_id": 2,
+            },
         )
 
     def test_get_with_list_batches_in_attribute_order(self):

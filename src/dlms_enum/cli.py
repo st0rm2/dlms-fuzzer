@@ -9,10 +9,19 @@ import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.prompt import Confirm
 
+from .association_view import (
+    compare_snapshots,
+    default_cache_path,
+    load_snapshot,
+    snapshot_from_report,
+    validate_snapshot,
+    write_snapshot,
+)
 from .catalogues import COMMON_OBIS
 from .config import (
     ConfigError,
@@ -32,6 +41,7 @@ from .scanner import (
 from .traffic_logger import TrafficLogger
 from .tui import (
     ScanUI,
+    choose_association_view_mode,
     choose_read_plan,
     choose_invocation_counter_reuse_test,
     interactive_config,
@@ -56,6 +66,19 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument(
         "--roles",
         help="comma-separated configured roles to scan; defaults to all roles",
+    )
+    scan_parser.add_argument(
+        "--association-view-mode",
+        choices=("live", "reuse", "compare"),
+        help=(
+            "read the meter view, reuse the saved per-device/role view, or compare "
+            "a fresh view with the saved one"
+        ),
+    )
+    scan_parser.add_argument(
+        "--save-association-view",
+        action="store_true",
+        help="update the reusable per-device/role Association View after a live read",
     )
     scope = scan_parser.add_mutually_exclusive_group()
     scope.add_argument(
@@ -216,13 +239,13 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 else False
             )
             continue
-        if not preflight.counter_candidates:
-            raise RuntimeError(
-                f"role {profile.role} has no public-readable invocation-counter candidate"
-            )
         if interactive:
             candidate = verify_counter_source(profile, preflight, console)
         else:
+            if not preflight.counter_candidates:
+                raise RuntimeError(
+                    f"role {profile.role} has no public-readable invocation-counter candidate"
+                )
             candidate = configured_candidate
             if candidate is None:
                 raise RuntimeError(
@@ -237,7 +260,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             {
                 "role": profile.role,
                 **candidate.as_dict(),
-                "live_read_validated": True,
+                "live_read_validated": candidate.value is not None,
                 "operator_verified": interactive,
             }
         )
@@ -257,6 +280,53 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 args.short or args.full or args.get_limit is not None
             ),
         )
+    association_view_plans: dict[str, dict[str, Any]] = {}
+    for profile in config.profiles:
+        cache_path = default_cache_path(config.transport.device, profile.role)
+        snapshot = None
+        if cache_path.exists():
+            try:
+                snapshot = load_snapshot(cache_path)
+                validate_snapshot(
+                    snapshot,
+                    device=config.transport.device,
+                    role=profile.role,
+                    client_address=profile.client_address,
+                    meter_identity=preflight.meter_identity,
+                    profile=profile.name,
+                )
+            except (OSError, ValueError) as exc:
+                if getattr(args, "association_view_mode", None) in {"reuse", "compare"}:
+                    raise RuntimeError(f"Cannot use {cache_path}: {exc}") from exc
+                console.print(
+                    f"[yellow]Ignoring incompatible Association View cache for "
+                    f"{profile.role}:[/yellow] {exc}"
+                )
+                snapshot = None
+        requested_view_mode = getattr(args, "association_view_mode", None)
+        if requested_view_mode is not None:
+            mode = requested_view_mode
+            if mode in {"reuse", "compare"} and snapshot is None:
+                raise RuntimeError(
+                    f"Association View mode {mode!r} requires a saved view for "
+                    f"device {config.transport.device} and role {profile.role}"
+                )
+            save = bool(
+                getattr(args, "save_association_view", False)
+                and mode in {"live", "compare"}
+            )
+        elif interactive:
+            mode, save = choose_association_view_mode(
+                role=profile.role, snapshot=snapshot, console=console
+            )
+        else:
+            mode, save = "live", bool(getattr(args, "save_association_view", False))
+        association_view_plans[profile.role] = {
+            "mode": mode,
+            "save": save,
+            "snapshot": snapshot,
+            "cache_path": cache_path,
+        }
     if interactive and not Confirm.ask(
         "Start the selected READ-only scans", default=True, console=console
     ):
@@ -277,10 +347,16 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         used_directory_names.add(directory_name)
         role_directory_names[profile.role] = directory_name
     for profile in config.profiles:
+        view_plan = association_view_plans[profile.role]
         console.rule(f"Normal scan — {profile.role}")
+        view_phase = {
+            "live": "fresh Association View",
+            "reuse": "saved Association View",
+            "compare": "fresh + saved-view comparison",
+        }[view_plan["mode"]]
         console.print(
-            f"Profile: {profile.name} | Client SAP: {profile.client_address} | "
-            "phases: association, Association View, GET enumeration"
+            f"[bold]{profile.name}[/bold]  •  client [bold cyan]{profile.client_address}[/bold cyan]  •  "
+            f"association  •  {view_phase}  •  GET enumeration"
             + (
                 ", invocation-counter replay diagnostic"
                 if counter_reuse_tests.get(profile.role, False)
@@ -306,6 +382,8 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 invocation_counter_reuse_test=counter_reuse_tests.get(
                     profile.role, False
                 ),
+                association_view_mode=view_plan["mode"],
+                association_view_snapshot=view_plan["snapshot"],
             )
         finally:
             role_ui.close()
@@ -320,9 +398,44 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 profile.role, False
             ),
         }
+        association_export_path = role_directory / "association-view.json"
+        exported_snapshot = (
+            view_plan["snapshot"] if view_plan["mode"] == "reuse" else None
+        )
+        if view_plan["mode"] != "reuse" and report.get("profiles"):
+            try:
+                exported_snapshot = snapshot_from_report(report)
+            except ValueError:
+                # Failed scans and lightweight test doubles may not have reached
+                # Association View discovery, so there is nothing useful to export.
+                exported_snapshot = None
+        view_report = report.setdefault(
+            "association_view",
+            {"mode": view_plan["mode"], "source": "meter"},
+        )
+        if exported_snapshot is not None:
+            write_snapshot(exported_snapshot, association_export_path)
+            view_report["snapshot_saved_at"] = exported_snapshot.get("saved_at")
+            if view_plan["mode"] == "compare":
+                view_report["comparison"] = compare_snapshots(
+                    view_plan["snapshot"], exported_snapshot
+                )
+            if view_plan["save"]:
+                write_snapshot(exported_snapshot, view_plan["cache_path"])
+        view_report.update(
+            {
+                "export_file": (
+                    association_export_path.name
+                    if exported_snapshot is not None
+                    else None
+                ),
+                "cache_file": str(view_plan["cache_path"]),
+                "cache_updated": bool(view_plan["save"] and exported_snapshot),
+            }
+        )
         write_report(report, report_path, traffic_path, summary_path)
         role_ui.summary(
-            summary_lines(report),
+            report,
             report_path.resolve(),
             traffic_path.resolve(),
             summary_path.resolve(),
@@ -336,6 +449,12 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 "status": status,
                 "directory": str(role_directory.relative_to(run_directory) or "."),
                 "report": str(report_path.relative_to(run_directory)),
+                "association_view": (
+                    str(association_export_path.relative_to(run_directory))
+                    if exported_snapshot is not None
+                    else None
+                ),
+                "association_view_mode": view_plan["mode"],
             }
         )
 

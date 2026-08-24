@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.panel import Panel
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -24,6 +25,40 @@ from rich.table import Table
 
 from .config import AppConfig, ProfileConfig, SecureProfile, dump_config, parse_config
 from .workflow import CounterCandidate, PublicPreflight
+
+
+def choose_association_view_mode(
+    *, role: str, snapshot: dict[str, Any] | None, console: Console | None = None
+) -> tuple[str, bool]:
+    """Choose whether to download, reuse, or compare an Association View."""
+
+    console = console or Console()
+    console.rule(f"Association View — {role}")
+    if snapshot is None:
+        console.print(
+            "No reusable view exists for this device and role; the meter view will be read."
+        )
+        save = Confirm.ask(
+            "Save the discovered view for future scans", default=True, console=console
+        )
+        return "live", save
+    console.print(
+        "Saved: [cyan]{}[/cyan]  Objects: [bold]{}[/bold]".format(
+            snapshot.get("saved_at", "unknown"), snapshot.get("object_count", "—")
+        )
+    )
+    mode = Prompt.ask(
+        "Association View source",
+        choices=("reuse", "live", "compare"),
+        default="reuse",
+        console=console,
+    )
+    save = mode in {"live", "compare"} and Confirm.ask(
+        "Replace the reusable view with this fresh result",
+        default=False,
+        console=console,
+    )
+    return mode, save
 
 
 class ScanUI:
@@ -86,8 +121,7 @@ class ScanUI:
             self.error(message or "Scan failed")
             return
         if phase == "scan_start":
-            self.close()
-            self.console.rule("Scan")
+            self._update(stage="Setup", description="Opening DLMS association")
             return
         if phase == "invocation_counter_reuse_start":
             self.close()
@@ -109,13 +143,25 @@ class ScanUI:
             self.console.print(message)
             return
         if phase == "authentication_scan_attempt":
-            self.close()
-            self.console.print(f"[cyan]→[/cyan] {message}")
+            sequence = int(event.get("sequence", 1))
+            self._update(
+                stage="Auth scan",
+                description=message,
+                total=int(event.get("total", sequence)),
+                completed=max(0, sequence - 1),
+            )
             return
         if phase == "authentication_scan_result":
             status = str(event.get("status", "unknown"))
-            style = "green" if status == "authenticated" else "yellow"
-            self.console.print(f"[{style}]← {message}[/{style}]")
+            self._update(
+                stage="Auth scan",
+                description=f"{message}",
+                total=int(event.get("total", event.get("sequence", 1))),
+                completed=int(event.get("sequence", 1)),
+            )
+            return
+        if phase in {"authentication_counter_refresh", "authentication_scan_retry"}:
+            self._update(stage="Auth scan", description=message)
             return
         if phase == "baud_detection":
             self._update(
@@ -219,19 +265,94 @@ class ScanUI:
 
     def summary(
         self,
-        lines: list[str],
+        report: dict[str, Any],
         report_path: Path,
         traffic_path: Path,
         summary_path: Path | None = None,
     ) -> None:
         self.close()
-        self.console.rule("DLMS scan summary")
-        for line in lines:
-            self.console.print(line)
+        run = report.get("run", {})
+        profile = (report.get("profiles") or [{}])[0]
+        summary = profile.get("summary", {})
+        association = profile.get("association", {})
+        transport = report.get("transport", {})
+        status = str(run.get("status", "unknown"))
+        status_style = {
+            "completed": "bold green",
+            "completed_with_errors": "bold yellow",
+            "failed": "bold red",
+            "interrupted": "bold yellow",
+        }.get(status, "bold white")
+        title = (
+            f"[bold]{profile.get('name', 'DLMS scan')}[/bold]  "
+            f"[{status_style}]{status.replace('_', ' ').upper()}[/{status_style}]"
+        )
+        table = Table.grid(padding=(0, 2), expand=True)
+        table.add_column(style="bold cyan", no_wrap=True)
+        table.add_column()
+        table.add_row(
+            "Endpoint",
+            f"client {association.get('client_address', '—')}  •  "
+            f"server {transport.get('selected_server_address', '—')}  •  "
+            f"{transport.get('selected_baudrate', '—')} baud  •  "
+            f"{transport.get('server_addressing_type', 'unknown addressing')}",
+        )
+        view = report.get("association_view", {})
+        view_label = str(view.get("mode", "live"))
+        comparison = view.get("comparison")
+        if isinstance(comparison, dict):
+            view_label += (
+                " • [green]matches saved view[/green]"
+                if comparison.get("matches")
+                else " • [yellow]{} added / {} removed / {} changed[/yellow]".format(
+                    len(comparison.get("added", [])),
+                    len(comparison.get("removed", [])),
+                    len(comparison.get("changed", [])),
+                )
+            )
+        table.add_row(
+            "Association View",
+            f"{view_label}  •  {summary.get('association_view_objects', 0)} objects",
+        )
+        table.add_row(
+            "GET results",
+            "[bold green]{} succeeded[/bold green]  •  "
+            "[bold yellow]{} failed[/bold yellow]  •  {} inconclusive  •  {} not tested".format(
+                summary.get("get_success", 0),
+                summary.get("get_failed", 0),
+                summary.get("get_inconclusive", 0),
+                summary.get("get_not_tested", 0),
+            ),
+        )
+        table.add_row(
+            "Passive findings",
+            f"{summary.get('advertised_set_attributes', 0)} SET attributes  •  "
+            f"{summary.get('advertised_action_methods', 0)} ACTION methods  "
+            "[dim](not executed)[/dim]",
+        )
+        if summary.get("profile_buffers_read", 0):
+            table.add_row(
+                "Profile data",
+                f"[bold]{summary.get('profile_rows_read', 0)} rows[/bold] from "
+                f"{summary.get('profile_buffers_read', 0)} buffers",
+            )
+        errors = len(report.get("errors", []))
+        if errors:
+            table.add_row("Warnings", f"[yellow]{errors} recorded; see the readable report[/yellow]")
+        self.console.print(Panel(table, title=title, border_style=status_style.split()[-1]))
+
+        artifacts = Table.grid(padding=(0, 2))
+        artifacts.add_column(style="bold")
+        artifacts.add_column(style="green")
         if summary_path is not None:
-            self.console.print(f"Readable report: [green]{summary_path}[/green]")
-        self.console.print(f"Full JSON: [green]{report_path}[/green]")
-        self.console.print(f"Traffic: [green]{traffic_path}[/green]")
+            artifacts.add_row("Readable report", str(summary_path))
+        artifacts.add_row("Full JSON", str(report_path))
+        artifacts.add_row("Traffic", str(traffic_path))
+        if view.get("export_file"):
+            artifacts.add_row(
+                "Association View", str(report_path.parent / view["export_file"])
+            )
+        self.console.print(artifacts)
 
 
 def select_roles(
@@ -270,25 +391,30 @@ def show_public_preflight(
     console = console or Console()
     transport = preflight.transport
     association = preflight.association
-    console.rule("Public preflight")
-    console.print(f"Meter identity: {preflight.meter_identity or 'unavailable'}")
-    console.print(f"Serial interface: {transport['device']}")
-    console.print(f"Baud rate: {transport['selected_baudrate']}")
-    console.print(
-        f"Server: {transport['selected_server_address']} "
-        f"({transport['server_addressing_type']})"
+    details = Table.grid(padding=(0, 2), expand=True)
+    details.add_column(style="bold cyan", no_wrap=True)
+    details.add_column()
+    details.add_row("Meter", preflight.meter_identity or "[yellow]unavailable[/yellow]")
+    details.add_row(
+        "Serial link",
+        f"{transport['device']}  •  [bold]{transport['selected_baudrate']} baud[/bold]",
     )
-    console.print(
-        "Server components: logical {} / physical {}".format(
-            transport["selected_server_logical_address"],
-            transport["selected_server_physical_address"],
-        )
+    details.add_row(
+        "HDLC endpoint",
+        f"server {transport['selected_server_address']}  •  "
+        f"logical {transport['selected_server_logical_address']} / "
+        f"physical {transport['selected_server_physical_address']}  •  "
+        f"{transport['server_addressing_type']}",
     )
-    console.print(f"DLMS version: {association.get('dlms_version', 'unknown')}")
-    console.print(f"Maximum PDU: {association.get('max_receive_pdu_size', 'unknown')}")
-    console.print(f"Public objects: {preflight.association_view_objects}")
+    details.add_row(
+        "DLMS",
+        f"version {association.get('dlms_version', 'unknown')}  •  "
+        f"max PDU {association.get('max_receive_pdu_size', 'unknown')}  •  "
+        f"[bold]{preflight.association_view_objects} public objects[/bold]",
+    )
     conformance = association.get("negotiated_conformance", [])
-    console.print("Conformance: " + (", ".join(conformance) or "not reported"))
+    details.add_row("Conformance", ", ".join(conformance) or "not reported")
+    console.print(Panel(details, title="[bold]Public preflight[/bold]", border_style="green"))
 
 
 def show_authentication_matrix(
@@ -299,7 +425,11 @@ def show_authentication_matrix(
     console = console or Console()
     matrix = report.get("authentication_matrix", {})
     roles = matrix.get("roles", [])
-    table = Table(title="Authentication result matrix")
+    table = Table(
+        title="Authentication result matrix",
+        caption="Authenticated = complete association (including HLS validation)",
+        show_lines=False,
+    )
     table.add_column("Mechanism")
     for role in roles:
         table.add_column(
@@ -310,11 +440,23 @@ def show_authentication_matrix(
         display_name = row.get("display_name") or str(
             row.get("mechanism", "unknown")
         ).upper()
+        status_styles = {
+            "authenticated": "bold green",
+            "rejected": "yellow",
+            "hls_validation_failed": "bold red",
+            "prerequisite_failed": "magenta",
+            "unsupported": "dim",
+        }
+        statuses = [
+            str(row.get("roles", {}).get(role["role"], {}).get("status", "—"))
+            for role in roles
+        ]
         table.add_row(
             str(display_name),
             *[
-                str(row.get("roles", {}).get(role["role"], {}).get("status", "—"))
-                for role in roles
+                f"[{status_styles.get(status, 'white')}]{status.replace('_', ' ')}"
+                f"[/{status_styles.get(status, 'white')}]"
+                for status in statuses
             ],
         )
     console.print(table)
@@ -329,15 +471,28 @@ def _counter_table(candidates: tuple[CounterCandidate, ...]) -> Table:
     table.add_column("Current value", justify="right")
     table.add_column("Description")
     for index, item in enumerate(candidates, 1):
+        current_value = (
+            f"{item.value} (0x{item.value:08X})"
+            if item.value is not None
+            else "not read"
+        )
         table.add_row(
             str(index),
             str(item.class_id),
             item.logical_name,
             str(item.attribute_id),
-            f"{item.value} (0x{item.value:08X})",
+            current_value,
             item.description or "",
         )
     return table
+
+
+def _counter_logical_name(value: str) -> str | None:
+    parts = value.split(".")
+    if len(parts) != 6 or any(not part.isdigit() for part in parts):
+        return None
+    octets = tuple(int(part) for part in parts)
+    return value if all(0 <= part <= 0xFF for part in octets) else None
 
 
 def verify_counter_source(
@@ -345,74 +500,94 @@ def verify_counter_source(
     preflight: PublicPreflight,
     console: Console | None = None,
 ) -> CounterCandidate:
-    """Require the operator to confirm a public counter source for one role."""
+    """Select a listed counter by number or accept an operator-supplied source."""
 
     console = console or Console()
     candidates = preflight.counter_candidates
     configured = profile.invocation_counter
-    selected = next(
+    console.rule(f"Invocation counter — {profile.role}")
+    console.print(f"Client SAP: {profile.client_address}")
+    console.print(
+        "Client system title: " + profile.client_system_title.hex().upper()
+    )
+    if candidates:
+        console.print(_counter_table(candidates))
+    else:
+        console.print(
+            "[yellow]No public-readable counter candidates were found. Enter a "
+            "counter-object logical name to attempt a direct public read.[/yellow]"
+        )
+    configured_index = next(
         (
-            item
-            for item in candidates
+            index
+            for index, item in enumerate(candidates, 1)
             if item.class_id == configured.class_id
             and item.logical_name == configured.logical_name
             and item.attribute_id == configured.attribute_id
         ),
         None,
     )
-    console.rule(f"Invocation counter — {profile.role}")
-    console.print(f"Client SAP: {profile.client_address}")
-    console.print(
-        "Client system title: " + profile.client_system_title.hex().upper()
-    )
-    if not candidates:
-        raise RuntimeError(
-            f"no public-readable unsigned counter candidates were found for role {profile.role}"
-        )
-    console.print(_counter_table(candidates))
     while True:
-        if selected is not None:
+        answer = Prompt.ask(
+            "Select candidate number or enter an invocation-counter logical name",
+            default=(
+                str(configured_index)
+                if configured_index is not None
+                else configured.logical_name
+            ),
+            console=console,
+        ).strip()
+        selected: CounterCandidate | None = None
+        if answer.isdigit():
+            number = int(answer)
+            if 1 <= number <= len(candidates):
+                selected = candidates[number - 1]
+            else:
+                console.print(
+                    f"[red]Candidate number must be from 1 to {len(candidates)}.[/red]"
+                )
+                continue
+        else:
+            logical_name = _counter_logical_name(answer)
+            if logical_name is None:
+                console.print(
+                    "[red]Enter a displayed candidate number or a valid six-part "
+                    "logical name.[/red]"
+                )
+                continue
+            selected = next(
+                (item for item in candidates if item.logical_name == logical_name),
+                CounterCandidate(
+                    class_id=1,
+                    logical_name=logical_name,
+                    attribute_id=2,
+                    value=None,
+                    description="Operator-supplied counter object",
+                    source="operator_supplied",
+                ),
+            )
+
+        if selected.value is not None:
             console.print(
-                f"Candidate: class {selected.class_id}, {selected.logical_name}, "
+                f"Selected: class {selected.class_id}, {selected.logical_name}, "
                 f"attribute {selected.attribute_id}"
             )
             console.print(
                 f"Decoded current value: {selected.value} (0x{selected.value:08X})"
             )
-            choice = Prompt.ask(
-                "Use this invocation-counter object?",
-                choices=("yes", "list", "manual", "abort"),
-                default="yes",
-                console=console,
-            )
-            if choice == "yes":
-                return selected
-            if choice == "abort":
-                raise KeyboardInterrupt
         else:
-            choice = "select"
-
-        if choice == "list":
-            console.print(_counter_table(candidates))
-        if choice == "manual":
-            logical_name = Prompt.ask("Logical name", console=console).strip()
-            selected = next(
-                (item for item in candidates if item.logical_name == logical_name),
-                None,
+            console.print(
+                f"Selected operator-supplied object: class {selected.class_id}, "
+                f"{selected.logical_name}, attribute {selected.attribute_id}"
             )
-            if selected is None:
-                console.print(
-                    "[red]That object was not found among the validated public-readable candidates.[/red]"
-                )
-                continue
-        else:
-            number = IntPrompt.ask(
-                "Select candidate", default=1, console=console
+            console.print(
+                "[yellow]This object was not read during preflight. The scan will "
+                "attempt a direct public read before secure association.[/yellow]"
             )
-            if not 1 <= number <= len(candidates):
-                console.print("[red]Candidate number is out of range.[/red]")
-                continue
-            selected = candidates[number - 1]
+        if Confirm.ask(
+            "Use this invocation-counter object", default=True, console=console
+        ):
+            return selected
 
 
 def choose_invocation_counter_reuse_test(
