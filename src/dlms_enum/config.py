@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .catalogues import CANDIDATE_PROVIDERS, CatalogueEntry
+
 DEFAULT_BAUD_RATES = (9600, 19200, 4800, 2400, 1200, 600, 300, 38400, 57600, 115200)
 SECURE_PROFILE_NAME = "hls_gmac_suite0"
 LLS_PROFILE_NAME = "lls"
@@ -53,6 +55,9 @@ class ScanConfig:
     batch_size: int = 1
     enumeration_timeout_ms: int = 1000
     timeout_breaker_threshold: int = 4
+    candidate_providers: tuple[str, ...] = ("common",)
+    candidate_limit: int = 100
+    candidate_objects: tuple[CatalogueEntry, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -184,6 +189,18 @@ class AppConfig:
 
         transport = asdict(self.transport)
         transport["baudrate_candidates"] = list(self.transport.baudrate_candidates)
+        scan = asdict(self.scan)
+        scan["candidate_providers"] = list(self.scan.candidate_providers)
+        scan["common_catalogue"] = "common" in self.scan.candidate_providers
+        scan["candidate_objects"] = [
+            {
+                "class_id": entry.class_id,
+                "logical_name": entry.logical_name,
+                "attributes": list(entry.attributes),
+                "description": entry.description,
+            }
+            for entry in self.scan.candidate_objects
+        ]
         profiles: list[dict[str, Any]] = []
         for configured_profile in self.profiles:
             profile: dict[str, Any] = {
@@ -243,7 +260,7 @@ class AppConfig:
         return {
             "version": self.version,
             "transport": transport,
-            "scan": asdict(self.scan),
+            "scan": scan,
             "authentication_scan": authentication_scan,
             "profiles": profiles,
             "output": asdict(self.output),
@@ -334,6 +351,7 @@ def _parse_scan(raw: Any) -> ScanConfig:
             "mode", "total_get_attempts", "association_view_first", "common_catalogue",
             "union_profile_test", "object_limit", "get_limit",
             "batch_size", "enumeration_timeout_ms", "timeout_breaker_threshold",
+            "candidate_providers", "candidate_limit", "candidate_objects",
         },
         "scan",
     )
@@ -372,6 +390,73 @@ def _parse_scan(raw: Any) -> ScanConfig:
         3,
         10,
     )
+    providers_raw = data.get("candidate_providers")
+    if providers_raw is None:
+        candidate_providers = (
+            ("common",) if boolean_values["common_catalogue"] else ()
+        )
+    else:
+        if not isinstance(providers_raw, (list, tuple)):
+            raise ConfigError("scan.candidate_providers must be a list")
+        candidate_providers = tuple(str(item).strip().lower() for item in providers_raw)
+        unknown_providers = sorted(set(candidate_providers) - set(CANDIDATE_PROVIDERS))
+        if unknown_providers:
+            raise ConfigError(
+                "scan.candidate_providers contains unknown providers: "
+                + ", ".join(unknown_providers)
+            )
+        if len(set(candidate_providers)) != len(candidate_providers):
+            raise ConfigError("scan.candidate_providers must not contain duplicates")
+        if not boolean_values["common_catalogue"] and "common" in candidate_providers:
+            raise ConfigError(
+                "scan.common_catalogue: false conflicts with candidate provider common"
+            )
+    candidate_limit = _integer(
+        data.get("candidate_limit", 100), "scan.candidate_limit", 1, 10_000
+    )
+    candidate_objects_raw = data.get("candidate_objects", [])
+    if not isinstance(candidate_objects_raw, (list, tuple)):
+        raise ConfigError("scan.candidate_objects must be a list")
+    candidate_objects: list[CatalogueEntry] = []
+    for index, raw_candidate in enumerate(candidate_objects_raw):
+        label = f"scan.candidate_objects[{index}]"
+        candidate = _mapping(raw_candidate, label)
+        _only_keys(
+            candidate,
+            {"class_id", "logical_name", "attributes", "description"},
+            label,
+        )
+        class_id = _integer(candidate.get("class_id"), f"{label}.class_id", 1, 65_535)
+        logical_name = candidate.get("logical_name")
+        try:
+            logical_parts = [int(part) for part in str(logical_name).split(".")]
+        except ValueError:
+            logical_parts = []
+        if len(logical_parts) != 6 or any(not 0 <= part <= 255 for part in logical_parts):
+            raise ConfigError(f"{label}.logical_name must be a six-part byte logical name")
+        attributes_raw = candidate.get("attributes")
+        if not isinstance(attributes_raw, (list, tuple)) or not attributes_raw:
+            raise ConfigError(f"{label}.attributes must be a non-empty list")
+        attributes = tuple(
+            _integer(value, f"{label}.attributes[{position}]", 1, 255)
+            for position, value in enumerate(attributes_raw)
+        )
+        if len(set(attributes)) != len(attributes):
+            raise ConfigError(f"{label}.attributes must not contain duplicates")
+        description = candidate.get("description", "User-supplied candidate")
+        if not isinstance(description, str) or not description.strip():
+            raise ConfigError(f"{label}.description must be a non-empty string")
+        candidate_objects.append(
+            CatalogueEntry(
+                class_id,
+                ".".join(str(part) for part in logical_parts),
+                attributes,
+                description.strip(),
+                provider="user",
+                rule="configured_candidate",
+                confidence="operator_supplied",
+            )
+        )
     return ScanConfig(
         total_get_attempts=attempts,
         association_view_first=True,
@@ -382,6 +467,9 @@ def _parse_scan(raw: Any) -> ScanConfig:
         batch_size=batch_size,
         enumeration_timeout_ms=enumeration_timeout_ms,
         timeout_breaker_threshold=timeout_breaker_threshold,
+        candidate_providers=candidate_providers,
+        candidate_limit=candidate_limit,
+        candidate_objects=tuple(candidate_objects),
     )
 
 

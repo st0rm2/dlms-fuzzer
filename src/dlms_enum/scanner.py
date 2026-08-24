@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .catalogues import COMMON_OBIS
+from .catalogues import bounded_candidates
 from .config import (
     AppConfig,
     LlsProfile,
@@ -22,6 +22,7 @@ from .config import (
 )
 from .counter_state import acquire_counter_lease, counter_identity
 from .result_model import Outcome, classify_exception, enum_name, error_record, utc_now
+from .security_posture import build_security_posture
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 CONSECUTIVE_TIMEOUTS_BEFORE_RETRY_SUPPRESSION = 2
@@ -1833,32 +1834,44 @@ def scan_public(
                 ),
             }
 
-        if config.scan.common_catalogue:
-            for entry in COMMON_OBIS:
-                key = (entry.class_id, entry.logical_name)
-                if key not in inventory:
-                    target = session.create_object(entry.class_id, entry.logical_name)
-                    target.description = entry.description
-                    inventory[key] = {"target": target, "sources": {"common_catalogue"}, "attributes": {}}
-                else:
-                    inventory[key]["sources"].add("common_catalogue")
-                for attribute_id in entry.attributes:
-                    rights = inventory[key]["attributes"].get(attribute_id)
-                    if rights is None:
-                        inventory[key]["attributes"][attribute_id] = {
-                            "advertised": False,
-                            "read": True,
-                            "write": False,
-                            "requires_authentication": False,
-                            "requirements": [],
-                            "mode": "catalogue_probe",
-                            "raw": None,
-                            "catalogue_probe": True,
-                        }
-                    else:
-                        # Preserve the Association View rights while retaining
-                        # the pre-existing, read-only common-catalogue probe.
-                        rights["catalogue_probe"] = True
+        inferred_candidates, candidate_generation = bounded_candidates(
+            config.scan.candidate_providers,
+            config.scan.candidate_objects,
+            config.scan.candidate_limit,
+            excluded_objects=set(inventory),
+        )
+        report["candidate_generation"] = candidate_generation
+        for entry in inferred_candidates:
+            source = (
+                "common_catalogue"
+                if entry.provider == "common"
+                else f"candidate_{entry.provider}"
+            )
+            key = (entry.class_id, entry.logical_name)
+            if key not in inventory:
+                target = session.create_object(entry.class_id, entry.logical_name)
+                target.description = entry.description
+                inventory[key] = {
+                    "target": target,
+                    "sources": {source},
+                    "attributes": {},
+                }
+            for attribute_id in entry.attributes:
+                rights = inventory[key]["attributes"].get(attribute_id)
+                if rights is None:
+                    inventory[key]["attributes"][attribute_id] = {
+                        "advertised": False,
+                        "read": True,
+                        "write": False,
+                        "requires_authentication": False,
+                        "requirements": [],
+                        "mode": "catalogue_probe",
+                        "raw": None,
+                        "catalogue_probe": True,
+                        "candidate_provider": entry.provider,
+                        "candidate_rule": entry.rule,
+                        "candidate_confidence": entry.confidence,
+                    }
 
         association_order_items = list(inventory.items())
         all_items = sorted(inventory.items(), key=lambda pair: pair[0])
@@ -1911,6 +1924,27 @@ def scan_public(
                 capability,
             )
 
+        # Put a small, fixed set of readable Security Setup and Image Transfer
+        # status attributes inside a GET-limited scan. Large transferred-block
+        # bitmaps and all modifying members remain passive only.
+        posture_capabilities = [
+            capability
+            for capability in testable_get_capabilities
+            if (
+                capability[0][0] == 64 and capability[1] in (2, 3, 4, 5)
+            )
+            or (
+                capability[0][0] == 18 and capability[1] in (2, 5, 6)
+            )
+        ][:16]
+        posture_index = (
+            (1 if association_view_get in testable_get_capabilities else 0)
+            + len(authentication_capabilities)
+        )
+        for capability in reversed(posture_capabilities):
+            testable_get_capabilities.remove(capability)
+            testable_get_capabilities.insert(posture_index, capability)
+
         # A class-7 buffer is otherwise typically thousands of capabilities
         # into a large Association View. Reserve one short-test slot for a
         # likely event log so block-transfer decoding and row rendering are
@@ -1949,6 +1983,7 @@ def scan_public(
                 priority_index = (
                     (1 if association_view_get in testable_get_capabilities else 0)
                     + len(authentication_capabilities)
+                    + len(posture_capabilities)
                 )
                 testable_get_capabilities.insert(
                     priority_index, prioritized_profile_buffer
@@ -2064,6 +2099,15 @@ def scan_public(
                     if prioritized_profile_buffer in selected_get_capabilities
                     else None
                 ),
+                "prioritized_posture_gets": [
+                    {
+                        "class_id": capability[0][0],
+                        "logical_name": capability[0][1],
+                        "attribute_id": capability[1],
+                    }
+                    for capability in posture_capabilities
+                    if capability in selected_get_capabilities
+                ],
                 "get_with_list": {
                     "requested_batch_size": config.scan.batch_size,
                     "negotiated": "multiple_references"
@@ -2516,6 +2560,7 @@ def scan_public(
         profile_result["authentication_enumeration"] = _authentication_enumeration(
             object_records, association
         )
+        profile_result["security_posture"] = build_security_posture(profile_result)
         profile_result["summary"].update(
             {
                 "objects": len(object_records),
@@ -2556,6 +2601,15 @@ def scan_public(
                     and attribute.get("outcome") == Outcome.SUCCESS.value
                     and isinstance(attribute.get("decoded", {}).get("value"), list)
                 ),
+                "security_setup_objects": profile_result["security_posture"][
+                    "summary"
+                ]["security_setup_objects"],
+                "image_transfer_objects": profile_result["security_posture"][
+                    "summary"
+                ]["image_transfer_objects"],
+                "security_posture_findings": profile_result["security_posture"][
+                    "summary"
+                ]["high_findings"],
             }
         )
         if config.scan.union_profile_test and union_candidates == []:

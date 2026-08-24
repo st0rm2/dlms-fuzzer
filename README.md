@@ -155,6 +155,51 @@ update the reusable snapshot after a live read. A reused view is inventory
 metadata, so its Association LN object-list GET is reported as `NOT_TESTED`, not
 as a new meter response.
 
+When both a public role and one or more authenticated roles are scanned, the
+tool also writes `capability-comparison.json` and `capability-comparison.md`.
+These files compare the advertised GET, SET, and ACTION permissions for the
+same objects and members. Direct GET results from the optional public
+cross-profile check are attached as separate evidence. The comparison never
+sends SET or ACTION requests, so an advertised permission is not presented as
+proof that a modifying operation would succeed.
+
+Security Setup and Image Transfer objects receive a separate read-only posture
+summary. It shows the values that were safely read, lists advertised
+permissions, and highlights security, key, certificate, or firmware-update
+controls that the public role can apparently modify. This is passive reporting:
+the tool does not try those modifying operations.
+
+Known targets that are absent from the Association View can be tested through
+bounded candidate providers:
+
+```yaml
+scan:
+  common_catalogue: true
+  candidate_providers: [common, security, firmware]
+  candidate_limit: 100
+  get_limit: 500
+```
+
+`common` contains the existing standard OBIS catalogue. `security` adds a
+small set of Security Setup targets and `firmware` adds the standard Image
+Transfer target. Generation is deterministic, duplicate requests are removed,
+and `candidate_limit` caps the total number of generated GET targets. Exact
+vendor targets can be supplied without creating an unbounded address sweep:
+
+```yaml
+scan:
+  candidate_providers: [common]
+  candidate_limit: 40
+  candidate_objects:
+    - class_id: 99
+      logical_name: 0.0.128.0.0.255
+      attributes: [2, 3]
+      description: Vendor status
+```
+
+Reports retain each candidate's provider, rule, and confidence. A definite
+DLMS rejection is kept distinct from a timeout or transport failure.
+
 Secure scan:
 
 ```shell
@@ -387,6 +432,10 @@ Each run gets a UTC-named directory under `./runs` unless overridden:
   reporting; `summary.md` renders them as row-preserving tables with timestamp
   and event/description-oriented columns while `report.json` retains canonical
   decoded values.
+- `capability-comparison.json` and `capability-comparison.md` compare public and
+  authenticated advertised permissions when both kinds of role were scanned.
+  Each role's `report.json` and `summary.md` also include the passive Security
+  Setup/Image Transfer posture and bounded candidate-generation details.
 - `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators. The reusable LLS password is never written as decoded data, and the raw LLS AARQ is omitted because it contains that password.
 - When `authentication_scan.enabled` is true, `authentication-report.json`,
   `authentication-summary.md`, and `authentication-traffic.jsonl` are written at

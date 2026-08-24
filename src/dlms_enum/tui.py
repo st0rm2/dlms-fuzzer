@@ -314,6 +314,23 @@ class ScanUI:
             "Association View",
             f"{view_label}  •  {summary.get('association_view_objects', 0)} objects",
         )
+        candidates = report.get("candidate_generation", {})
+        if candidates:
+            table.add_row(
+                "Known unlisted targets",
+                "{} selected / {} available  •  providers: {}".format(
+                    candidates.get("selected_targets", 0),
+                    candidates.get("available_targets", 0),
+                    ", ".join(candidates.get("providers", [])) or "none",
+                )
+                + (
+                    "  •  {} skipped (already advertised)".format(
+                        candidates.get("excluded_association_targets", 0)
+                    )
+                    if candidates.get("excluded_association_targets", 0)
+                    else ""
+                ),
+            )
         table.add_row(
             "GET results",
             "[bold green]{} succeeded[/bold green]  •  "
@@ -330,6 +347,20 @@ class ScanUI:
             f"{summary.get('advertised_action_methods', 0)} ACTION methods  "
             "[dim](not executed)[/dim]",
         )
+        if summary.get("security_setup_objects", 0) or summary.get(
+            "image_transfer_objects", 0
+        ):
+            posture_findings = int(summary.get("security_posture_findings", 0))
+            table.add_row(
+                "Security posture",
+                f"{summary.get('security_setup_objects', 0)} Security Setup  •  "
+                f"{summary.get('image_transfer_objects', 0)} Image Transfer  •  "
+                + (
+                    f"[bold yellow]{posture_findings} public exposure finding(s)[/bold yellow]"
+                    if posture_findings
+                    else "[green]no broad public control advertised[/green]"
+                ),
+            )
         if summary.get("profile_buffers_read", 0):
             table.add_row(
                 "Profile data",
@@ -459,6 +490,40 @@ def show_authentication_matrix(
                 for status in statuses
             ],
         )
+    console.print(table)
+
+
+def show_capability_comparison(
+    report: dict[str, Any], console: Console | None = None
+) -> None:
+    """Render compact public-versus-authenticated permission totals."""
+
+    console = console or Console()
+    table = Table(
+        title="Public versus authenticated permissions",
+        caption="Advertised rights only; SET and ACTION were not sent",
+    )
+    table.add_column("Role")
+    table.add_column("Operation")
+    table.add_column("Public", justify="right")
+    table.add_column("Authenticated", justify="right")
+    table.add_column("Public broader", justify="right", style="yellow")
+    table.add_column("Authenticated broader", justify="right", style="green")
+    for comparison in report.get("comparisons", []):
+        role = str(comparison.get("authenticated_role", "authenticated"))
+        for index, operation in enumerate(("GET", "SET", "ACTION")):
+            summary = comparison.get("summary", {}).get(operation, {})
+            table.add_row(
+                role if index == 0 else "",
+                operation,
+                str(summary.get("public_advertised", 0)),
+                str(summary.get("authenticated_advertised", 0)),
+                str(summary.get("public_only", 0) + summary.get("public_broader", 0)),
+                str(
+                    summary.get("authenticated_only", 0)
+                    + summary.get("authenticated_broader", 0)
+                ),
+            )
     console.print(table)
 
 

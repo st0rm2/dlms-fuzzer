@@ -281,7 +281,110 @@ class ReusedViewSession(FakeSession):
         return {"value": "decoded", "dlms_data_type": "visible_string"}
 
 
+class CandidateSession(LimitedSession):
+    def discover_objects(self, attempt):
+        return [ManyObject(1)]
+
+    def create_object(self, class_id, logical_name):
+        return SnapshotObject(class_id, logical_name)
+
+
+class SecuritySetupObject(FakeObject):
+    objectType = 64
+    logicalName = "0.0.43.0.0.255"
+    description = "Security Setup"
+    attributes = [Attribute(2), Attribute(3), Attribute(4), Attribute(5)]
+
+    def getAttributeCount(self):
+        return 5
+
+    def getNames(self):
+        return (
+            "Logical name",
+            "Security policy",
+            "Security suite",
+            "Client system title",
+            "Server system title",
+        )
+
+
+class PosturePrioritySession(LimitedSession):
+    def discover_objects(self, attempt):
+        return [ManyObject(index) for index in range(1, 10)] + [SecuritySetupObject()]
+
+
 class ScannerTests(unittest.TestCase):
+    def test_user_candidate_is_probed_with_provenance_and_independent_budget(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {
+                    "common_catalogue": False,
+                    "candidate_providers": [],
+                    "candidate_limit": 1,
+                    "candidate_objects": [
+                        {
+                            "class_id": 99,
+                            "logical_name": "0.0.128.0.0.255",
+                            "attributes": [2, 3],
+                            "description": "Vendor status",
+                        }
+                    ],
+                },
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = CandidateSession
+        CandidateSession.read_objects = []
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        self.assertEqual(report["candidate_generation"]["available_targets"], 2)
+        self.assertEqual(report["candidate_generation"]["selected_targets"], 1)
+        self.assertEqual(report["candidate_generation"]["truncated_targets"], 1)
+        candidate = next(
+            obj
+            for obj in report["profiles"][0]["objects"]
+            if obj["logical_name"] == "0.0.128.0.0.255"
+        )
+        self.assertIn("candidate_user", candidate["discovery_sources"])
+        rights = candidate["attributes"][0]["access_rights"]
+        self.assertEqual(rights["candidate_provider"], "user")
+        self.assertEqual(rights["candidate_rule"], "configured_candidate")
+
+    def test_get_limit_prioritizes_security_posture_values(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {
+                    "common_catalogue": False,
+                    "candidate_providers": [],
+                    "get_limit": 2,
+                },
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = PosturePrioritySession
+        PosturePrioritySession.read_objects = []
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        profile = report["profiles"][0]
+        self.assertEqual(
+            PosturePrioritySession.read_objects,
+            [("0.0.43.0.0.255", 2), ("0.0.43.0.0.255", 3)],
+        )
+        self.assertEqual(profile["summary"]["security_setup_objects"], 1)
+        self.assertEqual(len(profile["scan_scope"]["prioritized_posture_gets"]), 2)
+
     def test_saved_association_view_skips_object_list_download(self):
         config = parse_config(
             {

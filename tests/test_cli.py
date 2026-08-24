@@ -22,6 +22,127 @@ class NullLogger:
 
 
 class CliWorkflowTests(unittest.TestCase):
+    def test_public_and_authenticated_scans_write_permission_comparison(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "profiles": [
+                    {"name": "public", "role": "public"},
+                    {
+                        "name": "lls",
+                        "role": "reader",
+                        "client_address": 32,
+                        "authentication": {
+                            "mechanism": "low",
+                            "password": {"inline": "00000000"},
+                        },
+                    },
+                ],
+            }
+        )
+        preflight = PublicPreflight(
+            transport={
+                "device": "/dev/null",
+                "selected_baudrate": 9600,
+                "selected_server_address": 1,
+                "selected_server_logical_address": 0,
+                "selected_server_physical_address": 1,
+                "server_address_size": 1,
+                "server_addressing_type": "1-byte addressing",
+            },
+            association={"negotiated_conformance": ["get"]},
+            meter_identity="METER-1",
+            association_view_objects=1,
+            counter_candidates=(),
+        )
+        args = argparse.Namespace(
+            config=Path("meter.yaml"),
+            roles=None,
+            short=False,
+            full=True,
+            get_limit=None,
+            association_view_mode="live",
+            save_association_view=False,
+        )
+
+        def fake_scan(runtime_config, *_args, **_kwargs):
+            profile = runtime_config.profile
+            return {
+                "run": {"id": profile.role, "status": "completed"},
+                "effective_configuration": runtime_config.redacted_dict(),
+                "transport": {
+                    "device": "/dev/null",
+                    "selected_server_address": 1,
+                },
+                "profiles": [
+                    {
+                        "name": profile.role,
+                        "type": profile.name,
+                        "association": {
+                            "client_address": profile.client_address,
+                            "authentication": (
+                                "none" if profile.name == "public" else "low"
+                            ),
+                        },
+                        "objects": [
+                            {
+                                "class_id": 1,
+                                "logical_name": "0.0.96.1.0.255",
+                                "object_version": 0,
+                                "description": "Serial number",
+                                "discovery_sources": ["association_view"],
+                                "attributes": [
+                                    {
+                                        "attribute_id": 2,
+                                        "name": "Value",
+                                        "access_rights": {
+                                            "read": True,
+                                            "write": profile.name != "public",
+                                            "mode": (
+                                                "read"
+                                                if profile.name == "public"
+                                                else "read_write"
+                                            ),
+                                            "requirements": [],
+                                        },
+                                    }
+                                ],
+                                "methods": [],
+                            }
+                        ],
+                        "summary": {},
+                    }
+                ],
+                "errors": [],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_directory = Path(directory) / "run"
+            run_directory.mkdir()
+            with (
+                patch("dlms_enum.cli.load_config", return_value=config),
+                patch("dlms_enum.cli._run_directory", return_value=run_directory),
+                patch("dlms_enum.cli.TrafficLogger", NullLogger),
+                patch("dlms_enum.cli.run_public_preflight", return_value=preflight),
+                patch("dlms_enum.cli.scan", side_effect=fake_scan),
+                patch("dlms_enum.cli.write_report"),
+                patch("dlms_enum.cli.ScanUI.summary"),
+            ):
+                status = _scan(args, Console(file=io.StringIO(), color_system=None))
+
+            comparison = json.loads(
+                (run_directory / "capability-comparison.json").read_text()
+            )
+            workflow = json.loads((run_directory / "workflow.json").read_text())
+
+        self.assertEqual(status, 0)
+        self.assertEqual(comparison["comparisons"][0]["authenticated_role"], "reader")
+        self.assertEqual(
+            comparison["comparisons"][0]["summary"]["SET"]["authenticated_only"],
+            1,
+        )
+        self.assertEqual(workflow["capability_comparison"]["status"], "completed")
+
     def test_live_association_export_updates_report_snapshot_timestamp(self):
         config = parse_config(
             {

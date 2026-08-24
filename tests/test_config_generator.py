@@ -42,6 +42,9 @@ class ConfigGeneratorTests(unittest.TestCase):
             "guek": element("DLMS_GUEK"),
             "counter-obis": element("0.0.43.1.12.255"),
             "common-catalogue": element(checked=True),
+            "security-candidates": element(),
+            "firmware-candidates": element(),
+            "candidate-limit": element("100"),
             "union-test": element(),
             "auth-scan": element(),
             "auth-source": element("env"),
@@ -112,6 +115,19 @@ globalThis.document = {
         self.assertEqual(config.profiles[0].client_address, 37)
         self.assertEqual(lls.public_client_address, 37)
         self.assertEqual(secure.invocation_counter.public_client_address, 37)
+
+    def test_candidate_provider_controls_are_exported(self):
+        self.fields["security-candidates"]["checked"] = True
+        self.fields["firmware-candidates"]["checked"] = True
+        self.fields["candidate-limit"]["value"] = "27"
+
+        config = parse_config(self.generated_mapping())
+
+        self.assertEqual(
+            config.scan.candidate_providers,
+            ("common", "security", "firmware"),
+        )
+        self.assertEqual(config.scan.candidate_limit, 27)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # dlms-enum roadmap
 
-Status: 2026-08-13
+Status: 2026-08-24
 
 ## Direction
 
@@ -28,10 +28,15 @@ Normal scans must not send arbitrary SET or ACTION requests, transfer firmware, 
 - [x] Suppress retries after two consecutive timeouts in a scan phase.
 - [x] Refresh the terminal elapsed-time display independently once per second.
 - [x] Canonical JSON, Markdown summary, and side-by-side traffic evidence.
+- [x] Per-device/per-role Association View export, reuse, and change detection.
+- [x] Multi-role authentication result matrix.
+- [x] Profile Generic/event-log row rendering after multi-block reassembly.
+- [x] Read-only Security Setup and Image Transfer posture reporting.
+- [x] Bounded providers for known objects omitted from an Association View.
 
-## Next: complete public-versus-secure capability comparison
+## Completed: public-versus-authenticated capability comparison
 
-This is the next feature to implement. The tool already downloads both Association Views when `union_profile_test` is enabled, but it uses the public view mainly to choose direct GET probes. The next step is to preserve and compare the complete advertised operation model for both roles.
+The workflow compares exported public and authenticated Association Views after all selected roles finish. It keeps passive permission evidence separate from direct public GET verification.
 
 Why this comes next:
 
@@ -43,16 +48,16 @@ Why this comes next:
 
 Planned work:
 
-- [ ] Retain normalized public and secure rights for every `(class_id, logical_name, member_id)`.
-- [ ] Compare GET, SET, and ACTION rights separately.
-- [ ] Preserve Access and Access3 requirements such as authenticated, encrypted, or signed requests and responses.
-- [ ] Report objects and members present in only one role.
-- [ ] Flag unexpectedly broad advertised public GET, SET, or ACTION rights without claiming that passive evidence proves successful access.
-- [ ] Continue direct verification for GET only.
-- [ ] Keep `UNEXPECTED_PUBLIC_ACCESS`, explicit rejection, and inconclusive transport outcomes distinct.
-- [ ] Apply `get_limit` only to transmitted GET probes; always produce the complete passive comparison.
-- [ ] Add per-role and per-operation totals to `report.json` and `summary.md`.
-- [ ] Add unit tests for Association LN versions 2 and 3, write-only attributes, method rights, missing objects, GET limits, and inconclusive responses.
+- [x] Retain normalized public and secure rights for every `(class_id, logical_name, member_id)`.
+- [x] Compare GET, SET, and ACTION rights separately.
+- [x] Preserve Access and Access3 requirements such as authenticated, encrypted, or signed requests and responses.
+- [x] Report objects and members present in only one role.
+- [x] Flag unexpectedly broad advertised public GET, SET, or ACTION rights without claiming that passive evidence proves successful access.
+- [x] Continue direct verification for GET only.
+- [x] Keep `UNEXPECTED_PUBLIC_ACCESS`, explicit rejection, and inconclusive transport outcomes distinct.
+- [x] Apply `get_limit` only to transmitted GET probes; always produce the complete passive comparison.
+- [x] Add per-role and per-operation totals to JSON and Markdown output.
+- [x] Add unit tests for read/write/action rights, Access3 requirements, missing objects, GET evidence, limits, and inconclusive responses.
 
 Definition of done:
 
@@ -61,55 +66,67 @@ Definition of done:
 - Passive exposure, verified exposure, rejection, and inconclusive evidence cannot be confused in either report format.
 - Existing report consumers remain compatible, or the report schema version is deliberately advanced and documented.
 
+## Next release gate: authorized live validation
+
+Before adding more scan breadth, validate the new behavior against the authorized meter:
+
+- [ ] Prove Association View reuse skips the large object-list download.
+- [ ] Confirm one prioritized event log is read and rendered correctly.
+- [ ] Confirm the refreshed/retried final HLS-GMAC check reflects the known-good role.
+- [ ] Review the generated public-versus-authenticated permission comparison.
+- [ ] Review Security Setup and Image Transfer posture values and passive findings.
+- [ ] Run an explicitly enabled, bounded `security`/`firmware` candidate scan.
+
 ## Reliability gate: dead-session circuit breaker and timing evidence
 
 This gate should be completed before significantly increasing the number of probe candidates. Retry suppression prevents a second transmission, but a silent association can still cause every remaining candidate to consume one timeout.
 
-- [ ] Track consecutive timeout outcomes separately for each scan phase.
-- [ ] After a configurable bounded threshold, stop or suspend that phase instead of timing out the entire remaining inventory.
-- [ ] Optionally perform one conservative association-health check or reconnect attempt before stopping.
-- [ ] Mark skipped remainder as `NOT_TESTED` with a `session_unhealthy` reason.
-- [ ] Never reuse a protected invocation counter during recovery.
+- [x] Track consecutive timeout outcomes separately for each scan phase.
+- [x] After a configurable bounded threshold, stop or suspend that phase instead of timing out the entire remaining inventory.
+- [x] Perform one conservative association-health check and bounded reconnect before stopping.
+- [x] Mark the skipped remainder as `INCONCLUSIVE` with the recorded session-health reason.
+- [x] Never reuse a protected invocation counter during recovery.
 - [ ] Detect unusually large gaps in the monotonic host clock and report a probable suspend/process-pause warning separately from meter response time.
-- [ ] Report the circuit-breaker threshold, trigger point, attempted recovery, and number of skipped requests.
-- [ ] Test public and protected recovery paths, including cleanup failures.
+- [x] Report the circuit-breaker threshold, trigger point, attempted recovery, and number of skipped requests.
+- [x] Test public and protected recovery paths, including cleanup failures.
 
 ## Bounded OBIS enumeration outside the Association LN
 
 Replace the small fixed catalogue as the only undeclared-object source with bounded, explainable candidate generation. Do not attempt the full six-byte OBIS Cartesian space.
 
-- [ ] Introduce candidate providers for the common catalogue, standard OBIS templates, user-supplied lists, and optional manufacturer catalogues.
-- [ ] Represent a probe as `(class_id, logical_name, attribute_id)`; an OBIS value alone is not a complete logical-name GET target.
-- [ ] Deduplicate candidates against the Association View and other providers.
-- [ ] Support explicit class, OBIS-group, attribute, and total-request budgets.
-- [ ] Use deterministic ordering so limits and repeated runs are reproducible.
-- [ ] Record the provider, rule, and confidence for every inferred target.
-- [ ] Treat explicit DLMS errors as negative evidence and timeouts as inconclusive.
-- [ ] Apply the dead-session circuit breaker to enumeration phases.
-- [ ] Keep the default candidate set conservative; broad enumeration must require explicit configuration.
+- [x] Introduce candidate providers for the common catalogue, Security Setup and Image Transfer templates, and user-supplied exact targets.
+- [x] Represent a probe as `(class_id, logical_name, attribute_id)`; an OBIS value alone is not a complete logical-name GET target.
+- [x] Deduplicate candidates against the Association View and other providers.
+- [x] Apply a separate total-request budget before the normal GET budget.
+- [x] Use deterministic ordering so limits and repeated runs are reproducible.
+- [x] Record the provider, rule, and confidence for every inferred target.
+- [x] Treat explicit DLMS errors as negative evidence and timeouts as inconclusive.
+- [x] Apply the dead-session circuit breaker to enumeration phases.
+- [x] Keep the default candidate set conservative; Security Setup and firmware candidates require explicit configuration.
+- [ ] Add optional named manufacturer catalogue packages when authoritative data is available.
 
 ## LLS profile and credential-exposure reporting
 
 Add Low Level Security only with secret-safe configuration and traffic handling.
 
-- [ ] Add a distinct LLS profile rather than overloading `public` or `hls_gmac_suite0`.
-- [ ] Accept the password from an environment variable, protected file, or masked prompt.
-- [ ] Never place the password in configuration snapshots, reports, exceptions, or decoded traffic.
-- [ ] Redact or disable raw AARQ capture by default because the ACSE authentication value can contain the static password.
-- [ ] Report credential length and observed transport/confidentiality properties without exposing the value.
-- [ ] Do not add password guessing, default-password lists, or authentication spraying.
-- [ ] Include LLS as another role in the passive capability comparison.
+- [x] Add a distinct LLS profile rather than overloading `public` or `hls_gmac_suite0`.
+- [ ] Accept the password from a protected file or direct masked prompt in addition to the implemented environment/inline sources.
+- [x] Never place the password in configuration snapshots, reports, exceptions, or decoded traffic.
+- [x] Omit raw credential-bearing AARQ capture and redact decoded authentication values.
+- [x] Report observed authentication and transport/confidentiality properties without exposing the value.
+- [x] Do not add password guessing, default-password lists, or authentication spraying.
+- [x] Include LLS as another role in the passive capability comparison.
 
 ## Passive security and firmware-update posture
 
 Build a read-only posture section from already accessible objects and Association LN rights.
 
-- [ ] Summarize Security Setup policy, suite, system titles, version, and advertised method rights.
-- [ ] Flag publicly advertised access to security activation, key transfer, key agreement, or certificate-management methods.
-- [ ] Detect class 18 Image Transfer objects and read only advertised readable attributes.
-- [ ] Report image-transfer status, block size, enablement, and advertised initiate/transfer/verify/activate rights where available.
-- [ ] Avoid claiming that remote metadata proves secure-element use, key extraction, signature enforcement, or secure boot.
-- [ ] Never send Image Transfer or key-management ACTION requests in a normal scan.
+- [x] Summarize Security Setup policy, suite, system titles, version, and advertised method rights.
+- [x] Flag publicly advertised access to security activation, key transfer, key agreement, or certificate-management methods.
+- [x] Detect class 18 Image Transfer objects and read only advertised readable attributes.
+- [x] Report image-transfer status, block size, enablement, and advertised initiate/transfer/verify/activate rights where available.
+- [x] Avoid claiming that remote metadata proves secure-element use, key extraction, signature enforcement, or secure boot.
+- [x] Never send Image Transfer or key-management ACTION requests in a normal scan.
 
 ## Separate conformance workflow: association policy and downgrade checks
 
@@ -123,16 +140,16 @@ This should be a separate command with explicit authorization and attempt limits
 - [ ] Never continue a normal scan under a weaker association after the expected secure association fails.
 - [ ] Produce a matrix of proposed versus negotiated/observed properties and explain why each result is or is not a downgrade.
 
-## Experimental lab workflow: invocation-counter replay enforcement
+## Optional risky diagnostic: invocation-counter replay enforcement
 
-The normal counter allocator deliberately prevents reuse. Replay testing must therefore be isolated from normal scanning and clearly marked experimental.
+The normal counter allocator deliberately prevents reuse. The existing diagnostic remains an explicit, default-no choice in the scan workflow. The tool is presented as carrying operational risk; the operator is responsible for using this option only on an authorized meter and accepting possible association disruption or lockout.
 
-- [ ] Require explicit lab-mode selection and a harmless allowlisted GET target.
-- [ ] Capture one valid protected GET APDU and reframe it in a valid data-link exchange, rather than blindly replaying an old HDLC frame.
-- [ ] Preserve normal counter-state safety for all newly generated protected requests.
-- [ ] Distinguish link-layer rejection, stale-counter rejection, silent discard, inconclusive transport failure, and confirmed duplicate acceptance.
-- [ ] Stop after the bounded test and verify that a fresh-counter request still works.
-- [ ] Document possible association desynchronization and lockout risks.
+- [x] Require explicit confirmation and use a harmless Association LN GET target.
+- [x] Generate a valid protected GET with a stale counter rather than replaying an old HDLC frame.
+- [x] Preserve normal counter-state safety for all newly generated protected requests.
+- [x] Distinguish rejection, timeout/protocol failure, and confirmed duplicate acceptance.
+- [x] Stop after two probes and verify that a fresh-counter request still works.
+- [x] Document possible association desynchronization and lockout risks.
 
 ## Deferred or out of scope
 

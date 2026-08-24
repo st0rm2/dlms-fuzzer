@@ -22,7 +22,11 @@ from .association_view import (
     validate_snapshot,
     write_snapshot,
 )
-from .catalogues import COMMON_OBIS
+from .catalogues import CANDIDATE_PROVIDERS
+from .capability_comparison import (
+    build_workflow_comparison,
+    write_workflow_comparison,
+)
 from .config import (
     ConfigError,
     PublicProfile,
@@ -47,6 +51,7 @@ from .tui import (
     interactive_config,
     select_roles,
     show_authentication_matrix,
+    show_capability_comparison,
     show_public_preflight,
     verify_counter_source,
 )
@@ -333,6 +338,8 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         raise KeyboardInterrupt
 
     role_results = []
+    role_reports: dict[str, dict[str, Any]] = {}
+    role_snapshots: dict[str, dict[str, Any]] = {}
     statuses = []
     multiple_roles = len(config.profiles) > 1
     role_directory_names: dict[str, str] = {}
@@ -456,6 +463,44 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 ),
                 "association_view_mode": view_plan["mode"],
             }
+        )
+        role_reports[profile.role] = report
+        if exported_snapshot is not None:
+            role_snapshots[profile.role] = exported_snapshot
+
+    capability_comparison = None
+    public_profile = next(
+        (profile for profile in config.profiles if isinstance(profile, PublicProfile)),
+        None,
+    )
+    authenticated_profiles = [
+        profile
+        for profile in config.profiles
+        if not isinstance(profile, PublicProfile) and profile.role in role_snapshots
+    ]
+    if (
+        public_profile is not None
+        and public_profile.role in role_snapshots
+        and authenticated_profiles
+    ):
+        capability_comparison = build_workflow_comparison(
+            role_snapshots[public_profile.role],
+            [
+                (role_snapshots[profile.role], role_reports.get(profile.role))
+                for profile in authenticated_profiles
+            ],
+        )
+        comparison_json_path = run_directory / "capability-comparison.json"
+        comparison_markdown_path = run_directory / "capability-comparison.md"
+        write_workflow_comparison(
+            capability_comparison,
+            comparison_json_path,
+            comparison_markdown_path,
+        )
+        show_capability_comparison(capability_comparison, console)
+        console.print(
+            "Permission comparison: "
+            f"[green]{comparison_markdown_path.resolve()}[/green]"
         )
 
     authentication_report = None
@@ -587,6 +632,20 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         "role_runs": role_results,
         "verified_counter_sources": verified_counter_sources,
         "invocation_counter_reuse_tests_requested": counter_reuse_tests,
+        "capability_comparison": (
+            {
+                "status": "completed",
+                "json": "capability-comparison.json",
+                "summary": "capability-comparison.md",
+                "public_role": capability_comparison.get("public_role"),
+                "compared_roles": [
+                    item.get("authenticated_role")
+                    for item in capability_comparison.get("comparisons", [])
+                ],
+            }
+            if capability_comparison is not None
+            else {"status": "not_available"}
+        ),
         "authentication_scan": (
             {
                 "enabled": True,
@@ -624,7 +683,11 @@ def main(argv: list[str] | None = None) -> int:
             console.print_json(json.dumps(config.redacted_dict()))
             return 0
         if args.command == "list-catalogues":
-            console.print(f"common: {len(COMMON_OBIS)} entries")
+            for name, entries in CANDIDATE_PROVIDERS.items():
+                console.print(
+                    f"{name}: {len(entries)} objects / "
+                    f"{sum(len(entry.attributes) for entry in entries)} GET targets"
+                )
             return 0
         if args.command == "report":
             report = load_report(args.path)

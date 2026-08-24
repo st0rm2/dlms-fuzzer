@@ -271,6 +271,26 @@ def render_summary_report(
         "",
     ]
 
+    candidate_generation = report.get("candidate_generation", {})
+    if candidate_generation:
+        lines.extend(
+            [
+                "## Unlisted-object candidate generation",
+                "",
+                "Known targets outside the Association View are generated deterministically and bounded before any GET is sent.",
+                "",
+                "| Field | Value |",
+                "|---|---|",
+                f"| Providers | {_markdown(', '.join(candidate_generation.get('providers', [])) or 'none')} |",
+                f"| Candidate request limit | {_markdown(candidate_generation.get('request_limit', 0))} |",
+                f"| Available targets | {_markdown(candidate_generation.get('available_targets', 0))} |",
+                f"| Selected targets | {_markdown(candidate_generation.get('selected_targets', 0))} |",
+                f"| Truncated targets | {_markdown(candidate_generation.get('truncated_targets', 0))} |",
+                f"| Skipped because object was advertised | {_markdown(candidate_generation.get('excluded_association_targets', 0))} |",
+                "",
+            ]
+        )
+
     authentication_matrix = report.get("authentication_matrix", {})
     matrix_roles = authentication_matrix.get("roles", [])
     if matrix_roles:
@@ -573,6 +593,73 @@ def render_summary_report(
             for key, value in identification.items():
                 lines.append(f"| {_markdown(key)} | {_markdown(_compact_value(value))} |")
             lines.append("")
+
+        posture = profile.get("security_posture", {})
+        if posture.get("security_setup_objects") or posture.get(
+            "image_transfer_objects"
+        ):
+            lines.extend(
+                [
+                    "### Security and firmware-update posture",
+                    "",
+                    "This section is read-only. Advertised SET and ACTION permissions are passive evidence and were not executed.",
+                    "",
+                ]
+            )
+            for heading, objects in (
+                ("Security Setup", posture.get("security_setup_objects", [])),
+                ("Image Transfer", posture.get("image_transfer_objects", [])),
+            ):
+                for item in objects:
+                    lines.extend(
+                        [
+                            f"#### {heading} `{_markdown(item.get('logical_name', '—'))}`",
+                            "",
+                            "| Member | Read | Write/action | Requirements | Result/value |",
+                            "|---|---|---|---|---|",
+                        ]
+                    )
+                    for attribute in item.get("attributes", []):
+                        value = attribute.get("value")
+                        outcome_value = (
+                            _compact_value(value)
+                            if value is not None
+                            else attribute.get("outcome", "NOT_TESTED")
+                        )
+                        lines.append(
+                            "| {} | {} | {} | {} | {} |".format(
+                                _markdown(attribute.get("name", "—")),
+                                _markdown(attribute.get("read_advertised", False)),
+                                _markdown(attribute.get("write_advertised", False)),
+                                _markdown(
+                                    ", ".join(attribute.get("requirements", [])) or "none"
+                                ),
+                                _markdown(outcome_value),
+                            )
+                        )
+                    for method in item.get("methods", []):
+                        if not method.get("advertised"):
+                            continue
+                        lines.append(
+                            "| {} | — | {} | {} | passive only |".format(
+                                _markdown(method.get("name", "—")),
+                                _markdown(True),
+                                _markdown(
+                                    ", ".join(method.get("requirements", [])) or "none"
+                                ),
+                            )
+                        )
+                    lines.append("")
+            findings = posture.get("findings", [])
+            if findings:
+                lines.extend(["#### Findings", ""])
+                for finding in findings:
+                    lines.append(
+                        f"- **{_markdown(str(finding.get('severity', 'info')).upper())}:** "
+                        f"{_markdown(finding.get('message', ''))}"
+                    )
+                lines.append("")
+            lines.extend([_markdown(posture.get("limitations", "")), ""])
 
         profile_buffers = _render_profile_buffers(profile)
         if profile_buffers:

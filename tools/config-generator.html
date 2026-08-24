@@ -206,6 +206,14 @@
         <label for="common-catalogue">Supplement the Association View with the common OBIS catalogue</label>
       </div>
       <div class="check">
+        <input id="security-candidates" type="checkbox">
+        <label for="security-candidates">Try bounded standard Security Setup addresses missing from the object list</label>
+      </div>
+      <div class="check">
+        <input id="firmware-candidates" type="checkbox">
+        <label for="firmware-candidates">Try the standard Image Transfer address when missing from the object list</label>
+      </div>
+      <div class="check">
         <input id="union-test" type="checkbox" disabled>
         <label for="union-test">Retest authenticated-only targets through the public client</label>
       </div>
@@ -227,6 +235,10 @@
         </label>
       </div>
       <div class="grid">
+        <label>
+          <span>Maximum known unlisted GET targets</span>
+          <input id="candidate-limit" type="number" min="1" max="10000" value="100">
+        </label>
         <label>
           <span>Scan scope</span>
           <select id="scope">
@@ -398,6 +410,11 @@
 
     if (!profiles.length) throw new Error("Select at least one profile.");
 
+    const candidateProviders = [];
+    if (checked("common-catalogue")) candidateProviders.push("common");
+    if (checked("security-candidates")) candidateProviders.push("security");
+    if (checked("firmware-candidates")) candidateProviders.push("firmware");
+
     const lines = [
       "version: 1",
       "",
@@ -410,6 +427,8 @@
       "  mode: get",
       "  association_view_first: true",
       `  common_catalogue: ${checked("common-catalogue")}`,
+      `  candidate_providers: [${candidateProviders.join(", ")}]`,
+      `  candidate_limit: ${integer("candidate-limit", "Candidate limit", 1, 10000)}`,
       `  union_profile_test: ${checked("union-test")}`,
       `  batch_size: ${integer("batch-size", "GET batch size", 1, 10)}`
     ];
