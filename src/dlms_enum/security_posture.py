@@ -52,6 +52,10 @@ def _object_posture(
     attribute_names: dict[int, str],
     method_names: dict[int, str],
 ) -> dict[str, Any]:
+    discovery_sources = list(obj.get("discovery_sources", []))
+    advertised = (
+        "association_view" in discovery_sources or "discovery_sources" not in obj
+    )
     attributes = []
     for attribute in obj.get("attributes", []):
         attribute_id = int(attribute.get("attribute_id", -1))
@@ -62,11 +66,20 @@ def _object_posture(
             {
                 "attribute_id": attribute_id,
                 "name": attribute_names[attribute_id],
-                "read_advertised": bool(rights.get("read")),
-                "write_advertised": bool(rights.get("write")),
+                "read_advertised": (
+                    advertised
+                    and bool(rights.get("advertised", True))
+                    and bool(rights.get("read"))
+                ),
+                "write_advertised": (
+                    advertised
+                    and bool(rights.get("advertised", True))
+                    and bool(rights.get("write"))
+                ),
                 "requirements": list(rights.get("requirements", [])),
                 "outcome": attribute.get("outcome") or Outcome.NOT_TESTED.value,
                 "value": _value(attribute),
+                "candidate_assessment": attribute.get("candidate_assessment"),
             }
         )
     methods = []
@@ -80,16 +93,39 @@ def _object_posture(
             {
                 "method_id": method_id,
                 "name": name,
-                "advertised": bool(rights.get("action")),
+                "advertised": advertised and bool(rights.get("action")),
                 "requirements": list(rights.get("requirements", [])),
                 "tested": False,
             }
         )
+    candidate_assessments = {
+        attribute.get("candidate_assessment") for attribute in attributes
+    }
+    candidate_outcomes = {attribute.get("outcome") for attribute in attributes}
+    if advertised:
+        discovery_status = "advertised"
+    elif Outcome.SUCCESS.value in candidate_outcomes:
+        discovery_status = "candidate_verified"
+    elif "object_unavailable" in candidate_assessments:
+        discovery_status = "candidate_object_unavailable"
+    elif "access_rejected" in candidate_assessments:
+        discovery_status = "candidate_access_rejected"
+    elif candidate_outcomes & {
+        Outcome.TIMEOUT.value,
+        Outcome.PROTOCOL_ERROR.value,
+        Outcome.INCONCLUSIVE.value,
+    }:
+        discovery_status = "candidate_inconclusive"
+    else:
+        discovery_status = "candidate_not_tested"
     return {
         "class_id": int(obj["class_id"]),
         "logical_name": obj["logical_name"],
         "object_version": int(obj.get("object_version", 0)),
         "description": obj.get("description"),
+        "discovery_sources": discovery_sources,
+        "advertised_in_association_view": advertised,
+        "discovery_status": discovery_status,
         "attributes": attributes,
         "methods": methods,
     }
@@ -99,7 +135,7 @@ def build_security_posture(profile: dict[str, Any]) -> dict[str, Any]:
     """Summarize class 64 and class 18 without sending modifying operations."""
 
     public_role = profile.get("association", {}).get("authentication") == "none"
-    security_setups = [
+    all_security_setups = [
         _object_posture(
             obj,
             attribute_names=SECURITY_ATTRIBUTE_NAMES,
@@ -108,7 +144,7 @@ def build_security_posture(profile: dict[str, Any]) -> dict[str, Any]:
         for obj in profile.get("objects", [])
         if int(obj.get("class_id", -1)) == 64
     ]
-    image_transfers = [
+    all_image_transfers = [
         _object_posture(
             obj,
             attribute_names=IMAGE_ATTRIBUTE_NAMES,
@@ -116,6 +152,17 @@ def build_security_posture(profile: dict[str, Any]) -> dict[str, Any]:
         )
         for obj in profile.get("objects", [])
         if int(obj.get("class_id", -1)) == 18
+    ]
+    security_setups = [
+        item for item in all_security_setups if item["advertised_in_association_view"]
+    ]
+    image_transfers = [
+        item for item in all_image_transfers if item["advertised_in_association_view"]
+    ]
+    candidate_objects = [
+        item
+        for item in all_security_setups + all_image_transfers
+        if not item["advertised_in_association_view"]
     ]
     findings: list[dict[str, Any]] = []
     for item in security_setups:
@@ -171,10 +218,28 @@ def build_security_posture(profile: dict[str, Any]) -> dict[str, Any]:
         "public_role": public_role,
         "security_setup_objects": security_setups,
         "image_transfer_objects": image_transfers,
+        "candidate_objects": candidate_objects,
         "findings": findings,
         "summary": {
             "security_setup_objects": len(security_setups),
             "image_transfer_objects": len(image_transfers),
+            "verified_candidate_objects": sum(
+                item["discovery_status"] == "candidate_verified"
+                for item in candidate_objects
+            ),
+            "rejected_candidate_objects": sum(
+                item["discovery_status"]
+                in {"candidate_object_unavailable", "candidate_access_rejected"}
+                for item in candidate_objects
+            ),
+            "inconclusive_candidate_objects": sum(
+                item["discovery_status"] == "candidate_inconclusive"
+                for item in candidate_objects
+            ),
+            "untested_candidate_objects": sum(
+                item["discovery_status"] == "candidate_not_tested"
+                for item in candidate_objects
+            ),
             "high_findings": sum(
                 item.get("severity") == "high" for item in findings
             ),

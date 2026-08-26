@@ -59,10 +59,17 @@ dlms-enum scan --config examples/authentication-enumeration.yaml
 `authentication_scan` is an optional top-level final phase, not a profile. The
 normal public/LLS/HLS role scans, GET enumeration, optional public cross-profile
 tests, and optional invocation-counter replay diagnostic finish first. The tool
-then tries NONE, LOW, HIGH, HIGH-MD5, HIGH-SHA1, HIGH-SHA256, and HIGH-GMAC in
-fresh associations for every selected role. The configured password is shared
-by the password probes; each secure role keeps its own system title, keys, and
-counter state. HIGH-GMAC is reported as a prerequisite failure for roles without
+then verifies the role's known-working method first (NONE for public, LOW for
+LLS, and HIGH-GMAC for secure roles), followed by the other methods in fresh
+associations. The existing `transport.session_guard_ms` delay applies when each
+association closes; there is no separate authentication cooldown. Between
+mechanisms, the tool reopens the role's known-good association. If that check
+fails, later mechanisms are not tested because their rejection would be
+ambiguous. If the first check contradicts the association that just worked, the
+result is explicitly marked `inconsistent_with_known_good`, not simply rejected.
+The configured password is shared by the password probes; each secure role keeps
+its own system title, keys, and counter state. HIGH-GMAC is reported as a
+prerequisite failure for roles without
 those secure credentials. Results distinguish an AARQ rejection from a completed
 HLS challenge. Immediately before HIGH-GMAC, the tool refreshes that role's
 public invocation-counter object. If the meter rejects the first secure AARQ,
@@ -70,7 +77,14 @@ the tool refreshes the counter again and makes one monotonic retry; an accepted
 AARQ with a failed HLS challenge is not retried. HIGH-ECDSA is listed as
 unsupported because this release has no
 signing-key/certificate credential support. A rejected mechanism does not stop
-the remaining probes.
+the remaining probes while the intervening known-good connection still works.
+
+Every intervening HIGH-GMAC health check first rereads the public invocation
+counter, combines it with the crash-safe persisted client state, and leases the
+next strictly monotonic counter before generating protected messages. Health
+checks therefore consume counters normally and never reuse or roll back a
+counter. Their results and counter-refresh evidence are included in the
+authentication report.
 
 ### Standalone public connection discovery
 
@@ -198,7 +212,11 @@ scan:
 ```
 
 Reports retain each candidate's provider, rule, and confidence. A definite
-DLMS rejection is kept distinct from a timeout or transport failure.
+DLMS rejection is expected negative evidence: it does not turn an otherwise
+successful run into `completed_with_errors`. Timeouts, transport failures, and
+malformed responses remain inconclusive or erroneous. Generated candidates are
+never described as Association View-advertised Security Setup or Image Transfer
+objects, even when a direct GET verifies that one exists.
 
 Secure scan:
 
@@ -426,14 +444,16 @@ Serial framing, validation response timeout, inter-request delay, and session gu
 Each run gets a UTC-named directory under `./runs` unless overridden:
 
 - `report.json` contains the selected endpoint, addressing type, redacted effective configuration, active, probed, and Association-LN-advertised authentication mechanisms, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, optional public cross-profile findings, a complete per-role GET/SET/ACTION capability matrix, cleanup warnings, and a traffic-file hash. Each matrix row is `SUCCESS`, a normalized failure category, or `NOT_TESTED`.
-- `summary.md` is the human-readable report. It contains connection and role details, a decoded OBIS table, the public cross-profile access findings when enabled, and the complete operation capability matrix. In secure scans the decoded table places the encrypted RX payload immediately to the right of the encoded value; only ciphertext is shown, without HDLC framing, security control, invocation counter, authentication tag, or CRC. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent. The separate protected-APDU table retains command, counter, ciphertext, and authentication-tag evidence.
+- `summary.md` is the human-readable report. It contains connection and role details, attempted decoded OBIS values, public cross-profile findings, and a compact operation matrix; untested GET detail remains in `report.json`. In secure scans the decoded table places compact encrypted-RX evidence immediately to the right of the encoded value. Large or multi-block ciphertext is summarized by fragment/byte count and the protected-APDU table limits and hashes long evidence; complete bytes remain in `traffic.jsonl`. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent.
 - `association-view.json` is the portable per-role inventory snapshot. Profile
   Generic buffers that arrive across multiple DLMS blocks are reassembled before
-  reporting; `summary.md` renders them as row-preserving tables with timestamp
-  and event/description-oriented columns while `report.json` retains canonical
-  decoded values.
+  reporting; `summary.md` decodes 12-byte COSEM timestamps and renders numeric
+  event codes in timestamp/code/description columns while `report.json` retains
+  canonical decoded values.
 - `capability-comparison.json` and `capability-comparison.md` compare public and
   authenticated advertised permissions when both kinds of role were scanned.
+  The Markdown omits repetitive authenticated-only detail; the JSON remains
+  complete.
   Each role's `report.json` and `summary.md` also include the passive Security
   Setup/Image Transfer posture and bounded candidate-generation details.
 - `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators. The reusable LLS password is never written as decoded data, and the raw LLS AARQ is omitted because it contains that password.

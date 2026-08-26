@@ -81,6 +81,43 @@ def _profile_buffer_value(
     return value if isinstance(value, list) else None
 
 
+def _decode_cosem_datetime(value: Any) -> str | None:
+    """Render a normalized 12-byte COSEM date-time without altering JSON evidence."""
+
+    if not isinstance(value, dict) or value.get("encoding") != "octet-string":
+        return None
+    encoded = value.get("hex")
+    if not isinstance(encoded, str):
+        return None
+    try:
+        raw = bytes.fromhex(encoded)
+    except ValueError:
+        return None
+    if len(raw) != 12:
+        return None
+    year = int.from_bytes(raw[0:2], "big")
+    month, day, hour, minute, second, hundredths = (
+        raw[2], raw[3], raw[5], raw[6], raw[7], raw[8]
+    )
+    if year == 0xFFFF or 0xFF in {month, day, hour, minute, second}:
+        return None
+    rendered = f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}"
+    if hundredths != 0xFF and hundredths:
+        rendered += f".{hundredths:02d}"
+    deviation_raw = int.from_bytes(raw[9:11], "big")
+    if deviation_raw != 0x8000:
+        deviation = int.from_bytes(raw[9:11], "big", signed=True)
+        utc_offset = -deviation
+        sign = "+" if utc_offset >= 0 else "-"
+        hours, minutes = divmod(abs(utc_offset), 60)
+        rendered += f"{sign}{hours:02d}:{minutes:02d}"
+    return rendered
+
+
+def _profile_display_value(value: Any) -> Any:
+    return _decode_cosem_datetime(value) or value
+
+
 def _profile_row_columns(rows: list[Any]) -> list[str]:
     width = max(
         (
@@ -102,12 +139,22 @@ def _profile_row_columns(rows: list[Any]) -> list[str]:
         bool(
             re.search(
                 r"(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}:\d{2})",
-                _compact_value(value),
+                _compact_value(_profile_display_value(value)),
             )
         )
         for value in first_values
     ) >= max(1, len(first_values) // 2)
     if timestamped:
+        second_values = [
+            row[1]
+            for row in rows[:10]
+            if isinstance(row, (list, tuple)) and len(row) > 1
+        ]
+        if width == 2 and second_values and all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in second_values
+        ):
+            return ["Timestamp", "Event code", "Description"]
         return ["Timestamp", "Event / description"] + [
             f"Value {index}" for index in range(3, width + 1)
         ]
@@ -144,6 +191,18 @@ def _render_profile_buffers(profile: dict[str, Any]) -> list[str]:
             )
             for row in rows:
                 values = list(row) if isinstance(row, (list, tuple)) else [row]
+                values = [_profile_display_value(value) for value in values]
+                if columns == ["Timestamp", "Event code", "Description"]:
+                    event_code = values[1] if len(values) > 1 else None
+                    values = [
+                        values[0] if values else None,
+                        event_code,
+                        (
+                            f"Meter-specific event code {event_code}"
+                            if event_code is not None
+                            else "—"
+                        ),
+                    ]
                 values.extend([None] * (len(columns) - len(values)))
                 sections.append(
                     "| "
@@ -226,6 +285,31 @@ def _encrypted_rx_by_attribute(
     return evidence
 
 
+def _encrypted_evidence_display(fragments: list[str]) -> str:
+    if not fragments:
+        return "—"
+    captured_hex = [fragment.split(" ", 1)[0] for fragment in fragments]
+    captured_bytes = sum(len(value) // 2 for value in captured_hex)
+    if len(fragments) > 3 or sum(map(len, captured_hex)) > 384:
+        return (
+            f"{len(fragments)} protected response fragments, "
+            f"{captured_bytes} captured ciphertext bytes — see traffic.jsonl"
+        )
+    return "<br>".join(fragments)
+
+
+def _compact_ciphertext(value: Any, *, hexadecimal_char_limit: int = 64) -> str:
+    ciphertext = str(value or "")
+    if not ciphertext:
+        return "—"
+    if len(ciphertext) <= hexadecimal_char_limit:
+        return ciphertext
+    digest = hashlib.sha256(
+        ciphertext.encode("ascii", errors="replace")
+    ).hexdigest()[:12]
+    return f"{ciphertext[:hexadecimal_char_limit]}… [sha256:{digest}]"
+
+
 def _scan_scope_label(scan_scope: dict[str, Any]) -> str:
     if not scan_scope.get("short_test"):
         return "Full inventory"
@@ -287,6 +371,9 @@ def render_summary_report(
                 f"| Selected targets | {_markdown(candidate_generation.get('selected_targets', 0))} |",
                 f"| Truncated targets | {_markdown(candidate_generation.get('truncated_targets', 0))} |",
                 f"| Skipped because object was advertised | {_markdown(candidate_generation.get('excluded_association_targets', 0))} |",
+                f"| Verified candidates | {_markdown(candidate_generation.get('verified_targets', 0))} |",
+                f"| Expected negative evidence | {_markdown(candidate_generation.get('negative_targets', 0))} |",
+                f"| Inconclusive candidates | {_markdown(candidate_generation.get('inconclusive_targets', 0))} |",
                 "",
             ]
         )
@@ -330,10 +417,43 @@ def render_summary_report(
             [
                 "",
                 "`authenticated` means the complete association succeeded; for HLS "
-                "this includes the challenge-response validation.",
+                "this includes the challenge-response validation. "
+                "`inconsistent_with_known_good` means the same role worked during "
+                "the normal scan but failed its first isolated verification; treat "
+                "that as meter state, throttling, or lockout evidence rather than a "
+                "simple credential rejection.",
                 "",
             ]
         )
+        health_rows = [
+            (profile, check)
+            for profile in profiles
+            for check in profile.get("authentication_scan", {}).get(
+                "health_checks", []
+            )
+        ]
+        if health_rows:
+            lines.extend(
+                [
+                    "### Known-good connection checks",
+                    "",
+                    "A fresh known-good association is made between authentication mechanisms. Secure checks first refresh the public invocation counter and then use the crash-safe monotonic counter lease.",
+                    "",
+                    "| Role | After mechanism | Known-good method | Status | Counter handling |",
+                    "|---|---|---|---|---|",
+                ]
+            )
+            for profile, check in health_rows:
+                lines.append(
+                    "| {} | {} | {} | {} | {} |".format(
+                        _markdown(profile.get("role", profile.get("name", "—"))),
+                        _markdown(check.get("after_mechanism", "—")),
+                        _markdown(check.get("mechanism", "—")),
+                        _markdown(check.get("status", "—")),
+                        _markdown(check.get("counter_safety", "not applicable")),
+                    )
+                )
+            lines.append("")
 
     for profile in profiles:
         association = profile.get("association", {})
@@ -342,6 +462,13 @@ def render_summary_report(
             authentication_enumeration.get("observed_methods", [])
         ) or "none observed"
         summary = profile.get("summary", {})
+        expected_candidate_rejections = int(
+            candidate_generation.get("negative_targets", 0)
+        )
+        unexpected_get_failures = max(
+            0,
+            int(summary.get("get_failed", 0)) - expected_candidate_rejections,
+        )
         scan_scope = profile.get("scan_scope", {})
         list_scope = scan_scope.get("get_with_list", {})
         timeout_policy = scan_scope.get("timeout_policy", {})
@@ -414,7 +541,7 @@ def render_summary_report(
                 f"| Scan scope | {_markdown(_scan_scope_label(scan_scope))} |",
                 f"| Association View objects | {_markdown(scan_scope.get('association_view_objects', profile.get('association_view_object_count', '—')))} |",
                 f"| Association View source | {_markdown(report.get('association_view', {}).get('mode', profile.get('association_view_source', 'live')))} |",
-                f"| GET results | {_markdown(summary.get('get_success', 0))} successful / {_markdown(summary.get('get_failed', 0))} failed / {_markdown(summary.get('get_inconclusive', 0))} inconclusive |",
+                f"| GET results | {_markdown(summary.get('get_success', 0))} successful / {_markdown(unexpected_get_failures)} unexpected failures / {_markdown(expected_candidate_rejections)} expected candidate rejections / {_markdown(summary.get('get_inconclusive', 0))} inconclusive |",
                 f"| GET transmissions | {_markdown(summary.get('get_transmissions', 0))} |",
                 f"| GET-with-list | {_markdown(list_label)} |",
                 f"| Enumeration timeout | {_markdown(timeout_policy.get('enumeration_timeout_ms', '—'))} ms |",
@@ -597,7 +724,7 @@ def render_summary_report(
         posture = profile.get("security_posture", {})
         if posture.get("security_setup_objects") or posture.get(
             "image_transfer_objects"
-        ):
+        ) or posture.get("candidate_objects"):
             lines.extend(
                 [
                     "### Security and firmware-update posture",
@@ -650,6 +777,29 @@ def render_summary_report(
                             )
                         )
                     lines.append("")
+            candidate_objects = posture.get("candidate_objects", [])
+            if candidate_objects:
+                lines.extend(
+                    [
+                        "#### Generated candidates",
+                        "",
+                        "These objects were not advertised by the meter. Their results are probe evidence, not Association View permissions.",
+                        "",
+                        "| Class | Logical name | Result |",
+                        "|---:|---|---|",
+                    ]
+                )
+                for item in candidate_objects:
+                    lines.append(
+                        "| {} | {} | {} |".format(
+                            _markdown(item.get("class_id", "—")),
+                            _markdown(item.get("logical_name", "—")),
+                            _markdown(
+                                item.get("discovery_status", "candidate_not_tested")
+                            ),
+                        )
+                    )
+                lines.append("")
             findings = posture.get("findings", [])
             if findings:
                 lines.extend(["#### Findings", ""])
@@ -677,12 +827,13 @@ def render_summary_report(
             [
                 "### Decoded OBIS values",
                 "",
-                "One compact row is shown for every mapped GET attribute except logical-name attribute 1, which duplicates the OBIS value already present on the object. Untested rows remain mapped as `NOT_TESTED`. The encrypted-response column contains ciphertext only, excluding HDLC framing, security control, invocation counter, authentication tag, and CRC.",
+                "This human view shows attempted GET attributes. Logical-name attribute 1 and untested rows are omitted; the complete inventory remains in `report.json`. Large encrypted responses are summarized, with complete evidence in `traffic.jsonl`.",
                 "",
                 "| OBIS | Class | Attribute | Name | Decoded value | Encoded value (hex) | Encrypted response (hex) | Result |",
                 "|---|---:|---:|---|---|---|---|---|",
             ]
         )
+        omitted_decoded_attributes = 0
         for obj in profile.get("objects", []):
             attributes = list(obj.get("attributes", []))
             attributes = [
@@ -693,6 +844,14 @@ def render_summary_report(
             ]
             display_attributes = [item for item in attributes if item.get("attribute_id") != 1]
             for attribute in display_attributes:
+                result = (
+                    attribute.get("outcome")
+                    or attribute.get("lifecycle")
+                    or "not scanned"
+                )
+                if result == Outcome.NOT_TESTED.value:
+                    omitted_decoded_attributes += 1
+                    continue
                 decoded = attribute.get("decoded", {})
                 value = decoded.get("value") if isinstance(decoded, dict) else None
                 raw = decoded.get("raw_value") if isinstance(decoded, dict) else None
@@ -700,7 +859,6 @@ def render_summary_report(
                 if profile_rows is not None:
                     value = f"{len(profile_rows)} rows — see Profile Generic table above"
                     raw = None
-                result = attribute.get("outcome") or attribute.get("lifecycle") or "not scanned"
                 encrypted = encrypted_rx.get(
                     (
                         int(obj.get("class_id", 0)),
@@ -709,11 +867,7 @@ def render_summary_report(
                     ),
                     [],
                 )
-                encrypted_display = "<br>".join(encrypted) if encrypted else "—"
-                if profile_rows is not None and encrypted:
-                    encrypted_display = (
-                        f"{len(encrypted)} protected response fragment(s) — see traffic.jsonl"
-                    )
+                encrypted_display = _encrypted_evidence_display(encrypted)
                 lines.append(
                     "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
                         _markdown(obj.get("logical_name", "—")),
@@ -726,34 +880,43 @@ def render_summary_report(
                         _markdown(result),
                     )
                 )
+        if omitted_decoded_attributes:
+            lines.append(
+                f"| — | — | — | — | — | — | {omitted_decoded_attributes} untested attributes omitted; see report.json | — |"
+            )
         lines.append("")
 
         lines.extend(
             [
                 "### Operation capability matrix",
                 "",
-                "Every mapped operation is listed. GET contains its actual result when tested; operations outside a short-test budget are `NOT_TESTED`. SET and ACTION are mapped passively from this role's Association View and are never sent, so they remain `NOT_TESTED`. This scan uses logical-name referencing, where writes use SET; WRITE is the short-name equivalent.",
+                "Attempted GET operations and all advertised SET/ACTION permissions are listed. Untested GET detail remains in `report.json`. SET and ACTION are mapped passively and are never sent, so they remain `NOT_TESTED`.",
                 "",
                 "| Operation | OBIS | Class | Member | Name | Access mode | Status |",
                 "|---|---|---:|---:|---|---|---|",
             ]
         )
+        omitted_get_operations = 0
         for obj in profile.get("objects", []):
             for attribute in obj.get("attributes", []):
                 if attribute.get("attribute_id") == 1:
                     continue
                 rights = attribute.get("access_rights", {})
                 if rights.get("read", True) or rights.get("catalogue_probe", False):
-                    lines.append(
-                        "| GET | {} | {} | {} | {} | {} | {} |".format(
-                            _markdown(obj.get("logical_name", "—")),
-                            _markdown(obj.get("class_id", "—")),
-                            _markdown(attribute.get("attribute_id", "—")),
-                            _markdown(attribute.get("name") or "—"),
-                            _markdown(attribute.get("advertised_access", "—")),
-                            _markdown(attribute.get("outcome") or Outcome.NOT_TESTED.value),
+                    outcome = attribute.get("outcome") or Outcome.NOT_TESTED.value
+                    if outcome == Outcome.NOT_TESTED.value:
+                        omitted_get_operations += 1
+                    else:
+                        lines.append(
+                            "| GET | {} | {} | {} | {} | {} | {} |".format(
+                                _markdown(obj.get("logical_name", "—")),
+                                _markdown(obj.get("class_id", "—")),
+                                _markdown(attribute.get("attribute_id", "—")),
+                                _markdown(attribute.get("name") or "—"),
+                                _markdown(attribute.get("advertised_access", "—")),
+                                _markdown(outcome),
+                            )
                         )
-                    )
                 if rights.get("write", False):
                     lines.append(
                         "| SET | {} | {} | {} | {} | {} | NOT_TESTED |".format(
@@ -776,6 +939,10 @@ def render_summary_report(
                         _markdown(method.get("advertised_access", "—")),
                     )
                 )
+        if omitted_get_operations:
+            lines.append(
+                f"| GET | — | — | — | — | — | {omitted_get_operations} untested operations omitted; see report.json |"
+            )
         lines.append("")
 
     union_test = report.get("public_union_test", {})
@@ -839,7 +1006,14 @@ def render_summary_report(
                 "|---:|---|---|---|---|---:|---|---|---|---|",
             ]
         )
-        for entry in protected_traffic:
+        displayed_protected_traffic = protected_traffic
+        omitted_protected_entries = 0
+        if len(protected_traffic) > 80:
+            displayed_protected_traffic = (
+                protected_traffic[:40] + protected_traffic[-40:]
+            )
+            omitted_protected_entries = len(protected_traffic) - 80
+        for entry in displayed_protected_traffic:
             captured_length = entry.get("ciphertext_captured_length", 0)
             declared_length = entry.get("ciphertext_declared_length", 0)
             capture = (
@@ -858,11 +1032,15 @@ def render_summary_report(
                     _markdown(entry.get("protected_command", "—")),
                     _markdown(entry.get("security_control", "—")),
                     _markdown(entry.get("invocation_counter", "—")),
-                    _markdown(entry.get("ciphertext_hex") or "—"),
+                    _markdown(_compact_ciphertext(entry.get("ciphertext_hex"))),
                     _markdown(capture),
                     _markdown(tag),
                     _markdown(entry.get("result", "—")),
                 )
+            )
+        if omitted_protected_entries:
+            lines.append(
+                f"| — | — | — | — | — | — | {omitted_protected_entries} entries omitted; see traffic.jsonl | — | — | — |"
             )
         lines.append("")
 
@@ -943,6 +1121,12 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
     profiles = report.get("profiles", [])
     profile = profiles[0] if profiles else {}
     summary = profile.get("summary", {})
+    expected_candidate_rejections = int(
+        report.get("candidate_generation", {}).get("negative_targets", 0)
+    )
+    unexpected_get_failures = max(
+        0, int(summary.get("get_failed", 0)) - expected_candidate_rejections
+    )
     lines = [
         f"Run: {run.get('id', 'unknown')} ({run.get('status', 'unknown')})",
         f"Profile: {profile.get('name', 'not established')}",
@@ -950,7 +1134,7 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
         f"HDLC server address: {report.get('transport', {}).get('selected_server_address', 'not found')}",
         f"Server Addressing Type: {report.get('transport', {}).get('server_addressing_type', 'not found')}",
         f"Objects: {summary.get('objects', 0)}",
-        f"GET: {summary.get('get_success', 0)} success, {summary.get('get_failed', 0)} failed, {summary.get('get_inconclusive', 0)} inconclusive",
+        f"GET: {summary.get('get_success', 0)} success, {unexpected_get_failures} unexpected failures, {expected_candidate_rejections} expected candidate rejections, {summary.get('get_inconclusive', 0)} inconclusive",
         f"GET not tested: {summary.get('get_not_tested', 0)}",
         f"Advertised SET attributes: {summary.get('advertised_set_attributes', 0)} (not tested)",
         f"Advertised ACTION methods: {summary.get('advertised_action_methods', 0)} (not tested)",

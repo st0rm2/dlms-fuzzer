@@ -95,6 +95,67 @@ class SecurityPostureTests(unittest.TestCase):
         posture = build_security_posture(profile)
         self.assertEqual(posture["findings"], [])
 
+    def test_generated_candidates_are_not_counted_as_advertised_objects(self):
+        profile = {
+            "name": "client4",
+            "association": {"authentication": "high_gmac"},
+            "objects": [
+                {
+                    "class_id": 64,
+                    "logical_name": "0.0.43.0.0.255",
+                    "discovery_sources": ["association_view"],
+                    "attributes": [],
+                    "methods": [],
+                },
+                {
+                    "class_id": 64,
+                    "logical_name": "0.0.43.1.0.255",
+                    "discovery_sources": ["candidate_common"],
+                    "attributes": [
+                        {
+                            "attribute_id": 2,
+                            "outcome": "DLMS_ERROR",
+                            "candidate_assessment": "object_unavailable",
+                            "access_rights": {
+                                "advertised": False,
+                                "read": True,
+                                "catalogue_probe": True,
+                            },
+                        }
+                    ],
+                    "methods": [],
+                },
+                {
+                    "class_id": 18,
+                    "logical_name": "0.0.44.0.0.255",
+                    "discovery_sources": ["candidate_common"],
+                    "attributes": [
+                        {
+                            "attribute_id": 5,
+                            "outcome": "SUCCESS",
+                            "decoded": {"value": True},
+                            "access_rights": {
+                                "advertised": False,
+                                "read": True,
+                                "catalogue_probe": True,
+                            },
+                        }
+                    ],
+                    "methods": [],
+                },
+            ],
+        }
+
+        posture = build_security_posture(profile)
+
+        self.assertEqual(posture["summary"]["security_setup_objects"], 1)
+        self.assertEqual(posture["summary"]["image_transfer_objects"], 0)
+        self.assertEqual(posture["summary"]["verified_candidate_objects"], 1)
+        self.assertEqual(posture["summary"]["rejected_candidate_objects"], 1)
+        self.assertFalse(
+            posture["candidate_objects"][0]["attributes"][0]["read_advertised"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

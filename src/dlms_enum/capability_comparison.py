@@ -265,7 +265,14 @@ def render_comparison_markdown(report: dict[str, Any]) -> str:
                 "|---|---:|---|---:|---|---|---|---|",
             ]
         )
-        for item in comparison.get("capabilities", []):
+        capabilities = comparison.get("capabilities", [])
+        omitted_authenticated_only = sum(
+            item.get("classification") == "authenticated_only"
+            for item in capabilities
+        )
+        for item in capabilities:
+            if item.get("classification") == "authenticated_only":
+                continue
             verification = item.get("public_get_verification") or {}
             lines.append(
                 "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
@@ -280,6 +287,13 @@ def render_comparison_markdown(report: dict[str, Any]) -> str:
                     or verification.get("outcome")
                     or "not tested",
                 )
+            )
+        if omitted_authenticated_only:
+            lines.extend(
+                [
+                    "",
+                    f"{omitted_authenticated_only} authenticated-only rows are omitted from this compact view; the complete list remains in `capability-comparison.json`.",
+                ]
             )
         lines.append("")
     return "\n".join(lines)

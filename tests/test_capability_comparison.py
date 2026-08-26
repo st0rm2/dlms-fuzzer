@@ -128,6 +128,26 @@ class CapabilityComparisonTests(unittest.TestCase):
         self.assertIn("Public versus `client4`", markdown)
         self.assertIn("| GET |", markdown)
 
+    def test_markdown_omits_authenticated_only_detail_but_json_model_keeps_it(self):
+        public = snapshot("public", [])
+        secure = snapshot(
+            "client4",
+            [
+                object_record(
+                    18,
+                    "0.0.44.0.0.255",
+                    attributes=(attribute(5, read=True),),
+                )
+            ],
+        )
+        report = build_workflow_comparison(public, [(secure, None)])
+
+        markdown = render_comparison_markdown(report)
+
+        self.assertEqual(len(report["comparisons"][0]["capabilities"]), 1)
+        self.assertIn("1 authenticated-only rows are omitted", markdown)
+        self.assertNotIn("0.0.44.0.0.255", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

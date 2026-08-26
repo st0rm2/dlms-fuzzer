@@ -1109,6 +1109,7 @@ def run_authentication_scan(
     meter_identity: str | None,
     counter_candidates: tuple[Any, ...] | list[Any],
     progress: ProgressCallback,
+    known_good_association: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Probe one configured role after its ordinary scan has completed."""
 
@@ -1158,32 +1159,46 @@ def run_authentication_scan(
             )
 
     results: list[dict[str, Any]] = []
-    mechanisms = (
+    mechanisms = [
         ("none", None),
         ("low", Authentication.LOW),
         ("high", Authentication.HIGH),
         ("high_md5", Authentication.HIGH_MD5),
         ("high_sha1", Authentication.HIGH_SHA1),
         ("high_sha256", Authentication.HIGH_SHA256),
-    )
+    ]
+    if isinstance(profile, LlsProfile):
+        mechanisms.insert(0, mechanisms.pop(1))
     authentication_probe_total = len(mechanisms) + 1
-    for sequence, (mechanism, authentication) in enumerate(mechanisms, 1):
-        display_name = AUTHENTICATION_DISPLAY_NAMES[mechanism]
-        progress(
-            {
-                "phase": "authentication_scan_attempt",
-                "role": profile.role,
-                "client_address": profile.client_address,
-                "mechanism": mechanism,
-                "sequence": sequence,
-                "total": authentication_probe_total,
-                "message": (
-                    f"Testing {profile.role} / client {profile.client_address} / "
-                    f"{display_name}"
-                ),
-            }
-        )
+
+    known_good_mechanism = (
+        str(known_good_association.get("authentication"))
+        if known_good_association
+        else None
+    )
+    health_checks: list[dict[str, Any]] = []
+    known_good_confirmation: Callable[[str], dict[str, Any]] | None = None
+
+    def apply_known_good_context(result: dict[str, Any]) -> None:
+        if result["mechanism"] != known_good_mechanism:
+            return
+        result["known_good_baseline"] = True
+        if result["status"] != "authenticated":
+            result["observed_status"] = result["status"]
+            result["status"] = "inconsistent_with_known_good"
+
+    def run_standard_probe(
+        mechanism: str,
+        authentication: Any,
+        *,
+        health_check: bool = False,
+    ) -> dict[str, Any]:
         probe = None
+        phase = (
+            f"authentication_health_{mechanism}_finalization"
+            if health_check
+            else f"authentication_scan_{mechanism}_finalization"
+        )
         try:
             if authentication is None:
                 probe = GuruxSession(
@@ -1195,6 +1210,13 @@ def run_authentication_scan(
                     **endpoint,
                 )
             else:
+                probe_password = (
+                    resolve_lls_password(profile)
+                    if isinstance(profile, LlsProfile)
+                    and mechanism == "low"
+                    and mechanism == known_good_mechanism
+                    else password
+                )
                 probe = GuruxAuthenticationProbeSession(
                     config,
                     baudrate,
@@ -1202,7 +1224,7 @@ def run_authentication_scan(
                     authentication,
                     client_address=profile.client_address,
                     profile_name=profile.role,
-                    password=password,
+                    password=probe_password,
                     client_system_title=(
                         profile.client_system_title
                         if isinstance(profile, SecureProfile)
@@ -1211,36 +1233,134 @@ def run_authentication_scan(
                     **endpoint,
                 )
             association = probe.connect()
-            result = _authentication_probe_record(
+            return _authentication_probe_record(
                 mechanism, session=probe, association=association
             )
         except Exception as exc:
-            result = _authentication_probe_record(
+            return _authentication_probe_record(
                 mechanism, session=probe, error=exc
             )
         finally:
             if probe is not None:
-                _record_cleanup_warnings(
-                    report,
-                    probe.close(),
-                    phase=f"authentication_scan_{mechanism}_finalization",
-                )
-        results.append(result)
+                _record_cleanup_warnings(report, probe.close(), phase=phase)
+
+    def confirm_standard_known_good(after_mechanism: str) -> dict[str, Any]:
+        authentication = dict(mechanisms)[known_good_mechanism]
         progress(
             {
-                "phase": "authentication_scan_result",
+                "phase": "authentication_health_check",
                 "role": profile.role,
-                "client_address": profile.client_address,
-                "mechanism": mechanism,
-                "status": result["status"],
-                "sequence": sequence,
-                "total": authentication_probe_total,
+                "mechanism": known_good_mechanism,
+                "after_mechanism": after_mechanism,
                 "message": (
-                    f"{profile.role} / client {profile.client_address} / "
-                    f"{display_name}: {result['status']}"
+                    f"Confirming {profile.role} still accepts its known-good "
+                    f"{AUTHENTICATION_DISPLAY_NAMES[known_good_mechanism]} association"
                 ),
             }
         )
+        check = run_standard_probe(
+            known_good_mechanism,
+            authentication,
+            health_check=True,
+        )
+        check.update(
+            {
+                "after_mechanism": after_mechanism,
+                "check_sequence": len(health_checks) + 1,
+            }
+        )
+        health_checks.append(check)
+        progress(
+            {
+                "phase": "authentication_health_result",
+                "role": profile.role,
+                "mechanism": known_good_mechanism,
+                "after_mechanism": after_mechanism,
+                "status": check["status"],
+                "message": (
+                    f"Known-good {profile.role} connection after {after_mechanism}: "
+                    f"{check['status']}"
+                ),
+            }
+        )
+        return check
+
+    if known_good_mechanism in dict(mechanisms):
+        known_good_confirmation = confirm_standard_known_good
+
+    def append_unavailable_results(
+        remaining: list[tuple[str, Any]], *, after_mechanism: str
+    ) -> None:
+        for mechanism, _authentication in remaining:
+            skipped = _authentication_probe_record(mechanism, attempted=False)
+            skipped.update(
+                {
+                    "status": "not_tested_known_good_unavailable",
+                    "skip_reason": (
+                        "The known-good association failed after "
+                        f"{after_mechanism}; later results would be unreliable."
+                    ),
+                }
+            )
+            results.append(skipped)
+
+    def run_password_probes(start_sequence: int) -> bool:
+        for index, (mechanism, authentication) in enumerate(mechanisms):
+            sequence = start_sequence + index
+            display_name = AUTHENTICATION_DISPLAY_NAMES[mechanism]
+            progress(
+                {
+                    "phase": "authentication_scan_attempt",
+                    "role": profile.role,
+                    "client_address": profile.client_address,
+                    "mechanism": mechanism,
+                    "sequence": sequence,
+                    "total": authentication_probe_total,
+                    "message": (
+                        f"Testing {profile.role} / client {profile.client_address} / "
+                        f"{display_name}"
+                    ),
+                }
+            )
+            result = run_standard_probe(mechanism, authentication)
+            apply_known_good_context(result)
+            results.append(result)
+            progress(
+                {
+                    "phase": "authentication_scan_result",
+                    "role": profile.role,
+                    "client_address": profile.client_address,
+                    "mechanism": mechanism,
+                    "status": result["status"],
+                    "sequence": sequence,
+                    "total": authentication_probe_total,
+                    "message": (
+                        f"{profile.role} / client {profile.client_address} / "
+                        f"{display_name}: {result['status']}"
+                    ),
+                }
+            )
+            remaining = mechanisms[index + 1 :]
+            if (
+                mechanism == known_good_mechanism
+                and result["status"] != "authenticated"
+            ):
+                append_unavailable_results(remaining, after_mechanism=mechanism)
+                return False
+            if (
+                remaining
+                and mechanism != known_good_mechanism
+                and known_good_confirmation is not None
+            ):
+                check = known_good_confirmation(mechanism)
+                if check["status"] != "authenticated":
+                    append_unavailable_results(remaining, after_mechanism=mechanism)
+                    return False
+        return True
+
+    secure_first = isinstance(profile, SecureProfile)
+    if not secure_first:
+        run_password_probes(1)
 
     progress(
         {
@@ -1248,7 +1368,7 @@ def run_authentication_scan(
             "role": profile.role,
             "client_address": profile.client_address,
             "mechanism": "high_gmac",
-            "sequence": authentication_probe_total,
+            "sequence": 1 if secure_first else authentication_probe_total,
             "total": authentication_probe_total,
             "message": (
                 f"Testing {profile.role} / client {profile.client_address} / "
@@ -1261,7 +1381,9 @@ def run_authentication_scan(
     counter_refreshes: list[dict[str, Any]] = []
     gmac_attempts: list[dict[str, Any]] = []
 
-    def refresh_meter_counter() -> int | None:
+    def refresh_meter_counter(
+        refreshes: list[dict[str, Any]], *, health_check: bool = False
+    ) -> int | None:
         if not isinstance(profile, SecureProfile):
             return None
         refresh_session = None
@@ -1269,6 +1391,7 @@ def run_authentication_scan(
             {
                 "phase": "authentication_counter_refresh",
                 "role": profile.role,
+                "health_check": health_check,
                 "message": (
                     f"Refreshing the public invocation counter for {profile.role}"
                 ),
@@ -1285,10 +1408,10 @@ def run_authentication_scan(
             )
             refresh_session.connect()
             value = refresh_session.read_invocation_counter(profile)
-            counter_refreshes.append({"status": "success", "value": value})
+            refreshes.append({"status": "success", "value": value})
             return value
         except Exception as exc:
-            counter_refreshes.append(
+            refreshes.append(
                 {
                     "status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
@@ -1308,7 +1431,7 @@ def run_authentication_scan(
             raise RuntimeError(
                 "HIGH_GMAC requires an hls_gmac_suite0 role with system title and keys"
             )
-        refreshed_counter = refresh_meter_counter()
+        refreshed_counter = refresh_meter_counter(counter_refreshes)
         if refreshed_counter is not None:
             meter_counter = refreshed_counter
             counter_error = None
@@ -1380,7 +1503,7 @@ def run_authentication_scan(
                     phase="authentication_scan_high_gmac_retry_finalization",
                 )
                 gmac_session = None
-                refreshed_counter = refresh_meter_counter()
+                refreshed_counter = refresh_meter_counter(counter_refreshes)
                 if refreshed_counter is not None:
                     counter_lease.persist_next(
                         max(counter_lease.next_counter, refreshed_counter + 1)
@@ -1417,7 +1540,9 @@ def run_authentication_scan(
     gmac_result["attempt_count"] = len(gmac_attempts)
     gmac_result["attempts"] = gmac_attempts
     gmac_result["counter_refreshes"] = counter_refreshes
+    apply_known_good_context(gmac_result)
     results.append(gmac_result)
+    gmac_sequence = 1 if secure_first else authentication_probe_total
     progress(
         {
             "phase": "authentication_scan_result",
@@ -1425,7 +1550,7 @@ def run_authentication_scan(
             "client_address": profile.client_address,
             "mechanism": "high_gmac",
             "status": gmac_result["status"],
-            "sequence": authentication_probe_total,
+            "sequence": gmac_sequence,
             "total": authentication_probe_total,
             "message": (
                 f"{profile.role} / client {profile.client_address} / "
@@ -1435,6 +1560,170 @@ def run_authentication_scan(
         }
     )
 
+    def confirm_secure_known_good(after_mechanism: str) -> dict[str, Any]:
+        progress(
+            {
+                "phase": "authentication_health_check",
+                "role": profile.role,
+                "mechanism": "high_gmac",
+                "after_mechanism": after_mechanism,
+                "message": (
+                    f"Confirming {profile.role} still accepts its known-good "
+                    "HLS-GMAC association with a fresh counter bootstrap"
+                ),
+            }
+        )
+        health_session = None
+        health_lease = None
+        refreshes: list[dict[str, Any]] = []
+        attempts: list[dict[str, Any]] = []
+        association = None
+        health_error: BaseException | None = None
+        try:
+            refreshed_counter = refresh_meter_counter(
+                refreshes, health_check=True
+            )
+            if (
+                refreshed_counter is None
+                and profile.invocation_counter.unsafe_override is None
+            ):
+                raise RuntimeError(
+                    "fresh public invocation-counter bootstrap failed; "
+                    "known-good HLS-GMAC health check was not attempted"
+                )
+            identity = counter_identity(
+                meter_identity=meter_identity,
+                client_system_title=profile.client_system_title,
+                client_address=profile.client_address,
+                server_address=int(transport["selected_server_address"]),
+            )
+            health_lease = acquire_counter_lease(
+                profile.invocation_counter.state_file,
+                identity,
+                meter_reported_counter=refreshed_counter,
+                unsafe_override=profile.invocation_counter.unsafe_override,
+            )
+            gak, guek = resolve_secure_keys(profile)
+            for attempt in (1, 2):
+                health_session = GuruxSecureSession(
+                    config,
+                    baudrate,
+                    traffic,
+                    health_lease,
+                    gak,
+                    guek,
+                    **endpoint,
+                )
+                try:
+                    association = health_session.connect()
+                except Exception as exc:
+                    health_error = exc
+                    aarq_accepted = bool(
+                        getattr(health_session, "aarq_accepted", False)
+                    )
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "status": (
+                                "hls_validation_failed"
+                                if aarq_accepted
+                                else "rejected"
+                            ),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    if aarq_accepted or attempt == 2:
+                        break
+                    _record_cleanup_warnings(
+                        report,
+                        health_session.close(),
+                        phase="authentication_health_high_gmac_retry_finalization",
+                    )
+                    health_session = None
+                    refreshed_counter = refresh_meter_counter(
+                        refreshes, health_check=True
+                    )
+                    if refreshed_counter is None:
+                        break
+                    health_lease.persist_next(
+                        max(health_lease.next_counter, refreshed_counter + 1)
+                    )
+                else:
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "status": "authenticated",
+                            "error": None,
+                        }
+                    )
+                    break
+            check = _authentication_probe_record(
+                "high_gmac",
+                session=health_session,
+                association=association,
+                error=health_error if association is None else None,
+                security_policy="authentication_encryption",
+            )
+        except Exception as exc:
+            check = _authentication_probe_record(
+                "high_gmac",
+                session=health_session,
+                error=exc,
+                attempted=health_session is not None,
+                security_policy="authentication_encryption",
+            )
+        finally:
+            if health_session is not None:
+                _record_cleanup_warnings(
+                    report,
+                    health_session.close(),
+                    phase="authentication_health_high_gmac_finalization",
+                )
+            if health_lease is not None:
+                health_lease.close()
+        check.update(
+            {
+                "after_mechanism": after_mechanism,
+                "check_sequence": len(health_checks) + 1,
+                "attempt_count": len(attempts),
+                "attempts": attempts,
+                "counter_refreshes": refreshes,
+                "counter_safety": (
+                    "fresh public meter counter combined with the persisted "
+                    "monotonic client-counter lease; counters are never reused"
+                ),
+            }
+        )
+        health_checks.append(check)
+        progress(
+            {
+                "phase": "authentication_health_result",
+                "role": profile.role,
+                "mechanism": "high_gmac",
+                "after_mechanism": after_mechanism,
+                "status": check["status"],
+                "message": (
+                    f"Known-good {profile.role} HLS-GMAC connection after "
+                    f"{after_mechanism}: {check['status']}"
+                ),
+            }
+        )
+        return check
+
+    if secure_first:
+        if known_good_mechanism == "high_gmac":
+            if gmac_result["status"] == "authenticated":
+                known_good_confirmation = confirm_secure_known_good
+            else:
+                append_unavailable_results(
+                    mechanisms, after_mechanism="high_gmac"
+                )
+        if not (
+            known_good_mechanism == "high_gmac"
+            and gmac_result["status"] != "authenticated"
+        ):
+            run_password_probes(2)
+
     results.append(
         _authentication_probe_record(
             "high_ecdsa", supported=False, security_policy="implementation_defined"
@@ -1443,6 +1732,26 @@ def run_authentication_scan(
     accepted = [
         item["mechanism"] for item in results if item["fully_authenticated"] is True
     ]
+    known_good_baseline = next(
+        (
+            item
+            for item in results
+            if item["mechanism"] == known_good_mechanism
+            and item.get("known_good_baseline")
+        ),
+        None,
+    )
+    health_check_complete = (
+        None
+        if known_good_mechanism is None
+        else bool(
+            known_good_baseline
+            and known_good_baseline.get("status") == "authenticated"
+            and all(
+                item.get("status") == "authenticated" for item in health_checks
+            )
+        )
+    )
     return {
         "name": profile.name,
         "role": profile.role,
@@ -1450,6 +1759,11 @@ def run_authentication_scan(
         "authentication_scan": {
             "results": results,
             "accepted_mechanisms": accepted,
+            "execution_order": [item["mechanism"] for item in results],
+            "known_good_mechanism": known_good_mechanism,
+            "health_checks": health_checks,
+            "health_check_complete": health_check_complete,
+            "session_guard_ms": config.transport.session_guard_ms,
             "complete": True,
             "high_ecdsa_limitation": (
                 "Not attempted because signing-key and certificate credentials are not supported."
@@ -2066,6 +2380,7 @@ def scan_public(
         object_records: list[dict[str, Any]] = []
         get_success = 0
         get_failed = 0
+        unexpected_get_failed = 0
         profile_result: dict[str, Any] = {
             "name": profile_name,
             "type": config.profile.name,
@@ -2427,6 +2742,8 @@ def scan_public(
                     continue
 
                 last_exception: BaseException | None = None
+                candidate_probe = bool(access_rights.get("catalogue_probe"))
+                expected_candidate_rejection = False
                 allowed_attempts = retry_policy.attempts_for_next_get(
                     config.scan.total_get_attempts
                 )
@@ -2456,7 +2773,25 @@ def scan_public(
                         attribute_result["attempts"].append(
                             {"attempt": attempt, "outcome": outcome.value, "error": f"{type(exc).__name__}: {exc}"}
                         )
-                        report["errors"].append(error_record(exc, phase="get_scan", context={**identity, "attempt": attempt}))
+                        expected_candidate_rejection = (
+                            candidate_probe and outcome == Outcome.DLMS_ERROR
+                        )
+                        if expected_candidate_rejection:
+                            message = str(exc).lower()
+                            attribute_result["candidate_assessment"] = (
+                                "object_unavailable"
+                                if "object unavailable" in message
+                                or "object_unavailable" in message
+                                else "access_rejected"
+                            )
+                        else:
+                            report["errors"].append(
+                                error_record(
+                                    exc,
+                                    phase="get_scan",
+                                    context={**identity, "attempt": attempt},
+                                )
+                            )
                         progress(
                             {
                                 "phase": "get_error",
@@ -2505,6 +2840,8 @@ def scan_public(
                         }
                     )
                     get_failed += 1
+                    if not expected_candidate_rejection:
+                        unexpected_get_failed += 1
                 else:
                     get_success += 1
                 profile_result["summary"].update(
@@ -2559,6 +2896,42 @@ def scan_public(
         profile_result["identification"] = identification
         profile_result["authentication_enumeration"] = _authentication_enumeration(
             object_records, association
+        )
+        candidate_attributes = [
+            attribute
+            for obj in object_records
+            for attribute in obj.get("attributes", [])
+            if attribute.get("access_rights", {}).get("catalogue_probe")
+        ]
+        report["candidate_generation"].update(
+            {
+                "verified_targets": sum(
+                    attribute.get("outcome") == Outcome.SUCCESS.value
+                    for attribute in candidate_attributes
+                ),
+                "negative_targets": sum(
+                    attribute.get("candidate_assessment")
+                    in {"object_unavailable", "access_rejected"}
+                    for attribute in candidate_attributes
+                ),
+                "object_unavailable_targets": sum(
+                    attribute.get("candidate_assessment") == "object_unavailable"
+                    for attribute in candidate_attributes
+                ),
+                "access_rejected_targets": sum(
+                    attribute.get("candidate_assessment") == "access_rejected"
+                    for attribute in candidate_attributes
+                ),
+                "inconclusive_targets": sum(
+                    attribute.get("outcome")
+                    in {
+                        Outcome.TIMEOUT.value,
+                        Outcome.PROTOCOL_ERROR.value,
+                        Outcome.INCONCLUSIVE.value,
+                    }
+                    for attribute in candidate_attributes
+                ),
+            }
         )
         profile_result["security_posture"] = build_security_posture(profile_result)
         profile_result["summary"].update(
@@ -2708,7 +3081,9 @@ def scan_public(
                     "invocation-counter reuse test"
                 )
         report["run"]["status"] = (
-            "completed" if not get_failed and not report["errors"] else "completed_with_errors"
+            "completed"
+            if not unexpected_get_failed and not report["errors"]
+            else "completed_with_errors"
         )
     except KeyboardInterrupt:
         report["run"]["status"] = "interrupted"

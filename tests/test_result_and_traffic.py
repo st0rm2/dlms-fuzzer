@@ -397,6 +397,64 @@ class ResultAndTrafficTests(unittest.TestCase):
         )
         self.assertNotIn("7EA02C0309540911DEADBEEF7E", rendered)
 
+    def test_large_protected_evidence_is_summarized_in_markdown(self):
+        ciphertext = "AB" * 500
+        protected = [
+            {
+                "sequence_number": index,
+                "direction": "RX",
+                "operation": "GET",
+                "result": "SUCCESS",
+                "object_context": {
+                    "class_id": 1,
+                    "logical_name": "1.0.1.8.0.255",
+                    "attribute_id": 2,
+                },
+                "protected_command": "glo-get-response",
+                "security_control": "0x30",
+                "invocation_counter": index,
+                "ciphertext_hex": ciphertext,
+                "ciphertext_captured_length": 500,
+                "ciphertext_declared_length": 500,
+                "ciphertext_complete": True,
+            }
+            for index in range(100)
+        ]
+        report = {
+            "run": {"id": "test", "status": "completed"},
+            "transport": {},
+            "profiles": [
+                {
+                    "name": "client4",
+                    "association": {},
+                    "summary": {},
+                    "scan_scope": {},
+                    "objects": [
+                        {
+                            "class_id": 1,
+                            "logical_name": "1.0.1.8.0.255",
+                            "attributes": [
+                                {
+                                    "attribute_id": 2,
+                                    "outcome": "SUCCESS",
+                                    "access_rights": {"read": True},
+                                }
+                            ],
+                            "methods": [],
+                        }
+                    ],
+                }
+            ],
+            "errors": [],
+        }
+
+        rendered = render_summary_report(report, protected)
+
+        self.assertIn("captured ciphertext bytes — see traffic.jsonl", rendered)
+        self.assertIn("20 entries omitted; see traffic.jsonl", rendered)
+        self.assertIn("[sha256:", rendered)
+        self.assertNotIn(ciphertext, rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

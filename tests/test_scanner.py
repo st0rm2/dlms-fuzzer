@@ -289,6 +289,17 @@ class CandidateSession(LimitedSession):
         return SnapshotObject(class_id, logical_name)
 
 
+class GXDLMSException(Exception):
+    pass
+
+
+class RejectedCandidateSession(CandidateSession):
+    def read_attribute(self, target, attribute_id, attempt):
+        if target.logicalName == "0.0.128.0.0.255":
+            raise GXDLMSException("object unavailable")
+        return super().read_attribute(target, attribute_id, attempt)
+
+
 class SecuritySetupObject(FakeObject):
     objectType = 64
     logicalName = "0.0.43.0.0.255"
@@ -384,6 +395,46 @@ class ScannerTests(unittest.TestCase):
         )
         self.assertEqual(profile["summary"]["security_setup_objects"], 1)
         self.assertEqual(len(profile["scan_scope"]["prioritized_posture_gets"]), 2)
+
+    def test_expected_candidate_rejection_is_evidence_not_a_run_error(self):
+        config = parse_config(
+            {
+                "transport": {
+                    "device": "/dev/null",
+                    "baudrate": 9600,
+                    "inter_request_delay_ms": 0,
+                },
+                "scan": {
+                    "common_catalogue": False,
+                    "candidate_providers": [],
+                    "candidate_limit": 1,
+                    "candidate_objects": [
+                        {
+                            "class_id": 99,
+                            "logical_name": "0.0.128.0.0.255",
+                            "attributes": [2],
+                        }
+                    ],
+                },
+            }
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = RejectedCandidateSession
+        with patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan_public(config, object())
+
+        candidate = next(
+            obj
+            for obj in report["profiles"][0]["objects"]
+            if obj["logical_name"] == "0.0.128.0.0.255"
+        )
+        self.assertEqual(report["run"]["status"], "completed")
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["candidate_generation"]["negative_targets"], 1)
+        self.assertEqual(
+            candidate["attributes"][0]["candidate_assessment"],
+            "object_unavailable",
+        )
 
     def test_saved_association_view_skips_object_list_download(self):
         config = parse_config(

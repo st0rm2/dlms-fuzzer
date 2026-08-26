@@ -475,7 +475,11 @@ def _parse_scan(raw: Any) -> ScanConfig:
 
 def _parse_authentication_scan(raw: Any) -> AuthenticationScanConfig:
     data = _mapping(raw, "authentication_scan")
-    _only_keys(data, {"enabled", "password"}, "authentication_scan")
+    _only_keys(
+        data,
+        {"enabled", "password"},
+        "authentication_scan",
+    )
     enabled = data.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ConfigError("authentication_scan.enabled must be boolean")

@@ -33,6 +33,12 @@ Normal scans must not send arbitrary SET or ACTION requests, transfer firmware, 
 - [x] Profile Generic/event-log row rendering after multi-block reassembly.
 - [x] Read-only Security Setup and Image Transfer posture reporting.
 - [x] Bounded providers for known objects omitted from an Association View.
+- [x] Keep candidate rejections out of run errors and separate generated objects
+  from Association View-advertised security/firmware posture.
+- [x] Decode COSEM event-log timestamps and label numeric event codes.
+- [x] Compact large protected-ciphertext and authenticated-only comparison output.
+- [x] Verify each role's known-good authentication first and recheck it between
+  mechanisms using the existing transport session guard.
 
 ## Completed: public-versus-authenticated capability comparison
 
@@ -72,7 +78,7 @@ Before adding more scan breadth, validate the new behavior against the authorize
 
 - [ ] Prove Association View reuse skips the large object-list download.
 - [ ] Confirm one prioritized event log is read and rendered correctly.
-- [ ] Confirm the refreshed/retried final HLS-GMAC check reflects the known-good role.
+- [ ] Confirm the refreshed/retried first HLS-GMAC check reflects the known-good role.
 - [ ] Review the generated public-versus-authenticated permission comparison.
 - [ ] Review Security Setup and Image Transfer posture values and passive findings.
 - [ ] Run an explicitly enabled, bounded `security`/`firmware` candidate scan.
@@ -136,7 +142,7 @@ This should be a separate command with explicit authorization and attempt limits
 - [ ] Test application context/protection, authentication mechanism, security suite, and security policy as separate dimensions.
 - [ ] Establish a known-good baseline before testing weaker variants.
 - [ ] Distinguish AARE acceptance, completed HLS, protected-service acceptance, granted rights, and a successful harmless GET.
-- [ ] Bound attempts and add cooldown and lockout warnings.
+- [ ] Bound attempts, reuse the transport session guard, and add lockout warnings.
 - [ ] Never continue a normal scan under a weaker association after the expected secure association fails.
 - [ ] Produce a matrix of proposed versus negotiated/observed properties and explain why each result is or is not a downgrade.
 

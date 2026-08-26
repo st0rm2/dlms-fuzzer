@@ -51,6 +51,52 @@ class ProfileLogRenderingTests(unittest.TestCase):
             '[["2026-08-24T11:12:50Z","Power restored"]', rendered
         )
 
+    def test_cosem_datetime_and_numeric_event_code_are_rendered_as_log_columns(self):
+        report = {
+            "run": {"id": "run", "status": "completed"},
+            "transport": {},
+            "profiles": [
+                {
+                    "name": "public",
+                    "association": {},
+                    "summary": {},
+                    "scan_scope": {},
+                    "objects": [
+                        {
+                            "class_id": 7,
+                            "logical_name": "1.0.99.98.0.255",
+                            "description": "Event log",
+                            "attributes": [
+                                {
+                                    "attribute_id": 2,
+                                    "outcome": "SUCCESS",
+                                    "access_rights": {"read": True},
+                                    "decoded": {
+                                        "value": [[
+                                            {
+                                                "encoding": "octet-string",
+                                                "hex": "07EA030D050F0F1C00FFC400",
+                                                "length": 12,
+                                            },
+                                            255,
+                                        ]]
+                                    },
+                                }
+                            ],
+                            "methods": [],
+                        }
+                    ],
+                }
+            ],
+            "errors": [],
+        }
+
+        rendered = render_summary_report(report)
+
+        self.assertIn("| Timestamp | Event code | Description |", rendered)
+        self.assertIn("2026-03-13T15:15:28+01:00", rendered)
+        self.assertIn("Meter-specific event code 255", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

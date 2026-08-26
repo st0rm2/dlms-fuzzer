@@ -77,6 +77,22 @@ class FakePasswordSession(FakeSession):
         return {"authentication": self.mechanism, "hls_validated": True}
 
 
+class CapturingPasswordSession(FakeSession):
+    calls = []
+
+    def __init__(
+        self, _config, _baudrate, _traffic, authentication, *, password, **kwargs
+    ):
+        super().__init__(client_address=kwargs["client_address"])
+        self.mechanism = authentication.name.lower()
+        self.password = password
+        self.calls.append((self.mechanism, password))
+
+    def connect(self):
+        self.aarq_accepted = True
+        return {"authentication": self.mechanism, "hls_validated": True}
+
+
 class FakeGmacSession(FakeSession):
     def connect(self):
         self.aarq_accepted = True
@@ -100,6 +116,16 @@ class RetryGmacSession(FakeGmacSession):
         type(self).connect_calls += 1
         if type(self).connect_calls == 1:
             raise RuntimeError("fresh association temporarily rejected")
+        return super().connect()
+
+
+class HealthFailureGmacSession(FakeGmacSession):
+    connect_calls = 0
+
+    def connect(self):
+        type(self).connect_calls += 1
+        if type(self).connect_calls > 1:
+            raise RuntimeError("known-good connection no longer accepted")
         return super().connect()
 
 
@@ -137,6 +163,13 @@ class AuthenticationScanTests(unittest.TestCase):
         del mapping["authentication_scan"]["password"]
 
         with self.assertRaisesRegex(ConfigError, "password is required"):
+            parse_config(mapping)
+
+    def test_authentication_scan_has_no_separate_cooldown_setting(self):
+        mapping = authentication_scan_mapping()
+        mapping["authentication_scan"]["cooldown_ms"] = 2000
+
+        with self.assertRaisesRegex(ConfigError, "unsupported keys: cooldown_ms"):
             parse_config(mapping)
 
     def test_standalone_authentication_profile_is_rejected(self):
@@ -206,6 +239,42 @@ class AuthenticationScanTests(unittest.TestCase):
             7,
         )
         self.assertTrue(any("client 4 / HLS-GMAC" in event["message"] for event in events))
+        self.assertEqual(
+            result["authentication_scan"]["execution_order"][0], "high_gmac"
+        )
+
+    def test_failed_known_good_probe_is_reported_as_a_contradiction(self):
+        full = parse_config(authentication_scan_mapping())
+        config = full.for_profile(full.profiles[1])
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = FakeSession
+        module.GuruxAuthenticationProbeSession = FakePasswordSession
+
+        class RejectedGmacSession(FakeGmacSession):
+            def connect(self):
+                raise RuntimeError("temporarily rejected")
+
+        module.GuruxSecureSession = RejectedGmacSession
+        with (
+            patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}),
+            patch.dict(os.environ, {"TEST_DLMS_PASSWORD": "00000000"}),
+            patch("dlms_enum.scanner.acquire_counter_lease", return_value=FakeLease()),
+            patch("dlms_enum.scanner.resolve_secure_keys", return_value=(b"A" * 16, b"B" * 16)),
+        ):
+            result = run_authentication_scan(
+                config,
+                object(),
+                transport=TRANSPORT,
+                meter_identity="METER-1",
+                counter_candidates=(CounterCandidate(1, "0.0.43.1.1.255", 2, 10),),
+                progress=lambda _event: None,
+                known_good_association={"authentication": "high_gmac"},
+            )
+
+        gmac = result["authentication_scan"]["results"][0]
+        self.assertEqual(gmac["status"], "inconsistent_with_known_good")
+        self.assertEqual(gmac["observed_status"], "rejected")
+        self.assertTrue(gmac["known_good_baseline"])
 
     def test_public_role_marks_gmac_as_prerequisite_failed(self):
         full = parse_config(authentication_scan_mapping())
@@ -268,6 +337,168 @@ class AuthenticationScanTests(unittest.TestCase):
             ["rejected", "authenticated"],
         )
         self.assertEqual(len(gmac["counter_refreshes"]), 2)
+
+    def test_secure_known_good_connection_is_rechecked_between_mechanisms(self):
+        full = parse_config(authentication_scan_mapping())
+        config = full.for_profile(full.profiles[1])
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = FakeSession
+        module.GuruxAuthenticationProbeSession = FakePasswordSession
+        module.GuruxSecureSession = FakeGmacSession
+        events = []
+
+        with (
+            patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}),
+            patch.dict(os.environ, {"TEST_DLMS_PASSWORD": "00000000"}),
+            patch(
+                "dlms_enum.scanner.acquire_counter_lease",
+                side_effect=lambda *_args, **_kwargs: FakeLease(),
+            ) as acquire,
+            patch(
+                "dlms_enum.scanner.resolve_secure_keys",
+                return_value=(b"A" * 16, b"B" * 16),
+            ),
+        ):
+            result = run_authentication_scan(
+                config,
+                object(),
+                transport=TRANSPORT,
+                meter_identity="METER-1",
+                counter_candidates=(
+                    CounterCandidate(1, "0.0.43.1.1.255", 2, 129127),
+                ),
+                progress=events.append,
+                known_good_association={"authentication": "high_gmac"},
+            )
+
+        scan = result["authentication_scan"]
+        self.assertTrue(scan["health_check_complete"])
+        self.assertEqual(len(scan["health_checks"]), 5)
+        self.assertEqual(acquire.call_count, 6)
+        self.assertTrue(
+            all(check["counter_refreshes"] for check in scan["health_checks"])
+        )
+        self.assertTrue(
+            all("never reused" in check["counter_safety"] for check in scan["health_checks"])
+        )
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in events
+                    if event["phase"] == "authentication_health_result"
+                ]
+            ),
+            5,
+        )
+
+    def test_lls_health_checks_reuse_the_role_password_not_the_scan_password(self):
+        mapping = authentication_scan_mapping()
+        mapping["profiles"] = [
+            {
+                "name": "lls",
+                "role": "meter_reader",
+                "client_address": 32,
+                "authentication": {
+                    "mechanism": "low",
+                    "password": {"env": "TEST_LLS_ROLE_PASSWORD"},
+                },
+            }
+        ]
+        full = parse_config(mapping)
+        config = full.for_profile(full.profiles[0])
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = FakeSession
+        module.GuruxAuthenticationProbeSession = CapturingPasswordSession
+        module.GuruxSecureSession = FakeGmacSession
+        CapturingPasswordSession.calls = []
+
+        with (
+            patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}),
+            patch.dict(
+                os.environ,
+                {
+                    "TEST_DLMS_PASSWORD": "scan-password",
+                    "TEST_LLS_ROLE_PASSWORD": "role-password",
+                },
+            ),
+        ):
+            result = run_authentication_scan(
+                config,
+                object(),
+                transport=TRANSPORT,
+                meter_identity="METER-1",
+                counter_candidates=(),
+                progress=lambda _event: None,
+                known_good_association={"authentication": "low"},
+            )
+
+        scan = result["authentication_scan"]
+        low_passwords = [
+            password
+            for mechanism, password in CapturingPasswordSession.calls
+            if mechanism == "low"
+        ]
+        other_passwords = [
+            password
+            for mechanism, password in CapturingPasswordSession.calls
+            if mechanism != "low"
+        ]
+        self.assertTrue(scan["health_check_complete"])
+        self.assertEqual(len(scan["health_checks"]), 4)
+        self.assertTrue(low_passwords)
+        self.assertTrue(all(password == b"role-password" for password in low_passwords))
+        self.assertTrue(other_passwords)
+        self.assertTrue(all(password == b"scan-password" for password in other_passwords))
+
+    def test_failed_known_good_health_check_stops_later_mechanisms(self):
+        full = parse_config(authentication_scan_mapping())
+        config = full.for_profile(full.profiles[1])
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = FakeSession
+        module.GuruxAuthenticationProbeSession = FakePasswordSession
+        module.GuruxSecureSession = HealthFailureGmacSession
+        HealthFailureGmacSession.connect_calls = 0
+        events = []
+
+        with (
+            patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}),
+            patch.dict(os.environ, {"TEST_DLMS_PASSWORD": "00000000"}),
+            patch(
+                "dlms_enum.scanner.acquire_counter_lease",
+                side_effect=lambda *_args, **_kwargs: FakeLease(),
+            ),
+            patch(
+                "dlms_enum.scanner.resolve_secure_keys",
+                return_value=(b"A" * 16, b"B" * 16),
+            ),
+        ):
+            result = run_authentication_scan(
+                config,
+                object(),
+                transport=TRANSPORT,
+                meter_identity="METER-1",
+                counter_candidates=(
+                    CounterCandidate(1, "0.0.43.1.1.255", 2, 129127),
+                ),
+                progress=events.append,
+                known_good_association={"authentication": "high_gmac"},
+            )
+
+        scan = result["authentication_scan"]
+        results = {item["mechanism"]: item for item in scan["results"]}
+        self.assertFalse(scan["health_check_complete"])
+        self.assertEqual(len(scan["health_checks"]), 1)
+        self.assertEqual(
+            results["low"]["status"],
+            "not_tested_known_good_unavailable",
+        )
+        attempted = [
+            event["mechanism"]
+            for event in events
+            if event["phase"] == "authentication_scan_attempt"
+        ]
+        self.assertNotIn("low", attempted)
 
     def test_role_by_mechanism_matrix_renders_in_markdown_and_terminal(self):
         records = {

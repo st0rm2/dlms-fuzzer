@@ -153,15 +153,33 @@ class ScanUI:
             return
         if phase == "authentication_scan_result":
             status = str(event.get("status", "unknown"))
+            style = {
+                "authenticated": "bold green",
+                "rejected": "yellow",
+                "hls_validation_failed": "bold red",
+                "inconsistent_with_known_good": "bold red reverse",
+            }.get(status, "white")
             self._update(
                 stage="Auth scan",
-                description=f"{message}",
+                description=f"[{style}]{message}[/{style}]",
                 total=int(event.get("total", event.get("sequence", 1))),
                 completed=int(event.get("sequence", 1)),
             )
             return
-        if phase in {"authentication_counter_refresh", "authentication_scan_retry"}:
+        if phase in {
+            "authentication_counter_refresh",
+            "authentication_scan_retry",
+            "authentication_health_check",
+        }:
             self._update(stage="Auth scan", description=message)
+            return
+        if phase == "authentication_health_result":
+            status = str(event.get("status", "unknown"))
+            style = "bold green" if status == "authenticated" else "bold red"
+            self._update(
+                stage="Auth health",
+                description=f"[{style}]{message}[/{style}]",
+            )
             return
         if phase == "baud_detection":
             self._update(
@@ -329,14 +347,31 @@ class ScanUI:
                     )
                     if candidates.get("excluded_association_targets", 0)
                     else ""
+                )
+                + (
+                    "  •  [green]{} verified[/green]  •  [dim]{} rejected as expected[/dim]"
+                    .format(
+                        candidates.get("verified_targets", 0),
+                        candidates.get("negative_targets", 0),
+                    )
+                    if candidates.get("verified_targets", 0)
+                    or candidates.get("negative_targets", 0)
+                    else ""
                 ),
             )
+        expected_candidate_rejections = int(candidates.get("negative_targets", 0))
+        unexpected_get_failures = max(
+            0, int(summary.get("get_failed", 0)) - expected_candidate_rejections
+        )
         table.add_row(
             "GET results",
             "[bold green]{} succeeded[/bold green]  •  "
-            "[bold yellow]{} failed[/bold yellow]  •  {} inconclusive  •  {} not tested".format(
+            "[bold yellow]{} unexpected failures[/bold yellow]  •  "
+            "[dim]{} expected candidate rejections[/dim]  •  "
+            "{} inconclusive  •  {} not tested".format(
                 summary.get("get_success", 0),
-                summary.get("get_failed", 0),
+                unexpected_get_failures,
+                expected_candidate_rejections,
                 summary.get("get_inconclusive", 0),
                 summary.get("get_not_tested", 0),
             ),
@@ -458,7 +493,10 @@ def show_authentication_matrix(
     roles = matrix.get("roles", [])
     table = Table(
         title="Authentication result matrix",
-        caption="Authenticated = complete association (including HLS validation)",
+        caption=(
+            "Authenticated = complete association (including HLS validation). "
+            "Inconsistent = the same role worked in the normal scan."
+        ),
         show_lines=False,
     )
     table.add_column("Mechanism")
@@ -475,6 +513,8 @@ def show_authentication_matrix(
             "authenticated": "bold green",
             "rejected": "yellow",
             "hls_validation_failed": "bold red",
+            "inconsistent_with_known_good": "bold red reverse",
+            "not_tested_known_good_unavailable": "bold magenta",
             "prerequisite_failed": "magenta",
             "unsupported": "dim",
         }
@@ -491,6 +531,33 @@ def show_authentication_matrix(
             ],
         )
     console.print(table)
+
+    health_table = Table(
+        title="Known-good connection checks",
+        caption=(
+            "Each check uses a fresh association. Secure checks refresh and "
+            "advance invocation-counter state."
+        ),
+    )
+    health_table.add_column("Role")
+    health_table.add_column("After mechanism")
+    health_table.add_column("Known-good method")
+    health_table.add_column("Status")
+    health_rows = 0
+    for profile in report.get("profiles", []):
+        scan = profile.get("authentication_scan", {})
+        for check in scan.get("health_checks", []):
+            status = str(check.get("status", "unknown"))
+            style = "green" if status == "authenticated" else "bold red"
+            health_table.add_row(
+                str(profile.get("role", profile.get("name", "unknown"))),
+                str(check.get("after_mechanism", "—")),
+                str(check.get("mechanism", "—")),
+                f"[{style}]{status.replace('_', ' ')}[/{style}]",
+            )
+            health_rows += 1
+    if health_rows:
+        console.print(health_table)
 
 
 def show_capability_comparison(

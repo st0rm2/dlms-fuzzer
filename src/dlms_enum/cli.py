@@ -508,7 +508,8 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         console.rule("Final authentication scan")
         console.print(
             "Normal role scans are complete. Each authentication attempt now uses "
-            "a fresh association; rejected methods do not stop later tests."
+            "a fresh association. The known-good role is rechecked between methods; "
+            "later tests stop if that continuity check fails."
         )
         authentication_traffic_path = run_directory / "authentication-traffic.jsonl"
         authentication_report_path = run_directory / "authentication-report.json"
@@ -525,6 +526,15 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                     meter_identity=preflight.meter_identity,
                     counter_candidates=preflight.counter_candidates,
                     progress=authentication_ui.progress,
+                    known_good_association=next(
+                        (
+                            item.get("association")
+                            for item in role_reports.get(profile.role, {}).get(
+                                "profiles", []
+                            )
+                        ),
+                        None,
+                    ),
                 )
                 authentication_profiles.append(
                     {
@@ -582,6 +592,20 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 }
             )
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        authentication_errors = [
+            error
+            for item in authentication_profiles
+            for error in item.get("errors", [])
+        ]
+        known_good_contradiction = any(
+            result.get("status") == "inconsistent_with_known_good"
+            for item in authentication_profiles
+            for result in item["authentication_scan"].get("results", [])
+        )
+        known_good_health_failed = any(
+            item["authentication_scan"].get("health_check_complete") is False
+            for item in authentication_profiles
+        )
         authentication_report = {
             "schema_version": 1,
             "type": "authentication_matrix",
@@ -589,7 +613,13 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 "id": run_directory.name + "-authentication",
                 "started_at": now,
                 "finished_at": now,
-                "status": "completed",
+                "status": (
+                    "completed_with_errors"
+                    if authentication_errors
+                    or known_good_contradiction
+                    or known_good_health_failed
+                    else "completed"
+                ),
             },
             "effective_configuration": config.redacted_dict(),
             "transport": preflight.transport,
@@ -606,11 +636,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 "rows": matrix_rows,
             },
             "capability_matrix": [],
-            "errors": [
-                error
-                for item in authentication_profiles
-                for error in item.get("errors", [])
-            ],
+            "errors": authentication_errors,
         }
         write_report(
             authentication_report,
