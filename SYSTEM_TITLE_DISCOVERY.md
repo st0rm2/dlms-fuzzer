@@ -101,7 +101,15 @@ The direct public-DLMS methods were exhausted without recovering a title. The re
 
 If none of those sources is available, there is no standards-guaranteed way to recover this meter's system title without using an association authorized to expose Security Setup.
 
-A useful future addition to `dlms-autodiscover` would be a passive-listen mode that recognizes AARE and `GeneralGloCiphering` frames and reports any clear-text system title without attempting decryption.
+The main scanner now provides this passive option:
+
+```shell
+dlms-enum scan --config meter.yaml --system-title-listen-seconds 60
+```
+
+After public preflight confirms the serial settings, the tool listens without
+transmitting, recognizes AARE and `GeneralGloCiphering` frames, and reports any
+clear-text eight-byte sender system title without attempting decryption.
 
 ## References
 

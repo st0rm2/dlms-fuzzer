@@ -769,7 +769,7 @@ def _parse_profiles(
             if password.kind == "inline":
                 warnings.append(
                     f"Role {role}: an inline LLS password is for laboratory use only "
-                    "and will be redacted from all output."
+                    "and may be exposed when output.redact_secrets is false."
                 )
             parsed.append(
                 LlsProfile(
@@ -820,7 +820,11 @@ def _parse_profiles(
         gak = _parse_secret_source(secrets["gak"], f"{label}.secrets.gak", base_directory)
         guek = _parse_secret_source(secrets["guek"], f"{label}.secrets.guek", base_directory)
         if gak.kind == "inline" or guek.kind == "inline":
-            warnings.append(f"Role {role}: inline GAK/GUEK values are for laboratory use only and will be redacted from all output.")
+            warnings.append(
+                f"Role {role}: inline GAK/GUEK values are for laboratory use only; "
+                "raw protocol evidence may expose authentication data when "
+                "output.redact_secrets is false."
+            )
         parsed.append(
             SecureProfile(
                 name=SECURE_PROFILE_NAME,
@@ -859,9 +863,10 @@ def _parse_output(raw: Any) -> OutputConfig:
     for key in ("report_file", "summary_file", "traffic_file"):
         if Path(values[key]).name != values[key]:
             raise ConfigError(f"output.{key} must be a file name, not a path")
-    if data.get("redact_secrets", True) is not True:
-        raise ConfigError("output.redact_secrets must remain true")
-    return OutputConfig(**values, redact_secrets=True)
+    redact_secrets = data.get("redact_secrets", True)
+    if not isinstance(redact_secrets, bool):
+        raise ConfigError("output.redact_secrets must be boolean")
+    return OutputConfig(**values, redact_secrets=redact_secrets)
 
 
 def parse_config(data: Any, *, base_directory: str | Path | None = None) -> AppConfig:
@@ -878,13 +883,20 @@ def parse_config(data: Any, *, base_directory: str | Path | None = None) -> AppC
     authentication_scan = _parse_authentication_scan(
         root.get("authentication_scan")
     )
+    output = _parse_output(root.get("output"))
     if (
         authentication_scan.password is not None
         and authentication_scan.password.kind == "inline"
     ):
         warnings = warnings + (
             "The inline authentication-scan password is for laboratory use only "
-            "and will be redacted from all output.",
+            "and may be exposed when output.redact_secrets is false.",
+        )
+    if not output.redact_secrets:
+        warnings = warnings + (
+            "Secret redaction is disabled. Reports and traffic logs may contain "
+            "reusable passwords, authentication values, user names, and readable "
+            "Association secrets.",
         )
     if scan.union_profile_test and not any(
         isinstance(profile, SecureProfile) for profile in profiles
@@ -896,7 +908,7 @@ def parse_config(data: Any, *, base_directory: str | Path | None = None) -> AppC
         scan=scan,
         authentication_scan=authentication_scan,
         profiles=profiles,
-        output=_parse_output(root.get("output")),
+        output=output,
         warnings=warnings,
     )
 

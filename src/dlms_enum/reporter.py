@@ -67,6 +67,22 @@ def _hex_value(raw_value: Any) -> str:
     return "—"
 
 
+def _data_type_summary(decoded: Any) -> str:
+    """Return the detected wire/interface/UI types in a compact fixed order."""
+
+    if not isinstance(decoded, dict):
+        return "unknown / unknown / unknown"
+
+    values: list[str] = []
+    for key in ("dlms_data_type", "interface_data_type", "ui_data_type"):
+        value = decoded.get(key)
+        if value is None or str(value).strip().lower() in {"", "none", "unknown"}:
+            values.append("unknown")
+        else:
+            values.append(str(value))
+    return " / ".join(values)
+
+
 def _profile_buffer_value(
     obj: dict[str, Any], attribute: dict[str, Any]
 ) -> list[Any] | None:
@@ -118,7 +134,18 @@ def _profile_display_value(value: Any) -> Any:
     return _decode_cosem_datetime(value) or value
 
 
-def _profile_row_columns(rows: list[Any]) -> list[str]:
+def _profile_column_label(column: dict[str, Any]) -> str:
+    name = column.get("attribute_name") or column.get("object_description")
+    source = column.get("logical_name")
+    attribute_id = column.get("attribute_id")
+    if name and source:
+        return f"{name} ({source} attr {attribute_id})"
+    if source:
+        return f"{source} attr {attribute_id}"
+    return f"Column {column.get('position', '—')}"
+
+
+def _profile_row_columns(obj: dict[str, Any], rows: list[Any]) -> list[str]:
     width = max(
         (
             len(row) if isinstance(row, (list, tuple)) else 1
@@ -128,6 +155,9 @@ def _profile_row_columns(rows: list[Any]) -> list[str]:
     )
     if width == 0:
         return []
+    schema = obj.get("profile_generic", {}).get("columns", [])
+    if len(schema) == width:
+        return [_profile_column_label(column) for column in schema]
     if width == 1:
         return ["Value"]
     first_values = [
@@ -168,7 +198,8 @@ def _render_profile_buffers(profile: dict[str, Any]) -> list[str]:
             rows = _profile_buffer_value(obj, attribute)
             if rows is None:
                 continue
-            columns = _profile_row_columns(rows)
+            columns = _profile_row_columns(obj, rows)
+            profile_metadata = obj.get("profile_generic", {})
             sections.extend(
                 [
                     "#### {} (`{}`)".format(
@@ -180,6 +211,53 @@ def _render_profile_buffers(profile: dict[str, Any]) -> list[str]:
                     "",
                 ]
             )
+            if profile_metadata:
+                sections.extend(
+                    [
+                        "| Profile metadata | Value |",
+                        "|---|---|",
+                        f"| Row encoding | {_markdown(profile_metadata.get('row_encoding', '—'))} |",
+                        f"| Capture period | {_markdown(profile_metadata.get('capture_period_seconds', '—'))} seconds |",
+                        f"| Sort method | {_markdown(_compact_value(profile_metadata.get('sort_method')))} |",
+                        f"| Entries in use | {_markdown(profile_metadata.get('entries_in_use', '—'))} |",
+                        f"| Capacity | {_markdown(profile_metadata.get('profile_entries', '—'))} |",
+                        "",
+                    ]
+                )
+                schema = profile_metadata.get("columns", [])
+                if schema:
+                    sections.extend(
+                        [
+                            "| Column | Source OBIS | Class | Attribute | Data index | Name | Type (wire / interface / UI) | Engineering |",
+                            "|---:|---|---:|---:|---:|---|---|---|",
+                        ]
+                    )
+                    for column in schema:
+                        type_value = " / ".join(
+                            str(column.get(key) or "unknown")
+                            for key in (
+                                "dlms_data_type",
+                                "interface_data_type",
+                                "ui_data_type",
+                            )
+                        )
+                        engineering = ", ".join(
+                            f"{key}={_compact_value(value)}"
+                            for key, value in column.get("engineering_metadata", {}).items()
+                        ) or "—"
+                        sections.append(
+                            "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                                _markdown(column.get("position", "—")),
+                                _markdown(column.get("logical_name", "—")),
+                                _markdown(column.get("class_id", "—")),
+                                _markdown(column.get("attribute_id", "—")),
+                                _markdown(column.get("data_index", "—")),
+                                _markdown(column.get("attribute_name") or column.get("object_description") or "—"),
+                                _markdown(type_value),
+                                _markdown(engineering),
+                            )
+                        )
+                    sections.append("")
             if not columns:
                 sections.extend(["The buffer is empty.", ""])
                 continue
@@ -229,6 +307,11 @@ def _protected_traffic_entries(path: str | Path) -> list[dict[str, Any]]:
                     continue
                 if "ciphertext_hex" not in decoded:
                     continue
+                control_value = decoded.get("security_control", "—")
+                try:
+                    control = int(str(control_value), 16)
+                except (TypeError, ValueError):
+                    control = 0
                 entries.append(
                     {
                         "sequence_number": record.get("sequence_number", "—"),
@@ -238,6 +321,33 @@ def _protected_traffic_entries(path: str | Path) -> list[dict[str, Any]]:
                         "object_context": record.get("object_context", {}),
                         "protected_command": decoded.get("protected_command", "—"),
                         "security_control": decoded.get("security_control", "—"),
+                        "security_suite": decoded.get(
+                            "security_suite", control & 0x0F if control else "—"
+                        ),
+                        "authenticated": decoded.get(
+                            "authenticated", bool(control & 0x10)
+                        ),
+                        "encrypted": decoded.get("encrypted", bool(control & 0x20)),
+                        "compressed": decoded.get("compressed", False),
+                        "broadcast_key": decoded.get("broadcast_key", False),
+                        "key_scope": decoded.get("key_scope", "—"),
+                        "originator_system_title": decoded.get(
+                            "originator_system_title", "—"
+                        ),
+                        "recipient_system_title": decoded.get(
+                            "recipient_system_title", "—"
+                        ),
+                        "transaction_id": decoded.get("transaction_id"),
+                        "ciphering_datetime_hex": decoded.get(
+                            "ciphering_datetime_hex", ""
+                        ),
+                        "other_information_hex": decoded.get(
+                            "other_information_hex", ""
+                        ),
+                        "key_parameters": decoded.get("key_parameters"),
+                        "key_ciphered_data_hex": decoded.get(
+                            "key_ciphered_data_hex", ""
+                        ),
                         "invocation_counter": decoded.get("invocation_counter", "—"),
                         "ciphertext_hex": decoded.get("ciphertext_hex", ""),
                         "ciphertext_captured_length": decoded.get(
@@ -255,6 +365,32 @@ def _protected_traffic_entries(path: str | Path) -> list[dict[str, Any]]:
                         ),
                     }
                 )
+    return entries
+
+
+def _protocol_traffic_entries(path: str | Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            for direction in ("tx", "rx"):
+                decoded = record.get(direction, {}).get("decoded", {})
+                frames = decoded.get("protocol_frames", []) if isinstance(decoded, dict) else []
+                for frame_number, frame in enumerate(frames, 1):
+                    metadata = frame.get("metadata", {}) if isinstance(frame, dict) else {}
+                    if metadata:
+                        entries.append(
+                            {
+                                "sequence_number": record.get("sequence_number", "—"),
+                                "direction": direction.upper(),
+                                "operation": record.get("operation", "—"),
+                                "result": record.get("result", "—"),
+                                "frame_number": frame_number,
+                                "metadata": metadata,
+                            }
+                        )
     return entries
 
 
@@ -331,12 +467,18 @@ def _scan_scope_label(scan_scope: dict[str, Any]) -> str:
 def render_summary_report(
     report: dict[str, Any],
     protected_traffic: list[dict[str, Any]] | None = None,
+    protocol_traffic: list[dict[str, Any]] | None = None,
 ) -> str:
     """Create a compact Markdown view while retaining report.json as evidence."""
 
     run = report.get("run", {})
     transport = report.get("transport", {})
     profiles = report.get("profiles", [])
+    redact_secrets = (
+        report.get("effective_configuration", {})
+        .get("output", {})
+        .get("redact_secrets", True)
+    )
     encrypted_rx = _encrypted_rx_by_attribute(protected_traffic)
     lines = [
         "# DLMS scan report",
@@ -352,8 +494,51 @@ def render_summary_report(
         f"| Baud rate | {_markdown(transport.get('selected_baudrate', 'not found'))} |",
         f"| HDLC server | {_markdown(transport.get('selected_server_address', 'not found'))} |",
         f"| Server addressing | {_markdown(transport.get('server_addressing_type', 'not found'))} |",
+        f"| Secret redaction | {'enabled' if redact_secrets else 'DISABLED'} |",
         "",
     ]
+    if not redact_secrets:
+        lines.extend(
+            [
+                "> **Warning:** Secret redaction was disabled. This report and its traffic logs may contain reusable credentials and readable Association data.",
+                "",
+            ]
+        )
+
+    system_title_discovery = report.get("system_title_discovery", {})
+    if system_title_discovery.get("enabled"):
+        lines.extend(
+            [
+                "## Passive system-title discovery",
+                "",
+                "This phase only listened to serial traffic; it did not transmit or decrypt data.",
+                "",
+                "| Kind | System title | Evidence | Source address | Target address |",
+                "|---|---|---|---:|---:|",
+            ]
+        )
+        titles = system_title_discovery.get("titles", [])
+        if titles:
+            for title in titles:
+                lines.append(
+                    "| {} | `{}` | {} | {} | {} |".format(
+                        _markdown(title.get("kind", "sender")),
+                        _markdown(title.get("hex", "—")),
+                        _markdown(title.get("source", "—")),
+                        _markdown(title.get("source_address", "—")),
+                        _markdown(title.get("target_address", "—")),
+                    )
+                )
+        else:
+            lines.append("| — | — | No title observed | — | — |")
+        lines.extend(
+            [
+                "",
+                f"Frames observed: {_markdown(system_title_discovery.get('frames_seen', 0))}; "
+                f"listen status: {_markdown(system_title_discovery.get('status', 'unknown'))}.",
+                "",
+            ]
+        )
 
     candidate_generation = report.get("candidate_generation", {})
     if candidate_generation:
@@ -536,7 +721,9 @@ def render_summary_report(
                 f"| Security suite | {_markdown(association.get('security_suite', '—'))} |",
                 f"| HLS validated | {_markdown(association.get('hls_validated', '—'))} |",
                 f"| Client system title | {_markdown(association.get('client_system_title', '—'))} |",
+                f"| Client manufacturer ID | {_markdown((association.get('client_system_title_metadata') or {}).get('manufacturer_id', '—'))} |",
                 f"| Server system title | {_markdown(association.get('server_system_title', '—'))} |",
+                f"| Server manufacturer ID | {_markdown((association.get('server_system_title_metadata') or {}).get('manufacturer_id', '—'))} |",
                 f"| Objects | {_markdown(summary.get('objects', 0))} |",
                 f"| Scan scope | {_markdown(_scan_scope_label(scan_scope))} |",
                 f"| Association View objects | {_markdown(scan_scope.get('association_view_objects', profile.get('association_view_object_count', '—')))} |",
@@ -569,6 +756,109 @@ def render_summary_report(
                 ]
             )
         lines.append("")
+
+        protocol_metadata = association.get("protocol_metadata", {})
+        request_metadata = protocol_metadata.get("request", {})
+        response_metadata = protocol_metadata.get("response", {})
+        if request_metadata or response_metadata:
+            association_result = response_metadata.get("association_result")
+            result_label = {
+                0: "accepted",
+                1: "permanently rejected",
+                2: "transiently rejected",
+            }.get(association_result, association_result or "—")
+            diagnostic = response_metadata.get("result_source_diagnostic", {})
+            diagnostic_label = (
+                "{} code {}".format(
+                    diagnostic.get("source", "unknown"),
+                    diagnostic.get("code", "—"),
+                )
+                if diagnostic
+                else "—"
+            )
+            lines.extend(
+                [
+                    "### Association negotiation metadata",
+                    "",
+                    "| Field | Client proposed | Server response |",
+                    "|---|---|---|",
+                    "| Application context | {} | {} |".format(
+                        _markdown(request_metadata.get("application_context", "—")),
+                        _markdown(response_metadata.get("application_context", "—")),
+                    ),
+                    "| DLMS version | {} | {} |".format(
+                        _markdown(request_metadata.get("proposed_dlms_version", "—")),
+                        _markdown(response_metadata.get("negotiated_dlms_version", "—")),
+                    ),
+                    "| Conformance | {} | {} |".format(
+                        _markdown(", ".join(request_metadata.get("proposed_conformance", [])) or "—"),
+                        _markdown(", ".join(response_metadata.get("negotiated_conformance", [])) or "—"),
+                    ),
+                    "| Maximum PDU | {} | {} |".format(
+                        _markdown(request_metadata.get("proposed_max_pdu_size", "—")),
+                        _markdown(response_metadata.get("negotiated_max_pdu_size", "—")),
+                    ),
+                    "| Quality of service | {} | {} |".format(
+                        _markdown(request_metadata.get("proposed_quality_of_service", "—")),
+                        _markdown(response_metadata.get("negotiated_quality_of_service", "—")),
+                    ),
+                    f"| Association result | — | {_markdown(result_label)} |",
+                    f"| Result diagnostic | — | {_markdown(diagnostic_label)} |",
+                    f"| VAA name | — | {_markdown(response_metadata.get('vaa_name', '—'))} |",
+                    "",
+                ]
+            )
+
+        association_objects = profile.get("association_metadata", [])
+        if association_objects:
+            privacy_note = (
+                "User names and Association secrets are not included in this human-readable report."
+                if redact_secrets
+                else "Secret redaction is disabled; readable user and Association-secret values are shown below."
+            )
+            lines.extend(
+                [
+                    "### Association object metadata",
+                    "",
+                    privacy_note,
+                    "",
+                    "| Association LN | Version | Client SAP | Server SAP | Application context | xDLMS context | Mechanism | Status | Security Setup | Users | Current user | Association secret |",
+                    "|---|---:|---:|---:|---|---|---|---|---|---|---|---|",
+                ]
+            )
+            for item in association_objects:
+                user_list = item.get("user_list", {})
+                current_user = item.get("current_user", {})
+                users_display = (
+                    user_list.get("count", "—")
+                    if redact_secrets
+                    else _compact_value(user_list.get("value"))
+                )
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                        _markdown(item.get("logical_name", "—")),
+                        _markdown(item.get("object_version", "—")),
+                        _markdown(item.get("client_sap", "—")),
+                        _markdown(item.get("server_sap", "—")),
+                        _markdown(_compact_value(item.get("application_context"))),
+                        _markdown(_compact_value(item.get("xdlms_context_info"))),
+                        _markdown(_compact_value(item.get("authentication_mechanism"))),
+                        _markdown(_compact_value(item.get("association_status"))),
+                        _markdown(_compact_value(item.get("security_setup_reference"))),
+                        _markdown(users_display),
+                        _markdown(
+                            "—"
+                            if redact_secrets
+                            else _compact_value(current_user.get("value"))
+                        ),
+                        _markdown(
+                            "—"
+                            if redact_secrets
+                            else _compact_value(item.get("association_secret"))
+                        ),
+                    )
+                )
+            lines.append("")
 
         view_comparison = report.get("association_view", {}).get("comparison")
         if isinstance(view_comparison, dict):
@@ -811,6 +1101,98 @@ def render_summary_report(
                 lines.append("")
             lines.extend([_markdown(posture.get("limitations", "")), ""])
 
+        selector_rows = [
+            (obj, attribute, attribute.get("access_rights", {}).get("access_selectors"))
+            for obj in profile.get("objects", [])
+            for attribute in obj.get("attributes", [])
+            if attribute.get("access_rights", {}).get("access_selectors")
+        ]
+        if selector_rows:
+            lines.extend(
+                [
+                    "### Selective-access metadata",
+                    "",
+                    "These selectors describe the bounded or filtered reads advertised by the meter.",
+                    "",
+                    "| OBIS | Class | Attribute | Name | Selectors |",
+                    "|---|---:|---:|---|---|",
+                ]
+            )
+            for obj, attribute, selectors in selector_rows:
+                lines.append(
+                    "| {} | {} | {} | {} | {} |".format(
+                        _markdown(obj.get("logical_name", "—")),
+                        _markdown(obj.get("class_id", "—")),
+                        _markdown(attribute.get("attribute_id", "—")),
+                        _markdown(attribute.get("name") or "—"),
+                        _markdown(_compact_value(selectors)),
+                    )
+                )
+            lines.append("")
+
+        engineering_rows = [
+            obj
+            for obj in profile.get("objects", [])
+            if obj.get("engineering_metadata")
+        ]
+        if engineering_rows:
+            lines.extend(
+                [
+                    "### Engineering metadata",
+                    "",
+                    "Scaler and unit apply to the related register values; raw values remain available in `report.json`.",
+                    "",
+                    "| OBIS | Class | Scaler | Unit | Status | Capture time | Period |",
+                    "|---|---:|---:|---|---|---|---:|",
+                ]
+            )
+            for obj in engineering_rows:
+                metadata = obj.get("engineering_metadata", {})
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} | {} |".format(
+                        _markdown(obj.get("logical_name", "—")),
+                        _markdown(obj.get("class_id", "—")),
+                        _markdown(_compact_value(metadata.get("scaler"))),
+                        _markdown(_compact_value(metadata.get("unit"))),
+                        _markdown(_compact_value(metadata.get("status"))),
+                        _markdown(_compact_value(metadata.get("capture_time"))),
+                        _markdown(_compact_value(metadata.get("period"))),
+                    )
+                )
+            lines.append("")
+
+        temporal_rows = []
+        for obj in profile.get("objects", []):
+            for attribute in obj.get("attributes", []):
+                decoded = attribute.get("decoded", {})
+                value = decoded.get("value") if isinstance(decoded, dict) else None
+                if isinstance(value, dict) and (
+                    "clock_status" in value or "skipped_fields" in value
+                ):
+                    temporal_rows.append((obj, attribute, value))
+        if temporal_rows:
+            lines.extend(
+                [
+                    "### Date/time metadata",
+                    "",
+                    "| OBIS | Attribute | Value | Day of week | Skipped fields | Clock status | Extra information |",
+                    "|---|---:|---|---:|---|---|---|",
+                ]
+            )
+            for obj, attribute, value in temporal_rows:
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} | {} |".format(
+                        _markdown(obj.get("logical_name", "—")),
+                        _markdown(attribute.get("attribute_id", "—")),
+                        _markdown(value.get("value") or value.get("display") or "—"),
+                        _markdown(value.get("day_of_week", "—")),
+                        _markdown(", ".join(value.get("skipped_fields", [])) or "none"),
+                        _markdown(", ".join(value.get("clock_status", [])) or "none"),
+                        _markdown(", ".join(value.get("extra_info", [])) or "none"),
+                    )
+                )
+            lines.append("")
+
         profile_buffers = _render_profile_buffers(profile)
         if profile_buffers:
             lines.extend(
@@ -827,10 +1209,10 @@ def render_summary_report(
             [
                 "### Decoded OBIS values",
                 "",
-                "This human view shows attempted GET attributes. Logical-name attribute 1 and untested rows are omitted; the complete inventory remains in `report.json`. Large encrypted responses are summarized, with complete evidence in `traffic.jsonl`.",
+                "This human view shows attempted GET attributes. Type values are shown as `wire / interface / UI`; `unknown` means that source did not provide a type. Logical-name attribute 1 and untested rows are omitted; the complete inventory remains in `report.json`. Large encrypted responses are summarized, with complete evidence in `traffic.jsonl`.",
                 "",
-                "| OBIS | Class | Attribute | Name | Decoded value | Encoded value (hex) | Encrypted response (hex) | Result |",
-                "|---|---:|---:|---|---|---|---|---|",
+                "| OBIS | Class | Attribute | Name | Type | Decoded value | Encoded value (hex) | Encrypted response (hex) | Result |",
+                "|---|---:|---:|---|---|---|---|---|---|",
             ]
         )
         omitted_decoded_attributes = 0
@@ -869,11 +1251,12 @@ def render_summary_report(
                 )
                 encrypted_display = _encrypted_evidence_display(encrypted)
                 lines.append(
-                    "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                         _markdown(obj.get("logical_name", "—")),
                         _markdown(obj.get("class_id", "—")),
                         _markdown(attribute.get("attribute_id", "—")),
                         _markdown(attribute.get("name") or "—"),
+                        _markdown(_data_type_summary(decoded)),
                         _markdown(_compact_value(value)),
                         _markdown(_hex_value(raw)),
                         _markdown(encrypted_display),
@@ -882,7 +1265,7 @@ def render_summary_report(
                 )
         if omitted_decoded_attributes:
             lines.append(
-                f"| — | — | — | — | — | — | {omitted_decoded_attributes} untested attributes omitted; see report.json | — |"
+                f"| — | — | — | — | — | — | — | {omitted_decoded_attributes} untested attributes omitted; see report.json | — |"
             )
         lines.append("")
 
@@ -969,8 +1352,8 @@ def render_summary_report(
         if results:
             lines.extend(
                 [
-                    "| OBIS | Class | Attribute | Name | Public view | Result | Assessment | Decoded value |",
-                    "|---|---:|---:|---|---|---|---|---|",
+                    "| OBIS | Class | Attribute | Name | Public view | Result | Assessment | Type (wire / interface / UI) | Decoded value |",
+                    "|---|---:|---:|---|---|---|---|---|---|",
                 ]
             )
             for result in results:
@@ -982,7 +1365,7 @@ def render_summary_report(
                     else "object absent"
                 )
                 lines.append(
-                    "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                         _markdown(result.get("logical_name", "—")),
                         _markdown(result.get("class_id", "—")),
                         _markdown(result.get("attribute_id", "—")),
@@ -990,20 +1373,90 @@ def render_summary_report(
                         _markdown(public_view),
                         _markdown(result.get("outcome", "—")),
                         _markdown(result.get("access_assessment", "—")),
+                        _markdown(_data_type_summary(decoded)),
                         _markdown(_compact_value(value)),
                     )
                 )
             lines.append("")
+
+    if protocol_traffic:
+        lines.extend(
+            [
+                "## Protocol exchange metadata",
+                "",
+                "This compact view exposes HDLC sequencing, segmentation, FCS validation, xDLMS invoke IDs, block-transfer state, and selective-access parameters. Complete frame metadata and translated XML remain in `traffic.jsonl`.",
+                "",
+                "| Seq. | Direction | Operation | HDLC | Invoke | Block transfer | Selective access | FCS | Result |",
+                "|---:|---|---|---|---|---|---|---|---|",
+            ]
+        )
+        displayed_protocol = protocol_traffic
+        omitted_protocol = 0
+        if len(protocol_traffic) > 80:
+            displayed_protocol = protocol_traffic[:40] + protocol_traffic[-40:]
+            omitted_protocol = len(protocol_traffic) - 80
+        for entry in displayed_protocol:
+            metadata = entry.get("metadata", {})
+            hdlc = "{}→{} {}; control {}".format(
+                metadata.get("source_address", "—"),
+                metadata.get("target_address", "—"),
+                metadata.get("frame_class", "—"),
+                metadata.get("control", "—"),
+            )
+            if metadata.get("frame_class") == "information":
+                hdlc += "; N(S)={}; N(R)={}".format(
+                    metadata.get("send_sequence", "—"),
+                    metadata.get("receive_sequence", "—"),
+                )
+            if metadata.get("segmented"):
+                hdlc += "; segmented"
+            invoke = metadata.get("invoke", {})
+            invoke_label = (
+                "id {}; {}; {}".format(
+                    invoke.get("invoke_id", "—"),
+                    invoke.get("priority", "—"),
+                    invoke.get("service_class", "—"),
+                )
+                if invoke
+                else "—"
+            )
+            block_values = []
+            for key, label in (
+                ("block_number", "block"),
+                ("block_number_ack", "ack"),
+                ("window_size", "window"),
+                ("last_block", "last"),
+            ):
+                if key in metadata:
+                    block_values.append(f"{label}={metadata[key]}")
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                    _markdown(entry.get("sequence_number", "—")),
+                    _markdown(entry.get("direction", "—")),
+                    _markdown(entry.get("operation", "—")),
+                    _markdown(hdlc),
+                    _markdown(invoke_label),
+                    _markdown(", ".join(block_values) or "—"),
+                    _markdown(_compact_value(metadata.get("selective_access"))),
+                    _markdown(metadata.get("fcs_valid", "—")),
+                    _markdown(entry.get("result", "—")),
+                )
+            )
+        if omitted_protocol:
+            lines.append(
+                f"| — | — | — | — | — | — | {omitted_protocol} frame entries omitted; see traffic.jsonl | — | — |"
+            )
+        lines.append("")
 
     if protected_traffic:
         lines.extend(
             [
                 "## Protected APDU evidence",
                 "",
-                "Security-control `0x30` denotes Suite 0 authentication and encryption. Ciphertext below excludes the security-control byte, invocation counter, and 12-byte AES-GCM authentication tag. A complete successfully decoded response also means its authentication tag was verified; `fragment` means only the ciphertext bytes present in that HDLC segment are shown.",
+                "The security-control byte is decoded into suite, authentication, encryption, compression, broadcast-key, and key-scope fields. Ciphertext below excludes the security-control byte, invocation counter, and any 12-byte AES-GCM authentication tag. A complete successfully decoded authenticated response also means its tag was verified; `fragment` means only the ciphertext bytes present in that HDLC segment are shown.",
                 "",
-                "| Seq. | Direction | Operation | Protected command | Security control | Invocation counter | Ciphertext (hex) | Capture | AES-GCM tag (hex) | Result |",
-                "|---:|---|---|---|---|---:|---|---|---|---|",
+                "| Seq. | Direction | Operation | Protected command | Security control | Invocation counter | Ciphertext (hex) | Capture | AES-GCM tag (hex) | Result | Protection details |",
+                "|---:|---|---|---|---|---:|---|---|---|---|---|",
             ]
         )
         displayed_protected_traffic = protected_traffic
@@ -1024,8 +1477,24 @@ def render_summary_report(
             tag = entry.get("authentication_tag_hex") or "—"
             if tag != "—" and not entry.get("authentication_tag_complete"):
                 tag = f"{tag} (fragment)"
+            protection = "{}; suite {}; {}; {}{}{}".format(
+                entry.get("security_control", "—"),
+                entry.get("security_suite", "—"),
+                (
+                    "authentication + encryption"
+                    if entry.get("authenticated") and entry.get("encrypted")
+                    else "authentication"
+                    if entry.get("authenticated")
+                    else "encryption"
+                    if entry.get("encrypted")
+                    else "no protection"
+                ),
+                entry.get("key_scope", "—"),
+                "; compressed" if entry.get("compressed") else "",
+                "; broadcast key" if entry.get("broadcast_key") else "",
+            )
             lines.append(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                     _markdown(entry.get("sequence_number", "—")),
                     _markdown(entry.get("direction", "—")),
                     _markdown(entry.get("operation", "—")),
@@ -1036,13 +1505,43 @@ def render_summary_report(
                     _markdown(capture),
                     _markdown(tag),
                     _markdown(entry.get("result", "—")),
+                    _markdown(protection),
                 )
             )
         if omitted_protected_entries:
             lines.append(
-                f"| — | — | — | — | — | — | {omitted_protected_entries} entries omitted; see traffic.jsonl | — | — | — |"
+                f"| — | — | — | — | — | — | {omitted_protected_entries} entries omitted; see traffic.jsonl | — | — | — | — |"
             )
         lines.append("")
+        general_entries = [
+            entry
+            for entry in protected_traffic
+            if entry.get("transaction_id") is not None
+            or entry.get("originator_system_title") != "—"
+            or entry.get("recipient_system_title") != "—"
+        ]
+        if general_entries:
+            lines.extend(
+                [
+                    "### General-ciphering envelope metadata",
+                    "",
+                    "| Seq. | Direction | Transaction ID | Originator title | Recipient title | Date/time (hex) | Key parameters |",
+                    "|---:|---|---:|---|---|---|---|",
+                ]
+            )
+            for entry in general_entries:
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} | {} |".format(
+                        _markdown(entry.get("sequence_number", "—")),
+                        _markdown(entry.get("direction", "—")),
+                        _markdown(entry.get("transaction_id", "—")),
+                        _markdown(entry.get("originator_system_title", "—")),
+                        _markdown(entry.get("recipient_system_title", "—")),
+                        _markdown(entry.get("ciphering_datetime_hex") or "—"),
+                        _markdown(entry.get("key_parameters", "—")),
+                    )
+                )
+            lines.append("")
 
     errors = report.get("errors", [])
     lines.extend(["## Errors and warnings", ""])
@@ -1066,10 +1565,15 @@ def render_summary_report(
             "---",
             "",
             "Full structured data: `report.json`  ",
-            "Raw protocol traffic: `traffic.jsonl`",
-            "",
+            "Raw protocol traffic: `traffic.jsonl`  "
+            if report.get("related_logs", {}).get("profile_logs_file")
+            else "Raw protocol traffic: `traffic.jsonl`",
         ]
     )
+    profile_log_file = report.get("related_logs", {}).get("profile_logs_file")
+    if profile_log_file:
+        lines.append(f"Profile Generic rows: `{_markdown(profile_log_file)}`")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -1081,7 +1585,95 @@ def write_summary_report(
     protected_traffic = (
         _protected_traffic_entries(traffic_path) if traffic_path is not None else None
     )
-    _atomic_write_text(path, render_summary_report(report, protected_traffic))
+    protocol_traffic = (
+        _protocol_traffic_entries(traffic_path) if traffic_path is not None else None
+    )
+    _atomic_write_text(
+        path,
+        render_summary_report(report, protected_traffic, protocol_traffic),
+    )
+
+
+def _profile_log_records(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Create one schema record and one record per Profile Generic row."""
+
+    records: list[dict[str, Any]] = []
+    for profile in report.get("profiles", []):
+        for obj in profile.get("objects", []):
+            metadata = obj.get("profile_generic")
+            if int(obj.get("class_id", -1)) != 7 or not isinstance(metadata, dict):
+                continue
+            buffer_attribute = next(
+                (
+                    attribute
+                    for attribute in obj.get("attributes", [])
+                    if int(attribute.get("attribute_id", -1)) == 2
+                    and attribute.get("outcome") == Outcome.SUCCESS.value
+                ),
+                None,
+            )
+            if buffer_attribute is None:
+                continue
+            decoded = buffer_attribute.get("decoded", {})
+            rows = decoded.get("value") if isinstance(decoded, dict) else None
+            raw_rows = decoded.get("raw_value") if isinstance(decoded, dict) else None
+            if not isinstance(rows, list):
+                continue
+            identity = {
+                "profile": profile.get("name"),
+                "class_id": 7,
+                "logical_name": obj.get("logical_name"),
+            }
+            records.append(
+                {
+                    "record_type": "profile_schema",
+                    **identity,
+                    "metadata": metadata,
+                }
+            )
+            columns = metadata.get("columns", [])
+            for entry, row in enumerate(rows, 1):
+                values = list(row) if isinstance(row, (list, tuple)) else [row]
+                raw_values = (
+                    list(raw_rows[entry - 1])
+                    if isinstance(raw_rows, list)
+                    and entry <= len(raw_rows)
+                    and isinstance(raw_rows[entry - 1], (list, tuple))
+                    else [None] * len(values)
+                )
+                cells = []
+                for position, value in enumerate(values, 1):
+                    column = columns[position - 1] if position <= len(columns) else {}
+                    cells.append(
+                        {
+                            "position": position,
+                            "source": {
+                                key: column.get(key)
+                                for key in (
+                                    "class_id",
+                                    "logical_name",
+                                    "attribute_id",
+                                    "data_index",
+                                )
+                            },
+                            "dlms_data_type": column.get("dlms_data_type"),
+                            "interface_data_type": column.get("interface_data_type"),
+                            "ui_data_type": column.get("ui_data_type"),
+                            "value": value,
+                            "raw_value": raw_values[position - 1]
+                            if position <= len(raw_values)
+                            else None,
+                        }
+                    )
+                records.append(
+                    {
+                        "record_type": "profile_row",
+                        **identity,
+                        "entry": entry,
+                        "values": cells,
+                    }
+                )
+    return records
 
 
 def write_report(
@@ -1090,12 +1682,29 @@ def write_report(
     traffic_path: str | Path,
     summary_path: str | Path | None = None,
 ) -> None:
-    if summary_path is not None:
-        write_summary_report(report, summary_path, traffic_path)
     report["related_logs"] = {
         "traffic_file": str(Path(traffic_path).name),
         "traffic_sha256": sha256_file(traffic_path),
     }
+    profile_records = _profile_log_records(report)
+    if profile_records:
+        profile_log_path = Path(path).with_name("profile-logs.jsonl")
+        _atomic_write_text(
+            profile_log_path,
+            "".join(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                for record in profile_records
+            ),
+        )
+        report["related_logs"].update(
+            {
+                "profile_logs_file": profile_log_path.name,
+                "profile_logs_sha256": sha256_file(profile_log_path),
+                "profile_log_records": len(profile_records),
+            }
+        )
+    if summary_path is not None:
+        write_summary_report(report, summary_path, traffic_path)
     if summary_path is not None:
         report["related_logs"].update(
             {

@@ -30,6 +30,7 @@ from .config import (
     resolve_lls_password,
 )
 from .counter_state import InvocationCounterLease
+from .protocol_metadata import frame_xml_metadata, hdlc_frame_metadata
 from .result_model import Outcome, classify_exception, enum_name, normalize_value
 from .traffic_logger import TrafficLogger
 
@@ -41,6 +42,18 @@ _PROTECTED_COMMANDS = {
     int(Command.GLO_GET_RESPONSE): "glo-get-response",
     int(Command.GLO_METHOD_REQUEST): "glo-action-request",
     int(Command.GLO_METHOD_RESPONSE): "glo-action-response",
+    int(Command.GLO_SET_REQUEST): "glo-set-request",
+    int(Command.GLO_SET_RESPONSE): "glo-set-response",
+    int(Command.GLO_EVENT_NOTIFICATION): "glo-event-notification",
+    int(Command.DED_GET_REQUEST): "ded-get-request",
+    int(Command.DED_GET_RESPONSE): "ded-get-response",
+    int(Command.DED_SET_REQUEST): "ded-set-request",
+    int(Command.DED_SET_RESPONSE): "ded-set-response",
+    int(Command.DED_METHOD_REQUEST): "ded-action-request",
+    int(Command.DED_METHOD_RESPONSE): "ded-action-response",
+    int(Command.GENERAL_GLO_CIPHERING): "general-glo-ciphering",
+    int(Command.GENERAL_DED_CIPHERING): "general-ded-ciphering",
+    int(Command.GENERAL_CIPHERING): "general-ciphering",
 }
 _COMMAND_VALUES = {int(item) for item in Command}
 
@@ -80,14 +93,72 @@ def _axdr_length(data: bytes, offset: int) -> tuple[int, int] | None:
     return int.from_bytes(data[start:start + octet_count], "big"), start + octet_count
 
 
+def _security_control(value: int) -> bool:
+    return value & 0x30 != 0 and value & 0x0F <= 2
+
+
 def _protected_content(payload: bytes, command_offset: int) -> tuple[int, int] | None:
     decoded_length = _axdr_length(payload, command_offset + 1)
     if decoded_length is None:
         return None
     declared_length, content_offset = decoded_length
-    if content_offset >= len(payload) or payload[content_offset] != 0x30:
+    if content_offset >= len(payload) or not _security_control(payload[content_offset]):
         return None
     return declared_length, content_offset
+
+
+def _general_ciphering_content(
+    payload: bytes, command_offset: int
+) -> tuple[dict[str, Any], tuple[int, int] | None]:
+    """Parse the clear envelope that precedes general-ciphering content."""
+
+    offset = command_offset + 1
+    metadata: dict[str, Any] = {}
+
+    def take(label: str) -> bytes | None:
+        nonlocal offset
+        decoded = _axdr_length(payload, offset)
+        if decoded is None:
+            return None
+        length, content_offset = decoded
+        end = content_offset + length
+        if end > len(payload):
+            return None
+        offset = end
+        value = payload[content_offset:end]
+        metadata[label] = value.hex().upper()
+        return value
+
+    transaction = take("transaction_id_hex")
+    if transaction is None:
+        return metadata, None
+    metadata["transaction_id"] = int.from_bytes(transaction, "big")
+    if take("originator_system_title") is None:
+        return metadata, None
+    if take("recipient_system_title") is None:
+        return metadata, None
+    if take("ciphering_datetime_hex") is None:
+        return metadata, None
+    if take("other_information_hex") is None:
+        return metadata, None
+    if offset + 4 > len(payload):
+        return metadata, None
+    metadata["key_info_length"] = payload[offset]
+    metadata["agreed_key_choice"] = payload[offset + 1]
+    metadata["key_parameters_length"] = payload[offset + 2]
+    metadata["key_parameters"] = payload[offset + 3]
+    offset += 4
+    if metadata["key_parameters"] == 1:
+        key_data = take("key_ciphered_data_hex")
+        if key_data is None:
+            return metadata, None
+    content = _axdr_length(payload, offset)
+    if content is None:
+        return metadata, None
+    declared_length, security_offset = content
+    if security_offset >= len(payload) or not _security_control(payload[security_offset]):
+        return metadata, None
+    return metadata, (declared_length, security_offset)
 
 
 def protected_apdu_metadata(frame: bytes, *, outgoing: bool) -> dict[str, Any]:
@@ -128,35 +199,86 @@ def protected_apdu_metadata(frame: bytes, *, outgoing: bool) -> dict[str, Any]:
             "outer_command_code": payload[0],
         }
     command_offset, command = indexes[0]
-    protected_content = _protected_content(payload, command_offset)
+    general_sender_title = None
+    general_metadata: dict[str, Any] = {}
+    general_content: tuple[int, int] | None = None
+    if command in {
+        int(Command.GENERAL_GLO_CIPHERING),
+        int(Command.GENERAL_DED_CIPHERING),
+    }:
+        title_length = _axdr_length(payload, command_offset + 1)
+        if title_length is not None:
+            length, title_offset = title_length
+            general_sender_title = payload[title_offset : title_offset + length]
+            content_command_offset = title_offset + length
+            if content_command_offset < len(payload):
+                indexes[0] = (content_command_offset - 1, command)
+    command_offset, command = indexes[0]
+    if command == int(Command.GENERAL_CIPHERING):
+        general_metadata, general_content = _general_ciphering_content(
+            payload, command_offset
+        )
+    protected_content = general_content or _protected_content(payload, command_offset)
     result: dict[str, Any] = {
         "protected": True,
         "protected_command": _PROTECTED_COMMANDS[command],
         "protected_command_code": command,
     }
+    if general_sender_title:
+        result["originator_system_title"] = general_sender_title.hex().upper()
+    result.update(general_metadata)
     if protected_content is not None:
         declared_length, security_offset = protected_content
     else:
         # Preserve the earlier best-effort metadata behavior for malformed or
         # partial captures that still expose the Suite 0 security header.
         declared_length = 0
-        security_offset = payload.find(b"\x30", command_offset + 1, command_offset + 6)
+        security_offset = next(
+            (
+                index
+                for index in range(command_offset + 1, min(len(payload), command_offset + 8))
+                if _security_control(payload[index])
+            ),
+            -1,
+        )
 
-    # Suite 0 AUTHENTICATION_ENCRYPTION uses security-control byte 0x30,
-    # a four-octet invocation counter, and a 12-octet AES-GCM tag.
     if security_offset >= 0 and len(payload) >= security_offset + 5:
-        result["security_control"] = "0x30"
+        control = payload[security_offset]
+        result.update(
+            {
+                "security_control": f"0x{control:02X}",
+                "security_suite": control & 0x0F,
+                "authenticated": bool(control & 0x10),
+                "encrypted": bool(control & 0x20),
+                "broadcast_key": bool(control & 0x40),
+                "compressed": bool(control & 0x80),
+                "key_scope": (
+                    "dedicated"
+                    if command in {
+                        int(Command.GENERAL_DED_CIPHERING),
+                        int(Command.DED_GET_REQUEST),
+                        int(Command.DED_GET_RESPONSE),
+                        int(Command.DED_SET_REQUEST),
+                        int(Command.DED_SET_RESPONSE),
+                        int(Command.DED_METHOD_REQUEST),
+                        int(Command.DED_METHOD_RESPONSE),
+                    }
+                    else "global"
+                ),
+            }
+        )
         result["invocation_counter"] = int.from_bytes(
             payload[security_offset + 1:security_offset + 5], "big"
         )
-        if declared_length >= 17:
+        tag_length = 12 if control & 0x10 else 0
+        if declared_length >= 5 + tag_length:
             captured_content = payload[
                 security_offset:min(security_offset + declared_length, len(payload))
             ]
-            ciphertext_length = declared_length - 5 - 12
+            ciphertext_length = declared_length - 5 - tag_length
             captured_ciphertext = captured_content[5:5 + ciphertext_length]
             tag_offset = 5 + ciphertext_length
-            captured_tag = captured_content[tag_offset:tag_offset + 12]
+            captured_tag = captured_content[tag_offset:tag_offset + tag_length]
             result.update(
                 {
                     "protected_payload_declared_length": declared_length,
@@ -167,10 +289,74 @@ def protected_apdu_metadata(frame: bytes, *, outgoing: bool) -> dict[str, Any]:
                     "ciphertext_captured_length": len(captured_ciphertext),
                     "ciphertext_complete": len(captured_ciphertext) == ciphertext_length,
                     "authentication_tag_hex": captured_tag.hex().upper(),
-                    "authentication_tag_complete": len(captured_tag) == 12,
+                    "authentication_tag_complete": len(captured_tag) == tag_length,
                 }
             )
     return result
+
+
+def _logical_name(value: Any) -> str | None:
+    if isinstance(value, (bytes, bytearray, memoryview)) and len(value) == 6:
+        return ".".join(str(item) for item in bytes(value))
+    if isinstance(value, str) and value.count(".") == 5:
+        return value
+    return None
+
+
+def _system_title_metadata(value: bytes | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    raw = bytes(value)
+    manufacturer = raw[:3]
+    return {
+        "hex": raw.hex().upper(),
+        "length": len(raw),
+        "valid_length": len(raw) == 8,
+        "manufacturer_id": (
+            manufacturer.decode("ascii") if len(raw) >= 3 and manufacturer.isalpha() else None
+        ),
+        "device_identifier_hex": raw[3:].hex().upper() if len(raw) > 3 else "",
+    }
+
+
+def association_view_selectors(value: Any) -> dict[tuple[int, str], dict[int, Any]]:
+    """Return attribute access-selector lists from a raw Association View.
+
+    Gurux Python currently applies the access mode while dropping the selector
+    list. Extract it from the decoded object-list value before that happens.
+    """
+
+    found: dict[tuple[int, str], dict[int, Any]] = {}
+    if not isinstance(value, (list, tuple)):
+        return found
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) < 4:
+            continue
+        try:
+            class_id = int(item[0])
+        except (TypeError, ValueError):
+            continue
+        logical_name = _logical_name(item[2])
+        rights = item[3]
+        if logical_name is None or not isinstance(rights, (list, tuple)) or not rights:
+            continue
+        attributes = rights[0]
+        if not isinstance(attributes, (list, tuple)):
+            continue
+        selectors: dict[int, Any] = {}
+        for attribute in attributes:
+            if not isinstance(attribute, (list, tuple)) or len(attribute) < 3:
+                continue
+            try:
+                attribute_id = int(attribute[0])
+            except (TypeError, ValueError):
+                continue
+            selector_list = normalize_value(attribute[2])
+            if selector_list not in (None, []):
+                selectors[attribute_id] = selector_list
+        if selectors:
+            found[(class_id, logical_name)] = selectors
+    return found
 
 
 class GuruxSession:
@@ -244,6 +430,7 @@ class GuruxSession:
         self._linked = False
         self._associated = False
         self._response_timeout_ms = config.transport.response_timeout_ms
+        self._association_protocol_metadata: dict[str, Any] = {}
 
     def set_response_timeout(self, timeout_ms: int) -> None:
         """Set the timeout used by subsequent exchanges in this session."""
@@ -285,7 +472,9 @@ class GuruxSession:
             # returned XML after the traffic logger applies challenge redaction.
             with contextlib.redirect_stdout(io.StringIO()):
                 xml = translator.messageToXml(bytearray(frame))
-            return {"xml": xml}
+            metadata = frame_xml_metadata(xml)
+            metadata.update(hdlc_frame_metadata(frame))
+            return {"xml": xml, "metadata": metadata}
         except Exception as exc:  # logging must never break a scan
             return {"decode_error": f"{type(exc).__name__}: {exc}"}
 
@@ -395,10 +584,33 @@ class GuruxSession:
         finally:
             tx_decoded = dict(tx_context or {})
             tx_decoded.update(tx_protocol)
-            tx_decoded["protocol_frames"] = [self._frame_xml(raw_tx)] if raw_tx else []
+            tx_protocol_frames = [self._frame_xml(raw_tx)] if raw_tx else []
+            tx_decoded["protocol_frames"] = tx_protocol_frames
             rx_decoded = self._reply_structure(reply)
             rx_decoded.update(rx_protocol)
-            rx_decoded["protocol_frames"] = [self._frame_xml(frame) for frame in raw_rx]
+            rx_protocol_frames = [self._frame_xml(frame) for frame in raw_rx]
+            rx_decoded["protocol_frames"] = rx_protocol_frames
+            if operation == "AARQ":
+                request_metadata = next(
+                    (
+                        item.get("metadata", {})
+                        for item in tx_protocol_frames
+                        if item.get("metadata")
+                    ),
+                    {},
+                )
+                response_metadata = next(
+                    (
+                        item.get("metadata", {})
+                        for item in rx_protocol_frames
+                        if item.get("metadata")
+                    ),
+                    {},
+                )
+                self._association_protocol_metadata = {
+                    "request": request_metadata,
+                    "response": response_metadata,
+                }
             if caught is not None:
                 rx_decoded["exception"] = {
                     "type": type(caught).__name__, "message": str(caught)
@@ -406,12 +618,35 @@ class GuruxSession:
             context = self._endpoint_context()
             context.update(object_context or {})
             logged_tx_frames = [raw_tx] if raw_tx else []
-            if getattr(self, "authentication_name", None) == "low" and operation == "AARQ":
+            logged_rx_frames = raw_rx
+            if (
+                self.config.output.redact_secrets
+                and getattr(self, "authentication_name", None) == "low"
+                and operation == "AARQ"
+            ):
                 # LLS carries the reusable password in the ACSE AARQ. Preserve
                 # the redacted translator output and all response evidence, but
                 # never serialize the credential-bearing raw request frame.
                 logged_tx_frames = []
                 tx_decoded["credential_bearing_raw_frame_omitted"] = True
+            if (
+                self.config.output.redact_secrets
+                and operation == "GET"
+                and int((object_context or {}).get("class_id", -1)) == 15
+                and int((object_context or {}).get("attribute_id", -1)) == 7
+            ):
+                # A compliant meter should not expose the Association secret,
+                # but a scanner must also be safe when a meter is misconfigured.
+                logged_rx_frames = []
+                rx_decoded["value"] = "<redacted>"
+                rx_decoded["protocol_frames"] = [
+                    {
+                        "xml": "<redacted sensitive Association LN secret response>",
+                        "metadata": item.get("metadata", {}),
+                    }
+                    for item in rx_protocol_frames
+                ]
+                rx_decoded["sensitive_raw_frame_omitted"] = True
             self.traffic.log(
                 profile=self.profile_name,
                 phase=phase,
@@ -421,7 +656,7 @@ class GuruxSession:
                 attempt=attempt,
                 tx_frames=logged_tx_frames,
                 tx_decoded=tx_decoded,
-                rx_frames=raw_rx,
+                rx_frames=logged_rx_frames,
                 rx_decoded=rx_decoded,
                 elapsed_ms=(time.monotonic() - started) * 1000,
                 result=outcome.value,
@@ -543,6 +778,8 @@ class GuruxSession:
                 "window_size_rx": int(self.client.hdlcSettings.windowSizeRX),
             },
             "server_system_title": bytes(source_title).hex().upper() if source_title else None,
+            "server_system_title_metadata": _system_title_metadata(source_title),
+            "protocol_metadata": self._association_protocol_metadata,
         }
 
     def discover_objects(self, attempt: int) -> Any:
@@ -557,12 +794,19 @@ class GuruxSession:
             object_context={"class_id": 15, "logical_name": "0.0.40.0.0.255", "attribute_id": 2},
             tx_context={"service": "get-request", "attribute": "object-list"},
         )
-        return _quiet_gurux(
+        raw_selectors = association_view_selectors(reply.value)
+        objects = _quiet_gurux(
             self.client.parseObjects,
             reply.data,
             onlyKnownObjects=False,
             ignoreInactiveObjects=False,
         )
+        for target in objects:
+            selectors = raw_selectors.get(
+                (int(target.objectType), str(target.logicalName)), {}
+            )
+            setattr(target, "_dlms_access_selectors", selectors)
+        return objects
 
     def create_object(self, class_id: int, logical_name: str) -> Any:
         try:
@@ -1201,7 +1445,11 @@ class GuruxSecureSession(GuruxSession):
                 "security_suite": 0,
                 "security_policy": "authentication_encryption",
                 "client_system_title": bytes(self.client.ciphering.systemTitle).hex().upper(),
+                "client_system_title_metadata": _system_title_metadata(
+                    self.client.ciphering.systemTitle
+                ),
                 "server_system_title": bytes(server_title).hex().upper() if server_title else None,
+                "server_system_title_metadata": _system_title_metadata(server_title),
             }
         )
         return context
@@ -1571,7 +1819,11 @@ class GuruxSecureSession(GuruxSession):
                 "cipher": "aes_gcm_128",
                 "hls_validated": self._associated,
                 "client_system_title": bytes(self.client.ciphering.systemTitle).hex().upper(),
+                "client_system_title_metadata": _system_title_metadata(
+                    self.client.ciphering.systemTitle
+                ),
                 "server_system_title": bytes(server_title).hex().upper() if server_title else None,
+                "server_system_title_metadata": _system_title_metadata(server_title),
                 "next_client_invocation_counter": int(self.client.ciphering.invocationCounter),
             }
         )

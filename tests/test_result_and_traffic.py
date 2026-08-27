@@ -1,10 +1,15 @@
 import json
+import datetime as dt
 import tempfile
 import unittest
 from pathlib import Path
 
+from gurux_dlms import GXDateTime
+from gurux_dlms.enums import ClockStatus, DateTimeSkips
+
 from dlms_enum.result_model import Outcome, classify_exception, normalize_value
 from dlms_enum.reporter import load_report, render_summary_report, write_report
+from dlms_enum.scanner import _redact_sensitive_attribute
 from dlms_enum.traffic_logger import TrafficLogger, redact
 
 
@@ -14,6 +19,18 @@ class ResultAndTrafficTests(unittest.TestCase):
         self.assertEqual(value["hex"], "414243313233")
         self.assertEqual(value["base64"], "QUJDMTIz")
         self.assertEqual(value["text"], "ABC123")
+
+    def test_gurux_datetime_keeps_status_and_skipped_fields(self):
+        value = GXDateTime(dt.datetime(2026, 8, 27, 10, 30))
+        value.dayOfWeek = 4
+        value.skip = DateTimeSkips.SECOND
+        value.status = ClockStatus.INVALID_VALUE
+
+        normalized = normalize_value(value)
+
+        self.assertEqual(normalized["day_of_week"], 4)
+        self.assertIn("second", normalized["skipped_fields"])
+        self.assertIn("invalid_value", normalized["clock_status"])
 
     def test_timeout_is_normalized(self):
         self.assertEqual(classify_exception(TimeoutError("late")), Outcome.TIMEOUT)
@@ -32,6 +49,36 @@ class ResultAndTrafficTests(unittest.TestCase):
         self.assertEqual(clean["guek"], "<redacted>")
         self.assertIn("<redacted>", clean["xml"])
         self.assertTrue(indicators)
+
+    def test_readable_association_secret_is_hashed_and_redacted(self):
+        decoded = {
+            "value": "badly exposed",
+            "raw_value": {"hex": "6261646C79206578706F736564"},
+            "dlms_data_type": "octet_string",
+        }
+
+        clean = _redact_sensitive_attribute(decoded, class_id=15, attribute_id=7)
+
+        self.assertEqual(clean["value"], "<redacted>")
+        self.assertEqual(clean["raw_value"], "<redacted>")
+        self.assertEqual(clean["evidence_length"], 13)
+        self.assertEqual(len(clean["evidence_sha256"]), 64)
+
+    def test_readable_association_secret_is_retained_when_redaction_is_disabled(self):
+        decoded = {
+            "value": "laboratory secret",
+            "raw_value": {"hex": "6C61626F7261746F727920736563726574"},
+            "dlms_data_type": "octet_string",
+        }
+
+        clean = _redact_sensitive_attribute(
+            decoded,
+            class_id=15,
+            attribute_id=7,
+            redact_secrets=False,
+        )
+
+        self.assertEqual(clean, decoded)
 
     def test_jsonl_has_side_by_side_schema_and_flushes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -56,6 +103,69 @@ class ResultAndTrafficTests(unittest.TestCase):
         self.assertEqual(record["sequence_number"], 1)
         self.assertEqual(record["tx"]["encoded_frames"], ["7E017E"])
         self.assertEqual(record["rx"]["decoded"]["value"], 12)
+        self.assertTrue(record["secrets_redacted"])
+
+    def test_jsonl_retains_sensitive_values_when_redaction_is_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "traffic.jsonl"
+            logger = TrafficLogger(path, redact_secrets=False)
+            logger.log(
+                profile="lls",
+                phase="association",
+                purpose="test",
+                object_context={"password": "reader-password"},
+                operation="AARQ",
+                attempt=1,
+                tx_frames=[b"password-bearing-frame"],
+                tx_decoded={"xml": '<CallingAuthentication Value="AABB" />'},
+                rx_frames=[],
+                rx_decoded={},
+                elapsed_ms=1,
+                result="SUCCESS",
+            )
+            logger.close()
+            record = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["object_context"]["password"], "reader-password")
+        self.assertIn('Value="AABB"', record["tx"]["decoded"]["xml"])
+        self.assertFalse(record["secrets_redacted"])
+        self.assertEqual(record["redaction_indicators"], [])
+
+    def test_summary_shows_raw_association_values_when_redaction_is_disabled(self):
+        report = {
+            "schema_version": 1,
+            "run": {"id": "raw-test", "status": "completed"},
+            "transport": {},
+            "effective_configuration": {
+                "output": {"redact_secrets": False}
+            },
+            "profiles": [
+                {
+                    "name": "lls",
+                    "association": {},
+                    "summary": {},
+                    "association_metadata": [
+                        {
+                            "logical_name": "0.0.40.0.0.255",
+                            "user_list": {
+                                "count": 1,
+                                "value": [[1, "lab-user"]],
+                            },
+                            "current_user": {"value": [1, "lab-user"]},
+                            "association_secret": "lab-password",
+                        }
+                    ],
+                    "objects": [],
+                }
+            ],
+            "errors": [],
+        }
+
+        summary = render_summary_report(report)
+
+        self.assertIn("Secret redaction | DISABLED", summary)
+        self.assertIn("lab-user", summary)
+        self.assertIn("lab-password", summary)
 
     def test_report_is_canonical_json_with_traffic_hash(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -114,6 +224,9 @@ class ResultAndTrafficTests(unittest.TestCase):
                                             "hex": "3132333435",
                                             "text": "12345",
                                         },
+                                        "dlms_data_type": "octet_string",
+                                        "interface_data_type": "octet_string",
+                                        "ui_data_type": "string",
                                     },
                                 },
                             ],
@@ -128,7 +241,11 @@ class ResultAndTrafficTests(unittest.TestCase):
 
         self.assertIn("## Profile: hls_gmac_suite0", rendered)
         self.assertIn("First 1 objects (short test)", rendered)
-        self.assertIn("| 0.0.96.1.0.255 | 1 | 2 | Value | 12345 | 3132333435 | — | SUCCESS |", rendered)
+        self.assertIn(
+            "| 0.0.96.1.0.255 | 1 | 2 | Value | octet_string / octet_string / string | 12345 | 3132333435 | — | SUCCESS |",
+            rendered,
+        )
+        self.assertIn("Type values are shown as `wire / interface / UI`", rendered)
         self.assertNotIn("| 0.0.96.1.0.255 | 1 | 1 |", rendered)
         self.assertNotIn("| GET | 0.0.96.1.0.255 | 1 | 1 |", rendered)
 
@@ -151,6 +268,65 @@ class ResultAndTrafficTests(unittest.TestCase):
 
         self.assertEqual(loaded["related_logs"]["summary_file"], "summary.md")
         self.assertEqual(len(loaded["related_logs"]["summary_sha256"]), 64)
+
+    def test_write_report_exports_profile_rows_as_jsonl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traffic = root / "traffic.jsonl"
+            traffic.write_text("{}\n", encoding="utf-8")
+            report_path = root / "report.json"
+            report = {
+                "schema_version": 1,
+                "run": {"id": "test", "status": "completed"},
+                "transport": {},
+                "profiles": [
+                    {
+                        "name": "public",
+                        "objects": [
+                            {
+                                "class_id": 7,
+                                "logical_name": "1.0.99.1.0.255",
+                                "profile_generic": {
+                                    "columns": [
+                                        {
+                                            "position": 1,
+                                            "class_id": 8,
+                                            "logical_name": "0.0.1.0.0.255",
+                                            "attribute_id": 2,
+                                            "data_index": 0,
+                                            "ui_data_type": "datetime",
+                                        }
+                                    ]
+                                },
+                                "attributes": [
+                                    {
+                                        "attribute_id": 2,
+                                        "outcome": "SUCCESS",
+                                        "decoded": {
+                                            "value": [["2026-08-27T10:00:00Z"]],
+                                            "raw_value": [[{"hex": "07EA081B"}]],
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+                "errors": [],
+            }
+
+            write_report(report, report_path, traffic)
+            loaded = load_report(report_path)
+            rows = [
+                json.loads(line)
+                for line in (root / "profile-logs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual([item["record_type"] for item in rows], ["profile_schema", "profile_row"])
+        self.assertEqual(rows[1]["values"][0]["ui_data_type"], "datetime")
+        self.assertEqual(loaded["related_logs"]["profile_log_records"], 2)
 
     def test_summary_lists_passive_set_and_action_capabilities(self):
         report = {
@@ -201,6 +377,80 @@ class ResultAndTrafficTests(unittest.TestCase):
         self.assertIn("| SET | 1.0.0.1.0.255 | 1 | 2 | Value | read_write | NOT_TESTED |", rendered)
         self.assertIn("| ACTION | 1.0.0.1.0.255 | 1 | 1 | Reset | access | NOT_TESTED |", rendered)
         self.assertIn("SET and ACTION are mapped passively", rendered)
+
+    def test_summary_displays_association_negotiation_and_selectors(self):
+        report = {
+            "schema_version": 1,
+            "run": {"id": "test", "status": "completed"},
+            "transport": {},
+            "profiles": [
+                {
+                    "name": "public",
+                    "association": {
+                        "protocol_metadata": {
+                            "request": {
+                                "application_context": "LN",
+                                "proposed_dlms_version": 6,
+                                "proposed_conformance": ["Get", "SelectiveAccess"],
+                                "proposed_max_pdu_size": 65535,
+                            },
+                            "response": {
+                                "application_context": "LN",
+                                "association_result": 0,
+                                "result_source_diagnostic": {
+                                    "source": "user",
+                                    "code": 0,
+                                },
+                                "negotiated_dlms_version": 6,
+                                "negotiated_conformance": ["Get", "SelectiveAccess"],
+                                "negotiated_max_pdu_size": 1224,
+                                "vaa_name": 7,
+                            },
+                        }
+                    },
+                    "summary": {},
+                    "scan_scope": {},
+                    "association_metadata": [
+                        {
+                            "logical_name": "0.0.40.0.0.255",
+                            "object_version": 3,
+                            "client_sap": 16,
+                            "server_sap": 1,
+                            "authentication_mechanism": {"mechanism": "none"},
+                            "user_list": {"count": 0},
+                        }
+                    ],
+                    "objects": [
+                        {
+                            "class_id": 7,
+                            "logical_name": "1.0.99.1.0.255",
+                            "attributes": [
+                                {
+                                    "attribute_id": 2,
+                                    "name": "Buffer",
+                                    "outcome": "NOT_TESTED",
+                                    "access_rights": {
+                                        "read": True,
+                                        "access_selectors": [1, 2],
+                                    },
+                                }
+                            ],
+                            "methods": [],
+                        }
+                    ],
+                }
+            ],
+            "errors": [],
+        }
+
+        rendered = render_summary_report(report)
+
+        self.assertIn("### Association negotiation metadata", rendered)
+        self.assertIn("| Association result | — | accepted |", rendered)
+        self.assertIn("| Maximum PDU | 65535 | 1224 |", rendered)
+        self.assertIn("### Association object metadata", rendered)
+        self.assertIn("### Selective-access metadata", rendered)
+        self.assertIn("| 1.0.99.1.0.255 | 7 | 2 | Buffer | [1,2] |", rendered)
 
     def test_summary_lists_each_invocation_counter_reuse_probe(self):
         report = {
@@ -392,7 +642,7 @@ class ResultAndTrafficTests(unittest.TestCase):
         self.assertIn("00112233445566778899AABB", rendered)
         self.assertIn("| SUCCESS |", rendered)
         self.assertIn(
-            "| 1.0.1.8.0.255 | 1 | 2 | Value | 10 | 0A | E5F6A7B8 | SUCCESS |",
+            "| 1.0.1.8.0.255 | 1 | 2 | Value | unknown / unknown / unknown | 10 | 0A | E5F6A7B8 | SUCCESS |",
             rendered,
         )
         self.assertNotIn("7EA02C0309540911DEADBEEF7E", rendered)

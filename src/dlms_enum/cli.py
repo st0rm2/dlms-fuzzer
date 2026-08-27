@@ -42,6 +42,7 @@ from .scanner import (
     run_authentication_scan,
     scan,
 )
+from .system_title_listener import listen_for_system_titles
 from .traffic_logger import TrafficLogger
 from .tui import (
     ScanUI,
@@ -84,6 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-association-view",
         action="store_true",
         help="update the reusable per-device/role Association View after a live read",
+    )
+    scan_parser.add_argument(
+        "--system-title-listen-seconds",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help=(
+            "listen without transmitting for AARE or GeneralGloCiphering system "
+            "titles after public preflight; disabled by default"
+        ),
     )
     scope = scan_parser.add_mutually_exclusive_group()
     scope.add_argument(
@@ -163,12 +174,19 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         config = with_object_limit(config, None)
     elif args.get_limit is not None:
         config = with_get_limit(config, args.get_limit)
+    system_title_listen_seconds = getattr(
+        args, "system_title_listen_seconds", 0
+    )
+    if not 0 <= system_title_listen_seconds <= 3600:
+        raise ConfigError("--system-title-listen-seconds must be from 0 through 3600")
     for warning in config.warnings:
         console.print(f"[yellow]Warning:[/yellow] {warning}")
     run_directory = _run_directory(config.output.directory)
     ui = ScanUI(console)
     preflight_path = run_directory / "preflight-traffic.jsonl"
-    preflight_logger = TrafficLogger(preflight_path)
+    preflight_logger = TrafficLogger(
+        preflight_path, redact_secrets=config.output.redact_secrets
+    )
     try:
         # The configured public role remains the preflight authority even when
         # the operator selected only secure roles for the full scan.
@@ -189,6 +207,60 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
 
     show_public_preflight(preflight, console)
     config = apply_preflight_endpoint(config, preflight)
+    system_title_discovery: dict[str, Any] = {
+        "enabled": False,
+        "status": "disabled",
+        "titles": [],
+    }
+    if system_title_listen_seconds:
+        console.rule("Passive system-title discovery")
+        passive_traffic_path = run_directory / "system-title-traffic.jsonl"
+        passive_report_path = run_directory / "system-title-discovery.json"
+        passive_logger = TrafficLogger(
+            passive_traffic_path, redact_secrets=config.output.redact_secrets
+        )
+        try:
+            system_title_discovery = listen_for_system_titles(
+                config,
+                baudrate=int(preflight.transport["selected_baudrate"]),
+                duration_seconds=system_title_listen_seconds,
+                traffic=passive_logger,
+                server_address=int(
+                    preflight.transport["selected_server_address"]
+                ),
+                progress=ui.progress,
+            )
+        finally:
+            ui.close()
+            passive_logger.close()
+        system_title_discovery["enabled"] = True
+        system_title_discovery["artifacts"] = {
+            "report": passive_report_path.name,
+            "traffic": passive_traffic_path.name,
+        }
+        write_report(
+            system_title_discovery,
+            passive_report_path,
+            passive_traffic_path,
+        )
+        titles = system_title_discovery.get("titles", [])
+        if titles:
+            for title in titles:
+                console.print(
+                    f"[green]{str(title['kind']).title()} system title:[/green] "
+                    f"{title['hex']} ({title['source']})"
+                )
+        elif system_title_discovery.get("status") == "failed":
+            console.print(
+                "[yellow]Passive listening failed; normal scanning will continue.[/yellow]"
+            )
+        else:
+            console.print(
+                "No clear-text system title was observed during the listen window."
+            )
+        console.print(
+            f"Passive discovery report: [green]{passive_report_path.resolve()}[/green]"
+        )
     verified_profiles = []
     verified_counter_sources = []
     counter_reuse_tests: dict[str, bool] = {}
@@ -380,7 +452,9 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         report_path = role_directory / config.output.report_file
         summary_path = role_directory / config.output.summary_file
         role_ui = ScanUI(console)
-        logger = TrafficLogger(traffic_path)
+        logger = TrafficLogger(
+            traffic_path, redact_secrets=config.output.redact_secrets
+        )
         try:
             report = scan(
                 config.for_profile(profile),
@@ -396,6 +470,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             role_ui.close()
             logger.close()
         report["preflight"] = preflight.as_dict()
+        report["system_title_discovery"] = system_title_discovery
         report["workflow"] = {
             "selected_roles": [item.role for item in config.profiles],
             "current_role": profile.role,
@@ -514,7 +589,10 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         authentication_traffic_path = run_directory / "authentication-traffic.jsonl"
         authentication_report_path = run_directory / "authentication-report.json"
         authentication_summary_path = run_directory / "authentication-summary.md"
-        authentication_logger = TrafficLogger(authentication_traffic_path)
+        authentication_logger = TrafficLogger(
+            authentication_traffic_path,
+            redact_secrets=config.output.redact_secrets,
+        )
         authentication_ui = ScanUI(console)
         authentication_profiles = []
         try:
@@ -622,6 +700,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 ),
             },
             "effective_configuration": config.redacted_dict(),
+            "system_title_discovery": system_title_discovery,
             "transport": preflight.transport,
             "profiles": authentication_profiles,
             "authentication_matrix": {
@@ -654,6 +733,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         "type": "multi_role_read_workflow",
         "selected_roles": [profile.role for profile in config.profiles],
         "preflight": preflight.as_dict(),
+        "system_title_discovery": system_title_discovery,
         "effective_configuration": config.redacted_dict(),
         "role_runs": role_results,
         "verified_counter_sources": verified_counter_sources,

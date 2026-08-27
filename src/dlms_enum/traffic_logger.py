@@ -46,8 +46,9 @@ def redact(value: Any, *, key: str = "") -> tuple[Any, list[str]]:
 
 
 class TrafficLogger:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, redact_secrets: bool = True):
         self.path = Path(path)
+        self.redact_secrets = redact_secrets
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._stream: TextIO = self.path.open("a", encoding="utf-8")
         self._sequence = 0
@@ -69,9 +70,15 @@ class TrafficLogger:
         elapsed_ms: float,
         result: str,
     ) -> None:
-        context_clean, context_redactions = redact(object_context or {})
-        tx_clean, tx_redactions = redact(tx_decoded)
-        rx_clean, rx_redactions = redact(rx_decoded)
+        if self.redact_secrets:
+            context_clean, context_redactions = redact(object_context or {})
+            tx_clean, tx_redactions = redact(tx_decoded)
+            rx_clean, rx_redactions = redact(rx_decoded)
+        else:
+            context_clean = normalize_value(object_context or {})
+            tx_clean = normalize_value(tx_decoded)
+            rx_clean = normalize_value(rx_decoded)
+            context_redactions = tx_redactions = rx_redactions = []
         with self._lock:
             self._sequence += 1
             record = {
@@ -97,6 +104,7 @@ class TrafficLogger:
                 "redaction_indicators": sorted(
                     set(context_redactions + tx_redactions + rx_redactions)
                 ),
+                "secrets_redacted": self.redact_secrets,
             }
             self._stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
             self._stream.flush()

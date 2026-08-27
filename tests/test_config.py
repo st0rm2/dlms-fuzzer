@@ -19,6 +19,27 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(snapshot["profiles"][0]["authentication"], {"mechanism": "none"})
         self.assertNotIn("profile", snapshot)
 
+    def test_secret_redaction_can_be_disabled_explicitly(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null"},
+                "output": {"redact_secrets": False},
+            }
+        )
+
+        self.assertFalse(config.output.redact_secrets)
+        self.assertFalse(config.redacted_dict()["output"]["redact_secrets"])
+        self.assertTrue(any("redaction is disabled" in item for item in config.warnings))
+
+    def test_secret_redaction_must_be_boolean(self):
+        with self.assertRaisesRegex(ConfigError, "output.redact_secrets must be boolean"):
+            parse_config(
+                {
+                    "transport": {"device": "/dev/null"},
+                    "output": {"redact_secrets": "false"},
+                }
+            )
+
     def test_multi_role_example_is_valid(self):
         config = load_config(ROOT / "examples" / "multi-role-meter.yaml")
 

@@ -151,7 +151,18 @@ python -m dlms_enum scan --config meter-public.yaml --get-limit 100
 python -m dlms_enum scan --config meter-profiles.yaml --roles public,client1 --get-limit 100
 python -m dlms_enum scan --config meter-profiles.yaml --association-view-mode reuse
 python -m dlms_enum scan --config meter-profiles.yaml --association-view-mode compare
+python -m dlms_enum scan --config meter-profiles.yaml --system-title-listen-seconds 60
 ```
+
+`--system-title-listen-seconds 60` adds a passive phase after the public
+preflight has confirmed the baud rate and HDLC server address. During that
+window the tool sends nothing. It recognizes complete HDLC AARE and
+`GeneralGloCiphering` frames and records an exposed eight-byte sender system
+title without trying to decrypt the protected service. HDLC source and target
+addresses are used to label a title as server or client when possible. A title
+that is not exactly eight octets is ignored. On a point-to-point optical link,
+traffic from another client is visible only when the capture setup can observe
+that traffic.
 
 `--get-limit 100` tests exactly 100 mapped GET capabilities while retaining every other GET, SET, and ACTION capability in the report as `NOT_TESTED`. Association and authentication metadata are prioritized, and—when advertised and the budget permits—one likely event-log Profile Generic buffer is reserved within that same budget so block-transfer decoding and row rendering are exercised without selecting every potentially large profile. In a secure scan, the same limit also caps the optional cross-profile public GET test. For unattended configuration-driven runs, use `scan.get_limit: 100`; the older object-based short scope remains available as `scan.object_limit: 10`. The two limits are mutually exclusive. If neither limit nor a command-line switch is supplied and standard input is not an interactive terminal, the default remains a full scan.
 
@@ -366,9 +377,16 @@ secrets:
   guek: {prompt: true}
 ```
 
-Environment variables, protected files, and prompts accept 32 hexadecimal characters, optionally prefixed with `hex:`. Secret files must have mode `0600` or stricter on Unix. Inline `hex:` values are supported for isolated laboratory work, but produce a warning and are never copied to effective configuration, reports, traffic logs, saved configurations, exception messages, or dataclass repr output.
+Environment variables, protected files, and prompts accept 32 hexadecimal characters, optionally prefixed with `hex:`. Secret files must have mode `0600` or stricter on Unix. Inline `hex:` values are supported for isolated laboratory work, but produce a warning and are never copied into the effective configuration, a saved configuration, exception messages, or dataclass repr output.
 
-Raw wire logging contains ciphertext, protocol identifiers, system titles, and the ephemeral authentication value carried by AARQ because those bytes are part of the requested on-wire capture. Decoded challenge fields are redacted. GAK and GUEK are never transmitted and are never serialized.
+Secret redaction is enabled by default. To retain credential-bearing raw frames and any readable Association secret or user values during an authorized laboratory test, set:
+
+```yaml
+output:
+  redact_secrets: false
+```
+
+This unsafe mode is marked clearly in `summary.md` and every traffic record. It retains the raw LLS AARQ, decoded authentication values, readable Association LN attribute 7, and Association user data. Treat the whole run directory as sensitive. GAK and GUEK are still not serialized because they are client inputs rather than values received from the meter; they are not transmitted by DLMS. With the default `true`, decoded challenge fields are redacted, the raw LLS AARQ is omitted, and a readable Association secret is hashed while its raw response is omitted.
 
 ## Secure connection flow
 
@@ -443,8 +461,9 @@ Serial framing, validation response timeout, inter-request delay, and session gu
 
 Each run gets a UTC-named directory under `./runs` unless overridden:
 
-- `report.json` contains the selected endpoint, addressing type, redacted effective configuration, active, probed, and Association-LN-advertised authentication mechanisms, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, optional public cross-profile findings, a complete per-role GET/SET/ACTION capability matrix, cleanup warnings, and a traffic-file hash. Each matrix row is `SUCCESS`, a normalized failure category, or `NOT_TESTED`.
-- `summary.md` is the human-readable report. It contains connection and role details, attempted decoded OBIS values, public cross-profile findings, and a compact operation matrix; untested GET detail remains in `report.json`. In secure scans the decoded table places compact encrypted-RX evidence immediately to the right of the encoded value. Large or multi-block ciphertext is summarized by fragment/byte count and the protected-APDU table limits and hashes long evidence; complete bytes remain in `traffic.jsonl`. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent.
+- `report.json` contains the selected endpoint, addressing type, safely described effective configuration, active, probed, and Association-LN-advertised authentication mechanisms, structured AARQ/AARE negotiation metadata, Association LN context, selective-access selectors, Profile Generic schemas, engineering and date/time metadata, association/HLS outcome, public counter bootstrap, discovered objects, decoded values, GET outcomes, optional public cross-profile findings, a complete per-role GET/SET/ACTION capability matrix, cleanup warnings, and traffic-file hashes. Each matrix row is `SUCCESS`, a normalized failure category, or `NOT_TESTED`. Readable Association secrets and users are retained when `output.redact_secrets` is explicitly disabled.
+- `summary.md` is the human-readable report. It contains connection and role details, proposed-versus-negotiated association values, Association object metadata, selective-access support, engineering metadata, complete date/time flags, Profile Generic schemas and rows, attempted decoded OBIS values with detected wire/interface/UI types, public cross-profile findings, and a compact operation matrix. Per-frame HDLC sequence/FCS, invoke, block-transfer and selector details are shown for a bounded number of frames; complete evidence remains in `traffic.jsonl`. In secure scans, security-control flags and Suites 0–2 are decoded, and general-ciphering envelope fields are shown when present. SET and ACTION are discovered passively and remain `NOT_TESTED` because no modifying request is sent.
+- `profile-logs.jsonl` is written when Profile Generic rows were read. It starts each profile with a schema record containing the captured-object definitions and then writes one record per row. Each cell retains its ordered column position, source class/OBIS/attribute/data-index, available type information, decoded value, and raw value. JSONL is the canonical export because profile cells may contain nested DLMS arrays and structures.
 - `association-view.json` is the portable per-role inventory snapshot. Profile
   Generic buffers that arrive across multiple DLMS blocks are reassembled before
   reporting; `summary.md` decodes 12-byte COSEM timestamps and renders numeric
@@ -456,7 +475,13 @@ Each run gets a UTC-named directory under `./runs` unless overridden:
   complete.
   Each role's `report.json` and `summary.md` also include the passive Security
   Setup/Image Transfer posture and bounded candidate-generation details.
-- `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, protected command names, outgoing invocation counters, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators. The reusable LLS password is never written as decoded data, and the raw LLS AARQ is omitted because it contains that password.
+- `traffic.jsonl` contains the profile name, phase, addresses, authentication/security metadata, client/server system titles when known, raw TX/RX frames, searchable HDLC framing/FCS/sequence metadata, invoke ID and priority, service class, block-transfer fields, selective-access parameters, protected command names, security-control flags, outgoing invocation counters, general-ciphering envelope fields, separated ciphertext and authentication-tag evidence, Gurux-decoded response values, result category, timing, and redaction indicators. Each record says whether secrets were redacted. By default, the reusable LLS password is not decoded, its raw AARQ is omitted, and a readable Association LN secret is hashed while its raw response is omitted. Setting `output.redact_secrets: false` retains that raw evidence.
+- When passive system-title listening is requested,
+  `system-title-discovery.json` records the unique titles and every matching
+  observation, while `system-title-traffic.jsonl` retains receive-only raw
+  evidence for matching AARE and `GeneralGloCiphering` frames. Unrelated frames
+  are not retained because they could include a credential-bearing LLS AARQ.
+  These files are also linked from `workflow.json` and each role report.
 - When `authentication_scan.enabled` is true, `authentication-report.json`,
   `authentication-summary.md`, and `authentication-traffic.jsonl` are written at
   the run root. The summary and terminal show one role-by-mechanism matrix.

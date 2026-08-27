@@ -14,8 +14,9 @@ from dlms_enum.workflow import CounterCandidate, PublicPreflight
 
 
 class NullLogger:
-    def __init__(self, path):
+    def __init__(self, path, *, redact_secrets=True):
         self.path = path
+        self.redact_secrets = redact_secrets
 
     def close(self):
         pass
@@ -63,6 +64,7 @@ class CliWorkflowTests(unittest.TestCase):
             get_limit=None,
             association_view_mode="live",
             save_association_view=False,
+            system_title_listen_seconds=5,
         )
 
         def fake_scan(runtime_config, *_args, **_kwargs):
@@ -124,6 +126,20 @@ class CliWorkflowTests(unittest.TestCase):
                 patch("dlms_enum.cli._run_directory", return_value=run_directory),
                 patch("dlms_enum.cli.TrafficLogger", NullLogger),
                 patch("dlms_enum.cli.run_public_preflight", return_value=preflight),
+                patch(
+                    "dlms_enum.cli.listen_for_system_titles",
+                    return_value={
+                        "schema_version": 1,
+                        "status": "completed",
+                        "titles": [
+                            {
+                                "kind": "server",
+                                "hex": "4D45544552303031",
+                                "source": "passive_general_glo_ciphering",
+                            }
+                        ],
+                    },
+                ) as passive_listener,
                 patch("dlms_enum.cli.scan", side_effect=fake_scan),
                 patch("dlms_enum.cli.write_report"),
                 patch("dlms_enum.cli.ScanUI.summary"),
@@ -142,6 +158,11 @@ class CliWorkflowTests(unittest.TestCase):
             1,
         )
         self.assertEqual(workflow["capability_comparison"]["status"], "completed")
+        self.assertEqual(
+            workflow["system_title_discovery"]["titles"][0]["hex"],
+            "4D45544552303031",
+        )
+        passive_listener.assert_called_once()
 
     def test_live_association_export_updates_report_snapshot_timestamp(self):
         config = parse_config(

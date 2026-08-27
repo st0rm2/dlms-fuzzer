@@ -65,6 +65,37 @@ def normalize_value(value: Any) -> Any:
         }
     if isinstance(value, (dt.datetime, dt.date, dt.time)):
         return value.isoformat()
+    if type(value).__module__.startswith("gurux_dlms") and type(value).__name__ in {
+        "GXDateTime",
+        "GXDate",
+        "GXTime",
+    }:
+        temporal = getattr(value, "value", None)
+        skip = getattr(value, "skip", None)
+        status = getattr(value, "status", None)
+        extra = getattr(value, "extra", None)
+
+        def flags(item: Any) -> list[str]:
+            try:
+                return [
+                    member.name.lower()
+                    for member in type(item)
+                    if int(member) and int(item) & int(member)
+                ]
+            except (TypeError, ValueError):
+                return []
+
+        return {
+            "python_type": f"{type(value).__module__}.{type(value).__name__}",
+            "display": str(value),
+            "value": temporal.isoformat() if hasattr(temporal, "isoformat") else None,
+            "day_of_week": (
+                None if getattr(value, "dayOfWeek", 0xFF) == 0xFF else getattr(value, "dayOfWeek")
+            ),
+            "skipped_fields": flags(skip),
+            "clock_status": flags(status) or ([enum_name(status)] if enum_name(status) else []),
+            "extra_info": flags(extra),
+        }
     if dataclasses.is_dataclass(value):
         return normalize_value(dataclasses.asdict(value))
     if isinstance(value, dict):

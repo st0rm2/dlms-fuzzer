@@ -39,6 +39,8 @@ Normal scans must not send arbitrary SET or ACTION requests, transfer firmware, 
 - [x] Compact large protected-ciphertext and authenticated-only comparison output.
 - [x] Verify each role's known-good authentication first and recheck it between
   mechanisms using the existing transport session guard.
+- [x] Add optional receive-only system-title discovery for AARE and
+  `GeneralGloCiphering` traffic to the main scan workflow.
 
 ## Completed: public-versus-authenticated capability comparison
 
@@ -133,6 +135,18 @@ Build a read-only posture section from already accessible objects and Associatio
 - [x] Report image-transfer status, block size, enablement, and advertised initiate/transfer/verify/activate rights where available.
 - [x] Avoid claiming that remote metadata proves secure-element use, key extraction, signature enforcement, or secure boot.
 - [x] Never send Image Transfer or key-management ACTION requests in a normal scan.
+
+## Protocol and object metadata extraction
+
+- [x] Preserve AARQ/AARE application context, result diagnostic, proposed and negotiated version/conformance/PDU/QoS, and VAA name as structured fields.
+- [x] Preserve Association View selective-access selector lists instead of dropping them after parsing access modes.
+- [x] Group readable Association LN SAP, context, mechanism, status, Security Setup reference, and redacted user metadata in the report.
+- [x] Join Profile Generic capture-object schemas and settings to their buffer rows and export schema-plus-row JSONL.
+- [x] Attach scaler, unit, status, capture-time, and period metadata only when their defining attributes were successfully read.
+- [x] Preserve COSEM date/time skipped fields, day of week, status flags, and special-date information.
+- [x] Extract HDLC address, sequence, poll/final, segmentation, and FCS state plus xDLMS invoke, priority, service class, block, and selective-access metadata.
+- [x] Decode security-control level, Suites 0–2, compression, broadcast/global/dedicated scope, and available general-ciphering envelope fields.
+- [x] Redact and hash a readable Association LN secret and omit its raw response frame.
 
 ## Separate conformance workflow: association policy and downgrade checks
 

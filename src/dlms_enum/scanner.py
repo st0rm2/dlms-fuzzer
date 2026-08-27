@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import getpass
+import hashlib
 import os
 import shlex
 import stat
@@ -21,7 +22,14 @@ from .config import (
     resolve_secure_keys,
 )
 from .counter_state import acquire_counter_lease, counter_identity
-from .result_model import Outcome, classify_exception, enum_name, error_record, utc_now
+from .result_model import (
+    Outcome,
+    classify_exception,
+    enum_name,
+    error_record,
+    normalize_value,
+    utc_now,
+)
 from .security_posture import build_security_posture
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -114,6 +122,206 @@ def _successful_attribute(
         ):
             return attribute
     return None
+
+
+def _decoded_value(object_record: dict[str, Any], attribute_id: int) -> Any:
+    attribute = _successful_attribute(object_record, attribute_id)
+    if attribute is None:
+        return None
+    decoded = attribute.get("decoded", {})
+    return decoded.get("value") if isinstance(decoded, dict) else None
+
+
+def _raw_attribute_value(object_record: dict[str, Any], attribute_id: int) -> Any:
+    attribute = _successful_attribute(object_record, attribute_id)
+    if attribute is None:
+        return None
+    decoded = attribute.get("decoded", {})
+    return decoded.get("raw_value") if isinstance(decoded, dict) else None
+
+
+def _redact_sensitive_attribute(
+    decoded: dict[str, Any],
+    *,
+    class_id: int,
+    attribute_id: int,
+    redact_secrets: bool = True,
+) -> dict[str, Any]:
+    """Redact a readable Association LN secret unless raw output was requested."""
+
+    if not redact_secrets or class_id != 15 or attribute_id != 7:
+        return decoded
+    raw = decoded.get("raw_value")
+    if isinstance(raw, dict) and isinstance(raw.get("hex"), str):
+        try:
+            evidence = bytes.fromhex(raw["hex"])
+        except ValueError:
+            evidence = raw["hex"].encode("utf-8")
+    elif isinstance(raw, (bytes, bytearray, memoryview)):
+        evidence = bytes(raw)
+    else:
+        evidence = repr(raw).encode("utf-8")
+    return {
+        "value": "<redacted>",
+        "raw_value": "<redacted>",
+        "sensitive_value": True,
+        "evidence_length": len(evidence),
+        "evidence_sha256": hashlib.sha256(evidence).hexdigest(),
+        "dlms_data_type": decoded.get("dlms_data_type"),
+        "interface_data_type": decoded.get("interface_data_type"),
+        "ui_data_type": decoded.get("ui_data_type"),
+    }
+
+
+def _association_object_metadata(
+    object_records: list[dict[str, Any]],
+    association: dict[str, Any],
+    *,
+    redact_secrets: bool = True,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for obj in object_records:
+        if int(obj.get("class_id", -1)) != 15:
+            continue
+        partners = _decoded_value(obj, 3)
+        client_sap = server_sap = None
+        if isinstance(partners, list) and len(partners) >= 2:
+            client_sap, server_sap = partners[:2]
+        users = _decoded_value(obj, 10)
+        current_user = _decoded_value(obj, 11)
+        application_context_raw = _raw_attribute_value(obj, 4)
+        application_context = {
+            "oid": application_context_raw,
+            "context_id": (
+                application_context_raw[-1]
+                if isinstance(application_context_raw, list)
+                and application_context_raw
+                else None
+            ),
+            "display": _decoded_value(obj, 4),
+        }
+        xdlms_raw = _raw_attribute_value(obj, 5)
+        xdlms_context = {
+            "conformance": xdlms_raw[0],
+            "max_receive_pdu_size": xdlms_raw[1],
+            "max_send_pdu_size": xdlms_raw[2],
+            "dlms_version": xdlms_raw[3],
+            "quality_of_service": xdlms_raw[4],
+            "ciphering_info": xdlms_raw[5],
+        } if isinstance(xdlms_raw, list) and len(xdlms_raw) >= 6 else {
+            "display": _decoded_value(obj, 5)
+        }
+        mechanism_attribute = _successful_attribute(obj, 6)
+        mechanism_id = _authentication_mechanism_id(mechanism_attribute)
+        security_reference = _normalized_logical_name(_raw_attribute_value(obj, 9))
+        result.append(
+            {
+                "logical_name": obj.get("logical_name"),
+                "object_version": obj.get("object_version"),
+                "client_sap": client_sap,
+                "server_sap": server_sap,
+                "application_context": application_context,
+                "xdlms_context_info": xdlms_context,
+                "authentication_mechanism": {
+                    "mechanism_id": mechanism_id,
+                    "mechanism": AUTHENTICATION_MECHANISMS.get(
+                        mechanism_id, f"unknown_{mechanism_id}"
+                    ) if mechanism_id is not None else None,
+                    "oid": _raw_attribute_value(obj, 6),
+                },
+                "association_status": _decoded_value(obj, 8),
+                "security_setup_reference": security_reference or _decoded_value(obj, 9),
+                "user_list": {
+                    "present": users is not None,
+                    "count": len(users) if isinstance(users, list) else None,
+                    "redacted": redact_secrets and users is not None,
+                    "value": None if redact_secrets else users,
+                },
+                "current_user": {
+                    "present": current_user is not None,
+                    "redacted": redact_secrets and current_user is not None,
+                    "value": None if redact_secrets else current_user,
+                },
+                "association_secret": (
+                    None if redact_secrets else _decoded_value(obj, 7)
+                ),
+                "secrets_redacted": redact_secrets,
+                "active": obj.get("logical_name") == "0.0.40.0.0.255",
+                "negotiated_protocol": association.get("protocol_metadata", {}),
+            }
+        )
+    return result
+
+
+def _normalized_logical_name(value: Any) -> str | None:
+    if isinstance(value, dict) and value.get("encoding") == "octet-string":
+        raw_hex = value.get("hex")
+        if isinstance(raw_hex, str):
+            try:
+                raw = bytes.fromhex(raw_hex)
+            except ValueError:
+                raw = b""
+            if len(raw) == 6:
+                return ".".join(str(item) for item in raw)
+    if isinstance(value, str) and value.count(".") == 5:
+        return value
+    return None
+
+
+def _profile_generic_metadata(
+    obj: dict[str, Any], object_index: dict[tuple[int, str], dict[str, Any]]
+) -> dict[str, Any]:
+    capture_attribute = _successful_attribute(obj, 3)
+    decoded = capture_attribute.get("decoded", {}) if capture_attribute else {}
+    raw_columns = decoded.get("raw_value") if isinstance(decoded, dict) else None
+    if not isinstance(raw_columns, list):
+        raw_columns = decoded.get("value") if isinstance(decoded, dict) else None
+    columns: list[dict[str, Any]] = []
+    if isinstance(raw_columns, list):
+        for position, item in enumerate(raw_columns, 1):
+            if not isinstance(item, list) or len(item) < 4:
+                continue
+            try:
+                class_id = int(item[0])
+                attribute_id = int(item[2])
+                data_index = int(item[3])
+            except (TypeError, ValueError):
+                continue
+            logical_name = _normalized_logical_name(item[1])
+            source = object_index.get((class_id, logical_name or ""), {})
+            source_attribute = next(
+                (
+                    candidate
+                    for candidate in source.get("attributes", [])
+                    if candidate.get("attribute_id") == attribute_id
+                ),
+                {},
+            )
+            source_decoded = source_attribute.get("decoded", {})
+            columns.append(
+                {
+                    "position": position,
+                    "class_id": class_id,
+                    "logical_name": logical_name,
+                    "attribute_id": attribute_id,
+                    "data_index": data_index,
+                    "object_description": source.get("description") or None,
+                    "attribute_name": source_attribute.get("name"),
+                    "dlms_data_type": source_decoded.get("dlms_data_type"),
+                    "interface_data_type": source_decoded.get("interface_data_type"),
+                    "ui_data_type": source_decoded.get("ui_data_type"),
+                    "engineering_metadata": source.get("engineering_metadata", {}),
+                }
+            )
+    return {
+        "columns": columns,
+        "capture_period_seconds": _decoded_value(obj, 4),
+        "sort_method": _decoded_value(obj, 5),
+        "sort_object": _decoded_value(obj, 6),
+        "entries_in_use": _decoded_value(obj, 7),
+        "profile_entries": _decoded_value(obj, 8),
+        "row_encoding": "array_of_structures",
+    }
 
 
 def _authentication_mechanism_id(attribute: dict[str, Any] | None) -> int | None:
@@ -484,6 +692,7 @@ def _association_version(objects: list[Any]) -> int:
 def _attribute_access_rights(
     target: Any, attribute_id: int, association_version: int
 ) -> dict[str, Any]:
+    selectors = getattr(target, "_dlms_access_selectors", {}).get(attribute_id, [])
     if association_version >= 3:
         mode = int(target.getAccess3(attribute_id))
         base = mode & 0x03
@@ -507,6 +716,7 @@ def _attribute_access_rights(
             "requirements": requirements,
             "mode": f"access3:0x{mode:02X}",
             "raw": mode,
+            "access_selectors": selectors,
         }
     mode = int(target.getAccess(attribute_id))
     names = {
@@ -526,6 +736,7 @@ def _attribute_access_rights(
         "requirements": ["authenticated_request"] if mode in (4, 5, 6) else [],
         "mode": names.get(mode, f"mode_{mode}"),
         "raw": mode,
+        "access_selectors": selectors,
     }
 
 
@@ -2500,6 +2711,11 @@ def scan_public(
             for capability in testable_get_capabilities
             if capability in selected_get_capabilities
             and capability != association_view_get
+            and not (
+                config.output.redact_secrets
+                and capability[0][0] == 15
+                and capability[1] == 7
+            )
             and item_by_key[capability[0]]["attributes"][capability[1]].get("read")
             and not item_by_key[capability[0]]["attributes"][capability[1]].get(
                 "catalogue_probe"
@@ -2682,6 +2898,12 @@ def scan_public(
 
                 capability = ((class_id, logical_name), attribute_id)
                 if capability in batch_results:
+                    batch_decoded = _redact_sensitive_attribute(
+                        batch_results[capability],
+                        class_id=class_id,
+                        attribute_id=attribute_id,
+                        redact_secrets=config.output.redact_secrets,
+                    )
                     attribute_result.update(
                         {
                             "lifecycle": "success",
@@ -2694,7 +2916,7 @@ def scan_public(
                                     "get_with_list": True,
                                 }
                             ],
-                            "decoded": batch_results[capability],
+                            "decoded": batch_decoded,
                         }
                     )
                     get_success += 1
@@ -2802,7 +3024,16 @@ def scan_public(
                             break
                         continue
                     attribute_result.update(
-                        {"lifecycle": "success", "outcome": Outcome.SUCCESS.value, "decoded": decoded}
+                        {
+                            "lifecycle": "success",
+                            "outcome": Outcome.SUCCESS.value,
+                            "decoded": _redact_sensitive_attribute(
+                                decoded,
+                                class_id=class_id,
+                                attribute_id=attribute_id,
+                                redact_secrets=config.output.redact_secrets,
+                            ),
+                        }
                     )
                     attribute_result["attempts"].append({"attempt": attempt, "outcome": Outcome.SUCCESS.value})
                     retry_policy.record(Outcome.SUCCESS)
@@ -2865,15 +3096,62 @@ def scan_public(
                 )
 
             engineering: dict[str, Any] = {}
-            for name in ("scaler", "unit"):
+            successful_metadata_names = {
+                str(attribute.get("name") or "").lower().replace("_", " ")
+                for attribute in object_result.get("attributes", [])
+                if attribute.get("outcome") == Outcome.SUCCESS.value
+            }
+            for name in (
+                "scaler",
+                "unit",
+                "status",
+                "captureTime",
+                "startTimeCurrent",
+                "period",
+                "numberOfPeriods",
+            ):
+                expected_names = {
+                    "scaler": ("scaler", "scaler unit", "scaler and unit"),
+                    "unit": ("unit", "scaler unit", "scaler and unit"),
+                    "status": ("status",),
+                    "captureTime": ("capture time",),
+                    "startTimeCurrent": ("start time current",),
+                    "period": ("period",),
+                    "numberOfPeriods": ("number of periods",),
+                }[name]
+                if not any(
+                    expected in metadata_name
+                    for expected in expected_names
+                    for metadata_name in successful_metadata_names
+                ):
+                    continue
                 try:
                     value = getattr(target, name)
                 except Exception:
                     continue
                 if value is not None:
-                    engineering[name] = enum_name(value) or value
+                    key = {
+                        "captureTime": "capture_time",
+                        "startTimeCurrent": "start_time_current",
+                        "numberOfPeriods": "number_of_periods",
+                    }.get(name, name)
+                    engineering[key] = enum_name(value) or normalize_value(value)
             if engineering:
                 object_result["engineering_metadata"] = engineering
+
+        object_index = {
+            (int(obj["class_id"]), str(obj["logical_name"])): obj
+            for obj in object_records
+        }
+        for obj in object_records:
+            if int(obj.get("class_id", -1)) == 7:
+                obj["profile_generic"] = _profile_generic_metadata(obj, object_index)
+
+        profile_result["association_metadata"] = _association_object_metadata(
+            object_records,
+            association,
+            redact_secrets=config.output.redact_secrets,
+        )
 
         identification: dict[str, Any] = {}
         identity_names = {
