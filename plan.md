@@ -16,6 +16,8 @@ Every phase continues to distinguish clearly between:
 - explicit DLMS rejections;
 - transport failures and other inconclusive results.
 
+The vulnerability research behind Phases 2–5 — published flaws, multi-client logic errors, and the derived feature list (IDs A1–H3) — lives in [docs/vulnerability-research.md](docs/vulnerability-research.md).
+
 ## Phase 1 — enumeration and access engine (complete)
 
 ### Completed foundation
@@ -163,9 +165,9 @@ The normal counter allocator deliberately prevents reuse. The existing diagnosti
 - [x] Stop after two probes and verify that a fresh-counter request still works.
 - [x] Document possible association desynchronization and lockout risks.
 
-## Phase 2 — association policy and downgrade conformance checks
+## Phase 2 — active access-control and authentication checks
 
-A separate command with explicit authorization and attempt limits, not an automatic fallback used by `scan`.
+Feature IDs refer to [docs/vulnerability-research.md](docs/vulnerability-research.md). A separate command with explicit authorization and attempt limits, not an automatic fallback used by `scan`.
 
 - [ ] Require the expected policy for each client SAP.
 - [ ] Test application context/protection, authentication mechanism, security suite, and security policy as separate dimensions.
@@ -174,31 +176,56 @@ A separate command with explicit authorization and attempt limits, not an automa
 - [ ] Bound attempts, reuse the transport session guard, and add lockout warnings.
 - [ ] Never continue a normal scan under a weaker association after the expected secure association fails.
 - [ ] Produce a matrix of proposed versus negotiated/observed properties and explain why each result is or is not a downgrade.
+- [ ] A4: hidden-association discovery — probe Association LN objects absent from the current view.
+- [ ] A5: duplicate/multi-instance disconnect-control objects with inconsistent rights.
+- [ ] A6: system-title-dependent association views (same SAP, different claimed titles).
+- [ ] A7: selective-access leaks on restricted Profile Generic buffers.
+- [ ] B1: classify the mechanism acceptance matrix — MD5/SHA-1 acceptance is an offline-dictionary-attack finding.
+- [ ] B4: HLS challenge entropy analysis across repeated associations.
+- [ ] B5: HLS reflection acceptance (StoC == CtoS).
+- [ ] C1 extensions: replay after forced reboot; replay old captured frames.
+- [ ] C2: invocation-counter table exhaustion via arbitrary system titles.
+- [ ] C3: GMAC tag corruption acceptance.
+- [ ] C4: security-bit downgrade and plaintext APDUs on protected associations.
+- [ ] C6: plaintext disconnect injection mid-HLS-session.
 
 ## Phase 3 — fuzzing engine
 
 Protocol fuzzing built on the Phase 1 access engine. All mutated traffic passes through the adapter's single I/O funnel (`gurux_adapter.py` `_exchange_packet`), so mutation, recording, and abort logic apply uniformly.
 
 - [ ] Mutation and malformed-APDU injection at the `_exchange_packet` funnel.
-- [ ] BER length-field abuse: truncated, oversized, and inconsistent length encodings.
-- [ ] Oversized and malformed AARQ payloads.
-- [ ] Invalid and contradictory conformance blocks.
-- [ ] HDLC-level frame replay and out-of-order sequence testing.
-- [ ] Per-target crash and lockout detection with bounded recovery, building on the existing circuit breaker and invocation-counter safety.
+- [ ] E1: HDLC-layer fuzzing — frame length vs. payload mismatch, FCS corruption, segmentation abuse.
+- [ ] E2: AARQ/xDLMS BER fuzzing — truncated, oversized, inconsistent, and indefinite length encodings.
+- [ ] E3: A-XDR data fuzzing — array/string length lies, deeply nested COSEM structures, type confusion.
+- [ ] C5: ciphered-APDU type confusion and degenerate ciphered APDUs.
+- [ ] Oversized and malformed AARQ payloads; invalid and contradictory conformance blocks.
+- [ ] E4: rogue-server mode — malformed AARE/GET/ACTION responses to fuzz DLMS clients (HES/DCU).
+- [ ] E5: per-target crash and lockout detection with bounded recovery, building on the existing circuit breaker and invocation-counter safety.
 - [ ] Deterministic mutation seeds and budgets so a crashing input is reproducible.
 
-## Phase 4 — vulnerability corpus
+## Phase 4 — vulnerability corpus and multi-client state
 
-- [ ] Default/known-credential testing for LLS and HLS roles, lab-authorized and explicitly opt-in.
+- [ ] B2: default/known-credential testing for LLS and HLS roles, lab-authorized and explicitly opt-in.
+- [ ] B3: credential-reuse checks across client SAPs, sibling meters, and the DCU's own server.
+- [ ] D1: same-key invocation-counter desync race between concurrent associations.
+- [ ] D2: session-slot exhaustion (head-end imitation DoS).
+- [ ] D3: cross-role log tampering — clear/capture/reset on shared Profile Generic and security logs.
+- [ ] D4: shared-object state pollution across roles.
+- [ ] F1: Image Transfer active tests — unsigned images, anti-rollback, oversized blocks.
+- [ ] F2: key-transfer exposure — class-64 key methods from weak associations; non-rotatable master keys.
+- [ ] F3: suite capability baseline — Suite-0-only and missing ECDH/ECDSA findings.
+- [ ] G1: WRAPPER/TCP and cellular exposure checks.
+- [ ] G2: IEC 62056-21 optical-port probing.
+- [ ] G3: management-plane scan of DCUs/HES (default credentials, debug services).
+- [ ] G4: cleartext-credential detection in observed traffic.
 - [ ] Known DLMS/COSEM vulnerability signatures matched against enumerated versions and capabilities.
-- [ ] IEC 62056-21 optical-port and TCP/WRAPPER transport support.
-- [ ] Security-policy downgrade acceptance tests (extends the Phase 2 conformance matrix).
-- [ ] HLS challenge entropy analysis across repeated associations.
 
 ## Phase 5 — vulnerability reporting
 
-- [ ] Findings records with severity ratings on top of the existing evidence model.
+- [ ] H1: findings records with severity ratings on top of the existing evidence model.
 - [ ] Map each finding to its evidence: advertised capability, transmitted verification, or inconclusive result.
+- [ ] H2: compliance baseline mapping (Czech Decree 359/2020 Annex 4 / ENCS expectations).
+- [ ] H3: HES-side checks — client credential storage, downgrade acceptance, f(CtoS) verification.
 - [ ] Consolidated per-target vulnerability summary across roles and phases.
 
 ## Methodology notes
