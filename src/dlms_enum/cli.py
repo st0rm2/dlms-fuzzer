@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import replace
@@ -35,6 +36,7 @@ from .config import (
     with_get_limit,
     with_object_limit,
 )
+from .quickscan import DEFAULT_OUTPUT_DIRECTORY, discover_config, load_secrets_file
 from .reporter import load_report, summary_lines, write_report
 from .scanner import (
     AUTHENTICATION_DISPLAY_NAMES,
@@ -68,7 +70,35 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser = subparsers.add_parser(
         "scan", help="run normal GET-only role scans and an optional final authentication matrix"
     )
-    scan_parser.add_argument("--config", type=Path, help="YAML configuration; omit for guided setup")
+    source = scan_parser.add_mutually_exclusive_group()
+    source.add_argument(
+        "device",
+        nargs="?",
+        help="serial device for zero-config discovery, for example /dev/ttyUSB0",
+    )
+    source.add_argument("--config", type=Path, help="YAML configuration; omit for guided setup")
+    scan_parser.add_argument(
+        "--secrets",
+        type=Path,
+        metavar="FILE",
+        help="KEY=VALUE file exported into the environment before secret resolution",
+    )
+    scan_parser.add_argument(
+        "--save-profile",
+        type=Path,
+        metavar="PATH",
+        help="save the discovered configuration as a reusable profile",
+    )
+    scan_parser.add_argument(
+        "--no-save-profile",
+        action="store_true",
+        help="do not save the discovered configuration as a profile",
+    )
+    scan_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="never prompt; requires a device argument or --config",
+    )
     scan_parser.add_argument(
         "--roles",
         help="comma-separated configured roles to scan; defaults to all roles",
@@ -134,7 +164,7 @@ def _run_directory(base: str) -> Path:
     return candidate
 
 
-def _selected_roles(config, requested: str | None, console: Console):
+def _selected_roles(config, requested: str | None, console: Console, *, non_interactive: bool = False):
     if requested:
         available = {profile.role: profile for profile in config.profiles}
         names = [item.strip() for item in requested.split(",") if item.strip()]
@@ -145,7 +175,7 @@ def _selected_roles(config, requested: str | None, console: Console):
                 f"--roles contains unknown, empty, or duplicate role names{detail}"
             )
         return tuple(available[name] for name in names)
-    if console.is_terminal and sys.stdin.isatty():
+    if not non_interactive and console.is_terminal and sys.stdin.isatty():
         return select_roles(config, console)
     return config.profiles
 
@@ -156,8 +186,38 @@ def _safe_role_directory(role: str) -> str:
 
 
 def _scan(args: argparse.Namespace, console: Console) -> int:
-    loaded_config = load_config(args.config) if args.config else interactive_config(console)
-    selected = _selected_roles(loaded_config, args.roles, console)
+    non_interactive = bool(getattr(args, "non_interactive", False))
+    if getattr(args, "secrets", None):
+        os.environ.update(load_secrets_file(args.secrets))
+    run_directory: Path | None = None
+    if args.config:
+        loaded_config = load_config(args.config)
+    elif getattr(args, "device", None):
+        # Discovery runs before the suggested configuration exists, so the run
+        # directory is created up front and shared with the scan below.
+        run_directory = _run_directory(DEFAULT_OUTPUT_DIRECTORY)
+        discovery_traffic_path = run_directory / "discovery-traffic.jsonl"
+        discovery_logger = TrafficLogger(discovery_traffic_path)
+        console.print(
+            f"Discovering public DLMS endpoint on [bold]{args.device}[/bold]..."
+        )
+        try:
+            loaded_config = discover_config(args.device, discovery_logger)
+        finally:
+            discovery_logger.close()
+        console.print(
+            f"Discovery traffic: [green]{discovery_traffic_path.resolve()}[/green]"
+        )
+    elif non_interactive:
+        raise ConfigError(
+            "--non-interactive requires a device argument or --config; "
+            "guided setup needs an interactive terminal"
+        )
+    else:
+        loaded_config = interactive_config(console)
+    selected = _selected_roles(
+        loaded_config, args.roles, console, non_interactive=non_interactive
+    )
     public_preflight_profile = next(
         (
             profile
@@ -167,7 +227,9 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         selected[0],
     )
     config = replace(loaded_config, profiles=selected)
-    interactive = console.is_terminal and sys.stdin.isatty()
+    interactive = (
+        console.is_terminal and sys.stdin.isatty() and not non_interactive
+    )
     if args.short:
         config = with_object_limit(config, 10)
     elif args.full:
@@ -181,7 +243,8 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         raise ConfigError("--system-title-listen-seconds must be from 0 through 3600")
     for warning in config.warnings:
         console.print(f"[yellow]Warning:[/yellow] {warning}")
-    run_directory = _run_directory(config.output.directory)
+    if run_directory is None:
+        run_directory = _run_directory(config.output.directory)
     ui = ScanUI(console)
     preflight_path = run_directory / "preflight-traffic.jsonl"
     preflight_logger = TrafficLogger(
