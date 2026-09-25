@@ -1,10 +1,14 @@
 # dlms-enum roadmap
 
-Status: 2026-08-24
+Status: 2026-09-25
 
 ## Direction
 
-`dlms-enum` remains an authorized, read-only discovery and configuration-audit tool. It should distinguish clearly between:
+`dlms-enum` is an authorized DLMS/COSEM vulnerability scanner and fuzzer. Its mission is to assess the security posture of DLMS/COSEM meters: enumerate the attack surface, verify access-control and authentication policy with active tests, and fuzz the protocol implementation for robustness defects.
+
+Phase 1 — the read-only enumeration and multi-role access engine — was the feasibility phase: prove reliable interaction with a real meter over serial HDLC and working access via public, LLS-password, and HLS-GMAC roles. That phase succeeded and is complete. Subsequent phases build active vulnerability testing and protocol fuzzing on top of this engine.
+
+Every phase continues to distinguish clearly between:
 
 - capabilities advertised by an Association LN;
 - operations verified by a request;
@@ -12,9 +16,9 @@ Status: 2026-08-24
 - explicit DLMS rejections;
 - transport failures and other inconclusive results.
 
-Normal scans must not send arbitrary SET or ACTION requests, transfer firmware, rotate keys, guess credentials, or replay protected commands. Higher-risk protocol-conformance checks belong in separate, explicitly selected lab workflows.
+## Phase 1 — enumeration and access engine (complete)
 
-## Completed foundation
+### Completed foundation
 
 - [x] Public Association LN discovery and read-only GET scanning.
 - [x] HLS-GMAC Security Suite 0 association with authenticated and encrypted xDLMS traffic.
@@ -42,7 +46,7 @@ Normal scans must not send arbitrary SET or ACTION requests, transfer firmware, 
 - [x] Add optional receive-only system-title discovery for AARE and
   `GeneralGloCiphering` traffic to the main scan workflow.
 
-## Completed: public-versus-authenticated capability comparison
+### Completed: public-versus-authenticated capability comparison
 
 The workflow compares exported public and authenticated Association Views after all selected roles finish. It keeps passive permission evidence separate from direct public GET verification.
 
@@ -74,7 +78,7 @@ Definition of done:
 - Passive exposure, verified exposure, rejection, and inconclusive evidence cannot be confused in either report format.
 - Existing report consumers remain compatible, or the report schema version is deliberately advanced and documented.
 
-## Next release gate: authorized live validation
+### Next release gate: authorized live validation
 
 Before adding more scan breadth, validate the new behavior against the authorized meter:
 
@@ -85,7 +89,7 @@ Before adding more scan breadth, validate the new behavior against the authorize
 - [ ] Review Security Setup and Image Transfer posture values and passive findings.
 - [ ] Run an explicitly enabled, bounded `security`/`firmware` candidate scan.
 
-## Reliability gate: dead-session circuit breaker and timing evidence
+### Reliability gate: dead-session circuit breaker and timing evidence
 
 This gate should be completed before significantly increasing the number of probe candidates. Retry suppression prevents a second transmission, but a silent association can still cause every remaining candidate to consume one timeout.
 
@@ -98,7 +102,7 @@ This gate should be completed before significantly increasing the number of prob
 - [x] Report the circuit-breaker threshold, trigger point, attempted recovery, and number of skipped requests.
 - [x] Test public and protected recovery paths, including cleanup failures.
 
-## Bounded OBIS enumeration outside the Association LN
+### Bounded OBIS enumeration outside the Association LN
 
 Replace the small fixed catalogue as the only undeclared-object source with bounded, explainable candidate generation. Do not attempt the full six-byte OBIS Cartesian space.
 
@@ -113,7 +117,7 @@ Replace the small fixed catalogue as the only undeclared-object source with boun
 - [x] Keep the default candidate set conservative; Security Setup and firmware candidates require explicit configuration.
 - [ ] Add optional named manufacturer catalogue packages when authoritative data is available.
 
-## LLS profile and credential-exposure reporting
+### LLS profile and credential-exposure reporting
 
 Add Low Level Security only with secret-safe configuration and traffic handling.
 
@@ -122,10 +126,10 @@ Add Low Level Security only with secret-safe configuration and traffic handling.
 - [x] Never place the password in configuration snapshots, reports, exceptions, or decoded traffic.
 - [x] Omit raw credential-bearing AARQ capture and redact decoded authentication values.
 - [x] Report observed authentication and transport/confidentiality properties without exposing the value.
-- [x] Do not add password guessing, default-password lists, or authentication spraying.
+- [x] Keep password guessing, default-password lists, and authentication spraying out of the Phase 1 LLS association profile; credential-policy testing belongs to the Phase 4 module.
 - [x] Include LLS as another role in the passive capability comparison.
 
-## Passive security and firmware-update posture
+### Passive security and firmware-update posture
 
 Build a read-only posture section from already accessible objects and Association LN rights.
 
@@ -136,7 +140,7 @@ Build a read-only posture section from already accessible objects and Associatio
 - [x] Avoid claiming that remote metadata proves secure-element use, key extraction, signature enforcement, or secure boot.
 - [x] Never send Image Transfer or key-management ACTION requests in a normal scan.
 
-## Protocol and object metadata extraction
+### Protocol and object metadata extraction
 
 - [x] Preserve AARQ/AARE application context, result diagnostic, proposed and negotiated version/conformance/PDU/QoS, and VAA name as structured fields.
 - [x] Preserve Association View selective-access selector lists instead of dropping them after parsing access modes.
@@ -148,19 +152,7 @@ Build a read-only posture section from already accessible objects and Associatio
 - [x] Decode security-control level, Suites 0–2, compression, broadcast/global/dedicated scope, and available general-ciphering envelope fields.
 - [x] Redact and hash a readable Association LN secret and omit its raw response frame.
 
-## Separate conformance workflow: association policy and downgrade checks
-
-This should be a separate command with explicit authorization and attempt limits, not an automatic fallback used by `scan`.
-
-- [ ] Require the expected policy for each client SAP.
-- [ ] Test application context/protection, authentication mechanism, security suite, and security policy as separate dimensions.
-- [ ] Establish a known-good baseline before testing weaker variants.
-- [ ] Distinguish AARE acceptance, completed HLS, protected-service acceptance, granted rights, and a successful harmless GET.
-- [ ] Bound attempts, reuse the transport session guard, and add lockout warnings.
-- [ ] Never continue a normal scan under a weaker association after the expected secure association fails.
-- [ ] Produce a matrix of proposed versus negotiated/observed properties and explain why each result is or is not a downgrade.
-
-## Optional risky diagnostic: invocation-counter replay enforcement
+### Optional risky diagnostic: invocation-counter replay enforcement
 
 The normal counter allocator deliberately prevents reuse. The existing diagnostic remains an explicit, default-no choice in the scan workflow. The tool is presented as carrying operational risk; the operator is responsible for using this option only on an authorized meter and accepting possible association disruption or lockout.
 
@@ -171,24 +163,55 @@ The normal counter allocator deliberately prevents reuse. The existing diagnosti
 - [x] Stop after two probes and verify that a fresh-counter request still works.
 - [x] Document possible association desynchronization and lockout risks.
 
-## Deferred or out of scope
+## Phase 2 — association policy and downgrade conformance checks
 
-These items do not belong in the normal enumerator:
+A separate command with explicit authorization and attempt limits, not an automatic fallback used by `scan`.
 
-- Arbitrary SET automation.
-- Arbitrary or irreversible ACTION automation.
-- Firmware initiate, block transfer, verify, or activate operations.
-- Key rotation or key-transfer execution.
-- Credential guessing or password spraying.
-- AES key extraction from flash, UART, JTAG, SWD, firmware, or hardware security components.
-- Claims about secure boot or signature enforcement based only on passive DLMS metadata.
-- OBIS remapping: COSEM provides no standard operation for redirecting one logical name to another.
+- [ ] Require the expected policy for each client SAP.
+- [ ] Test application context/protection, authentication mechanism, security suite, and security policy as separate dimensions.
+- [ ] Establish a known-good baseline before testing weaker variants.
+- [ ] Distinguish AARE acceptance, completed HLS, protected-service acceptance, granted rights, and a successful harmless GET.
+- [ ] Bound attempts, reuse the transport session guard, and add lockout warnings.
+- [ ] Never continue a normal scan under a weaker association after the expected secure association fails.
+- [ ] Produce a matrix of proposed versus negotiated/observed properties and explain why each result is or is not a downgrade.
 
-A future low-priority semantic-consistency diagnostic may flag unusual class/type/scaler/unit combinations or suspiciously identical values, but it must not present correlation as proof of internal firmware aliasing.
+## Phase 3 — fuzzing engine
 
-## Release gates for every milestone
+Protocol fuzzing built on the Phase 1 access engine. All mutated traffic passes through the adapter's single I/O funnel (`gurux_adapter.py` `_exchange_packet`), so mutation, recording, and abort logic apply uniformly.
 
-- [ ] Preserve the read-only default and document every transmitted operation.
+- [ ] Mutation and malformed-APDU injection at the `_exchange_packet` funnel.
+- [ ] BER length-field abuse: truncated, oversized, and inconsistent length encodings.
+- [ ] Oversized and malformed AARQ payloads.
+- [ ] Invalid and contradictory conformance blocks.
+- [ ] HDLC-level frame replay and out-of-order sequence testing.
+- [ ] Per-target crash and lockout detection with bounded recovery, building on the existing circuit breaker and invocation-counter safety.
+- [ ] Deterministic mutation seeds and budgets so a crashing input is reproducible.
+
+## Phase 4 — vulnerability corpus
+
+- [ ] Default/known-credential testing for LLS and HLS roles, lab-authorized and explicitly opt-in.
+- [ ] Known DLMS/COSEM vulnerability signatures matched against enumerated versions and capabilities.
+- [ ] IEC 62056-21 optical-port and TCP/WRAPPER transport support.
+- [ ] Security-policy downgrade acceptance tests (extends the Phase 2 conformance matrix).
+- [ ] HLS challenge entropy analysis across repeated associations.
+
+## Phase 5 — vulnerability reporting
+
+- [ ] Findings records with severity ratings on top of the existing evidence model.
+- [ ] Map each finding to its evidence: advertised capability, transmitted verification, or inconclusive result.
+- [ ] Consolidated per-target vulnerability summary across roles and phases.
+
+## Methodology notes
+
+- Do not claim secure-boot or signature-enforcement properties from passive DLMS metadata alone.
+- OBIS remapping is not a software test: COSEM provides no standard operation for redirecting one logical name to another.
+- AES key extraction from flash, UART, JTAG, SWD, firmware, or hardware security components is a hardware-attack discipline, not a software feature of this tool.
+- A future low-priority semantic-consistency diagnostic may flag unusual class/type/scaler/unit combinations or suspiciously identical values, but it must not present correlation as proof of internal firmware aliasing.
+
+## Release gates for every phase
+
+- [ ] Document every transmitted operation; read-only enumeration remains the default scope until an active phase is explicitly selected.
+- [ ] Active and fuzzing phases require explicit opt-in and written authorization for the target.
 - [ ] Keep secrets out of reports, logs, exception messages, and test fixtures.
 - [ ] Use deterministic limits and make untested scope visible.
 - [ ] Classify timeouts and transport failures as inconclusive, never as access denial or object absence.

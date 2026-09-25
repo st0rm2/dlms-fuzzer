@@ -1,8 +1,9 @@
-"""Standalone, read-only public DLMS/HDLC connection discovery.
+"""Standalone public DLMS/HDLC connection discovery (scanner reconnaissance).
 
 The discovery workflow deliberately stops at unauthenticated public GETs.  It
 does not guess credentials, send SET/ACTION requests, or attempt a protected
-association.
+association; authenticated and active testing belong to the scanner's later
+phases, not to connection discovery.
 """
 
 from __future__ import annotations

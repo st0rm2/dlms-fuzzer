@@ -1,10 +1,10 @@
-# DLMS Smart Meter Enumeration Tool
+# DLMS Smart Meter Vulnerability Scanner and Fuzzer
 
-`dlms-enum` performs authorized, read-only DLMS/COSEM discovery over direct serial HDLC. It supports unauthenticated public associations, password-authenticated LLS associations, and HLS-GMAC Security Suite 0 associations with authenticated-and-encrypted xDLMS traffic. All profiles use logical-name referencing, read the Association LN object list, supplement it with a conservative OBIS catalogue, perform GET operations only, and write a canonical JSON report plus side-by-side JSONL traffic. Secure scans can additionally retest authenticated-only targets through the public client to identify unadvertised public access.
+`dlms-enum` is a DLMS/COSEM vulnerability scanner and fuzzer in active development, operating over direct serial HDLC. The completed first phase built and validated the reconnaissance and access engine: reliable serial-HDLC DLMS interaction and authenticated access through unauthenticated public associations, password-authenticated LLS associations, and HLS-GMAC Security Suite 0 associations with authenticated-and-encrypted xDLMS traffic. All profiles use logical-name referencing, read the Association LN object list, supplement it with a conservative OBIS catalogue, and write a canonical JSON report plus side-by-side JSONL traffic. Secure scans can additionally retest authenticated-only targets through the public client to identify unadvertised public access. Later phases add active vulnerability tests and protocol fuzzing on top of this engine; see [plan.md](plan.md).
 
 Logical-name attribute 1 is not read or emitted as a separate result because it duplicates the OBIS logical name already stored on every object record.
 
-The LLS and secure profiles use Gurux DLMS for authentication; the secure profile also uses Gurux for HLS-GMAC and AES-GCM. The tool does not implement cryptography itself. Association View access rights for SET and ACTION are reported passively, but no modifying SET, arbitrary ACTION, key transfer, key rotation, password guessing, manufacturer catalogue, or fuzzing is performed. The sole ACTION sent is Association LN method 1, which is required to complete configured HLS authentication.
+The LLS and secure profiles use Gurux DLMS for authentication; the secure profile also uses Gurux for HLS-GMAC and AES-GCM. The tool does not implement cryptography itself. Association View access rights for SET and ACTION are reported passively. In the current enumeration phase, a run transmits only GET requests, plus the mandatory Association LN method 1 ACTION required to complete configured HLS authentication and the opt-in invocation-counter replay diagnostic. No modifying SET, arbitrary ACTION, key transfer, or key rotation is transmitted in this phase. Active vulnerability modules — transmitted SET/ACTION verification, credential-policy testing, and protocol fuzzing — are roadmap items tracked in [plan.md](plan.md).
 
 ## Install and run
 
@@ -89,7 +89,7 @@ authentication report.
 ### Standalone public connection discovery
 
 If the serial-HDLC connection parameters are unknown, run the separate
-read-only discovery tool with only the device path:
+reconnaissance discovery tool with only the device path:
 
 ```shell
 dlms-autodiscover /dev/ttyUSB0
@@ -511,7 +511,7 @@ Gurux internally labels Suite 0 security-control bit `0x20` as “Encryption is 
 - **No endpoint found:** confirm serial permissions and wiring. Automatic discovery tries 9600 first, then configured candidates, and tests common one-byte and two-byte server addressing with public communication only.
 - **Protected release rejected:** some meters do not accept a protected release in the negotiated context. The warning is recorded and HDLC DISC is still attempted; it does not hide an earlier scan error.
 
-## Development and limitations
+## Development status and roadmap
 
 ```shell
 python -m unittest discover -s tests -v
@@ -523,4 +523,6 @@ python -m dlms_enum validate-config examples/multi-role-meter.yaml
 
 Protocol tests use fakes, the real Gurux request generator, and sanitized structural expectations derived from the supplied captures; they need no physical meter and embed no keys. Live validation is still required for the target meter, particularly its role provisioning, counter object access, server system title, association-view size, and protected-release behavior.
 
-This release accepts multiple named `public`, `lls`, and `hls_gmac_suite0` roles and scans each selected role independently after one public planning preflight. The LLS profile currently uses unprotected xDLMS messages after password authentication. A secure role can also perform the bounded public cross-profile test described above. Negotiated GET-with-list batching is available for Association View-advertised reads, with bounded groups and individual fallback. The optional final authentication phase probes the supported password-based HLS variants and Suite 0 HLS-GMAC only on configured client SAPs. LLS combined with APDU ciphering, Security Suites 1/2, dedicated keys, signing, key agreement, key management, unconfigured client-address sweeps, and arbitrary ACTION/SET execution are intentionally unsupported.
+The current phase — the enumeration and access engine — accepts multiple named `public`, `lls`, and `hls_gmac_suite0` roles and scans each selected role independently after one public planning preflight. The LLS profile currently uses unprotected xDLMS messages after password authentication. A secure role can also perform the bounded public cross-profile test described above. Negotiated GET-with-list batching is available for Association View-advertised reads, with bounded groups and individual fallback. The optional final authentication phase probes the supported password-based HLS variants and Suite 0 HLS-GMAC only on configured client SAPs.
+
+Not yet implemented in this phase: LLS combined with APDU ciphering, Security Suites 1/2, dedicated keys, signing, key agreement, key management, unconfigured client-address sweeps, and transmitted SET/arbitrary ACTION verification. These are roadmap items rather than exclusions; see [plan.md](plan.md) for the phased vulnerability-scanning and fuzzing roadmap.

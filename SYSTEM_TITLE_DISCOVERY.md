@@ -1,5 +1,7 @@
 # Discovering a DLMS/COSEM System Title Without Authentication
 
+System-title discovery is reconnaissance: a recovered title feeds the scanner's authenticated HLS testing phases, where it is needed to address a specific secure client.
+
 There is no universally guaranteed unauthenticated query for a meter's system title. Whether it can be retrieved depends on the communication profile and on the information exposed by the meter's public association.
 
 A DLMS/COSEM system title is eight octets long and uniquely identifies a DLMS entity. The first three octets should contain the FLAG manufacturer identifier; the remaining five octets ensure uniqueness. It is an identifier used by DLMS security, not an encryption key.

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dlms-enum"
 version = "0.4.0"
-description = "Read-only DLMS/COSEM serial-HDLC enumeration and authentication scanner"
+description = "DLMS/COSEM vulnerability scanner and fuzzer — enumeration and access engine (active modules in development)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

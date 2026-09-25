@@ -62,7 +62,7 @@ from .workflow import apply_preflight_endpoint, run_public_preflight, select_cou
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dlms-enum",
-        description="Read-only DLMS/COSEM enumeration and authentication scanning over serial HDLC",
+        description="DLMS/COSEM vulnerability scanner and fuzzer over serial HDLC; current phase: enumeration and authentication scanning",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     scan_parser = subparsers.add_parser(
