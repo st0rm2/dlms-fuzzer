@@ -253,13 +253,18 @@ def run_checks(config: AppConfig, snapshots: dict[str, dict[str, Any]],
                role_reports: dict[str, dict[str, Any]], pairs: list[tuple[str, str]],
                *, pair_limit: int, transmission_limit: int, directory: Path,
                authorization: dict[str, Any], hidden_roles: list[str] | None = None, control_roles: list[str] | None = None,
-               instances: range = range(1, 17), title_variants: dict[str, list[bytes]] | None = None) -> dict[str, Any]:
+               instances: range = range(1, 17), title_variants: dict[str, list[bytes]] | None = None,
+               selective_roles: list[str] | None = None, selective_limit: int = 5, selective_bounds: Any = None) -> dict[str, Any]:
     from .scanner import scan
     from .traffic_logger import TrafficLogger
     from .reporter import write_report
 
     if transmission_limit < 1:
         raise ValueError("transmission limit must be positive")
+    from .selective_checks import validate_options, run_selective_checks, parse_range
+    validate_options(config, selective_roles or [], selective_limit)
+    if selective_bounds is not None:
+        selective_bounds = parse_range(*(value.isoformat() for value in selective_bounds))
     from .title_checks import parse_titles, run_title_checks
     # Validate programmatic callers as well as the CLI before opening a session.
     title_variants = parse_titles([f"{role}:{title.hex()}" for role, titles in (title_variants or {}).items()
@@ -404,7 +409,11 @@ def run_checks(config: AppConfig, snapshots: dict[str, dict[str, Any]],
             for role, titles in title_variants.items()]
     else:
         system_title_checks = run_title_checks(config, snapshots, role_reports, title_variants, budget, directory)
-    return {**plan, "system_title_checks": system_title_checks, "hidden_view_comparisons": hidden_views, "type": "cross_role_get_report", "authorization": authorization,
+    interrupted = (any(d["status"] == "interrupted" for d in destinations) or
+                   any(e.get("reason") == "interrupted" for r in system_title_checks for e in [r["baseline"], *r["variants"]]))
+    selective_results = run_selective_checks(config, snapshots, role_reports, selective_roles or [],
+        selective_limit, selective_bounds, budget, directory, interrupted)
+    return {**plan, "selective_access_checks": selective_results, "system_title_checks": system_title_checks, "hidden_view_comparisons": hidden_views, "type": "cross_role_get_report", "authorization": authorization,
             "policy": config.access_policy.as_dict(), "destinations": destinations,
             "budget": {"pair_target_limit": pair_limit, "get_attempt_limit": budget.limit, "get_attempts": budget.used,
                        "includes": "probe, baseline and recovery GET service attempts; block continuations are not separate attempts",
@@ -443,4 +452,7 @@ def render_checks(report: dict[str, Any]) -> str:
     if report.get("system_title_checks"):
         from .title_checks import render_title_checks
         lines.extend(["", render_title_checks(report["system_title_checks"])])
+    if report.get("selective_access_checks"):
+        from .selective_checks import render_selective_checks
+        lines.extend(["", render_selective_checks(report["selective_access_checks"])])
     return "\n".join(lines) + "\n"

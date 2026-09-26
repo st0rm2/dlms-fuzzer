@@ -33,6 +33,7 @@ from .capability_comparison import (
 from .cross_role import parse_pairs, run_checks, render_checks
 from .association_checks import parse_instances
 from .title_checks import parse_titles
+from .selective_checks import parse_range, validate_options as validate_selective_options
 from .config import (
     ConfigError,
     LlsProfile,
@@ -177,6 +178,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="compare an HLS-GMAC role using an explicit 8-byte client title; repeat for variants")
     active.add_argument("--title-limit", type=int, default=4,
                         help="maximum explicit title variants across roles, 1..32 (default 4)")
+    active.add_argument("--selective-access", action="append", default=[], metavar="ROLE",
+                        help="check restricted Profile Generic buffers with bounded selectors")
+    active.add_argument("--selective-limit", type=int, default=5, help="maximum buffers per role, 1..32")
+    active.add_argument("--selective-range-start", help="optional ISO-8601 range start with timezone")
+    active.add_argument("--selective-range-end", help="optional ISO-8601 range end, at most one hour after start")
     active.add_argument("--pair-limit", type=int, default=10)
     active.add_argument("--transmission-limit", type=int, default=50,
                         help="total active GET service attempts including baseline and recovery; inventory/bootstrap are separate")
@@ -297,8 +303,12 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
     if active_checks:
         parse_instances(args.association_instances)
         title_variants = parse_titles(args.system_title, config, args.title_limit)
-        if not pairs and not args.hidden_associations and not args.control_instance_check and not title_variants:
-            raise ConfigError("select --pair, --hidden-associations, --control-instance-check or --system-title")
+        validate_selective_options(config, args.selective_access, args.selective_limit)
+        selective_bounds = parse_range(args.selective_range_start, args.selective_range_end)
+        if selective_bounds and not args.selective_access:
+            raise ConfigError("selective range requires --selective-access")
+        if not pairs and not args.hidden_associations and not args.control_instance_check and not title_variants and not args.selective_access:
+            raise ConfigError("select --pair, --hidden-associations, --control-instance-check or --system-title or --selective-access")
         if any(role not in {p.role for p in selected} for role in args.hidden_associations + args.control_instance_check):
             raise ConfigError("probe role must be a selected configured role")
         config = replace(config, scan=replace(config.scan, union_profile_test=False),
@@ -918,12 +928,18 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             pair_limit=args.pair_limit, transmission_limit=args.transmission_limit,
             directory=run_directory, authorization=authorization,
             hidden_roles=args.hidden_associations, control_roles=args.control_instance_check, instances=parse_instances(args.association_instances),
-            title_variants=title_variants)
+            title_variants=title_variants, selective_roles=args.selective_access,
+            selective_limit=args.selective_limit, selective_bounds=selective_bounds)
         (run_directory / "access-check.json").write_text(json.dumps(access_report, indent=2) + "\n", encoding="utf-8")
         (run_directory / "access-check.md").write_text(render_checks(access_report), encoding="utf-8")
         verified = sum(r.get("assessment") == "VERIFIED_POLICY_VIOLATION" for r in access_report["requests"])
         console.print(f"Access checks: {access_report['budget']['get_attempts']} GET attempts; {verified} verified policy violations")
         console.print(f"Access-check report: {run_directory / 'access-check.md'}")
+        selective_results = access_report.get("selective_access_checks", [])
+        if any(r.get("reason") == "interrupted" for r in selective_results):
+            statuses.append("interrupted")
+        elif any(r["status"] in {"inconclusive", "NOT_TESTED"} for r in selective_results):
+            statuses.append("failed")
         title_entries = [entry for role in access_report.get("system_title_checks", [])
                          for entry in [role["baseline"], *role["variants"]]]
         if any(entry.get("reason") == "interrupted" for entry in title_entries):

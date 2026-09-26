@@ -688,7 +688,7 @@ python -m dlms_enum access-check --config examples/access-check-meter.yaml \
 This reads class-70 attribute 2; it does not execute disconnect/reconnect methods
 or SET operations. Repeat the option for additional roles. These selectors
 (`--pair`, `--hidden-associations`, `--control-instance-check`) can be combined
-with `--system-title` below; at least one selector is required. They share the same active GET budget. The
+with `--system-title` or `--selective-access` below; at least one selector is required. They share the same active GET budget. The
 `--pair-limit` applies only to cross-role candidates; hidden candidates are
 bounded by their instance range and the shared budget.
 
@@ -740,3 +740,69 @@ view, and changed rights are not actively exercised.
 Changed views require review: the protocol may bind views to titles, and
 unrelated meter configuration changes between sequential observations can also
 produce differences. A changed view alone is not classified as a vulnerability.
+
+### Selective access on restricted profile buffers (A7)
+
+Check whether a role denied a normal Profile Generic buffer GET can retrieve
+rows using an entry selector:
+
+```bash
+python -m dlms_enum access-check --config examples/access-check-meter.yaml \
+  --authorization authorization.txt --selective-access public \
+  --selective-limit 5 --transmission-limit 20
+```
+
+Repeat `--selective-access ROLE` for additional configured roles. Candidates
+are class-7 attribute-2 buffers with explicitly advertised denied or conditional
+GET rights. Missing rights metadata is not treated as denial. The default
+per-role target limit is 5, configurable from 1–32. Remaining candidates are
+retained as `NOT_TESTED` with a limit reason.
+
+Each role uses one association with the configured authentication and protection.
+After a harmless health GET, A7 attempts a normal buffer GET. Only an explicit
+DLMS read/write-access-denied response (code 3) enables selector probes. The entry
+probe requests entry 1, count 1. Successful normal reads are reported as
+`NORMAL_READ_ALLOWED`; other errors do not establish access denial. A7 does not
+retry, reconnect or switch to a weaker role. An inconclusive exchange stops
+further requests in that session.
+
+Optional range reads require both timezone-qualified bounds, with a positive
+interval no longer than one hour:
+
+```bash
+python -m dlms_enum access-check --config examples/access-check-meter.yaml \
+  --authorization authorization.txt --selective-access public \
+  --selective-range-start 2026-09-26T10:00:00Z \
+  --selective-range-end 2026-09-26T10:05:00Z \
+  --transmission-limit 20
+```
+
+Choose bounds appropriate to the meter's data. A7 reads capture-object and
+sort-object metadata and only constructs a range selector when the sort object
+is a captured class-8 clock, attribute 2, data index 0. Unsupported or unavailable
+metadata produces a skipped range check; A7 does not guess a clock descriptor.
+Without explicit bounds, only the entry selector is exercised.
+
+Health, normal, selector and metadata GETs share the active transmission limit
+with A3–A6. A7 runs after those checks and requires three remaining attempts to
+open a session. A successful denied-normal/entry sequence uses three attempts;
+adding capture metadata, sort metadata and a range GET uses six. Each A7 GET
+allows at most four continuation exchanges, with 64 KiB checks on accumulated
+reply data and on bytes received within an exchange. These bounds are checked
+after receipt, so they are not a strict allocation limit. A normal GET has no
+row selector; if the meter grants a large response, the response bounds stop
+further continuations and the result is inconclusive.
+
+Reports distinguish `DATA_AFTER_NORMAL_DENIAL`, `EMPTY_RESPONSE`,
+`SELECTIVE_READS_REJECTED`, `NORMAL_READ_ALLOWED`, `INCONCLUSIVE`, and
+`NOT_TESTED`. Data returned after denial is an access discrepancy requiring
+policy review, since selective access may intentionally have different rules.
+Selector errors retain their DLMS codes, and an entry response exceeding one
+row is flagged as ignoring the requested limit. SET and ACTION are not sent.
+
+Per-role `selective-access-N.json` and traffic files accompany the aggregate
+`access-check.json` and Markdown report. A7 records row counts and selector
+parameters, omitting buffer values, raw response frames and all decoded buffer
+response projections from its traffic artifacts. The preceding inventory scan
+continues to use its existing reporting settings; this omission applies to the
+A7 checks themselves.

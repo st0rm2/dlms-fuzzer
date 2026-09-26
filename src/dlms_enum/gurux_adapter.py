@@ -571,6 +571,8 @@ class GuruxSession:
                         raise TimeoutException("no complete reply received from the meter")
                     received = self._bytes(receive.reply)
                     raw_rx.append(received)
+                    if phase == "selective_access" and sum(len(frame) for frame in raw_rx) > 65536:
+                        raise ValueError("selective-access received byte limit reached")
                     frame_data.set(received)
                     receive.reply = None
             rx_protocol = self._after_receive(
@@ -647,6 +649,11 @@ class GuruxSession:
                     for item in rx_protocol_frames
                 ]
                 rx_decoded["sensitive_raw_frame_omitted"] = True
+            if phase == "selective_access" and int((object_context or {}).get("attribute_id", -1)) == 2:
+                # Buffer values can be private even when a meter grants the GET.
+                # Drop raw frames and every decoded response projection.
+                logged_rx_frames = []
+                rx_decoded = {"buffer_response_omitted": True}
             self.traffic.log(
                 profile=self.profile_name,
                 phase=phase,
@@ -678,6 +685,10 @@ class GuruxSession:
         object_context: dict[str, Any] | None = None,
         tx_context: dict[str, Any] | None = None,
     ) -> None:
+        def check_response_bound() -> None:
+            if phase == "selective_access" and reply.data.size > 65536:
+                raise ValueError("selective-access response byte limit reached")
+
         packet_list = packets if isinstance(packets, list) else [packets]
         for packet_number, packet in enumerate(packet_list, 1):
             reply.clear()
@@ -693,8 +704,11 @@ class GuruxSession:
                 object_context=object_context,
                 tx_context=context,
             )
+        check_response_bound()
         block_number = 0
         while reply.isMoreData():
+            if phase == "selective_access" and block_number >= 4:
+                raise ValueError("selective-access continuation limit reached")
             block_number += 1
             packet = (
                 None
@@ -713,6 +727,7 @@ class GuruxSession:
                 object_context=object_context,
                 tx_context=context,
             )
+            check_response_bound()
 
     def connect(self) -> dict[str, Any]:
         self.media.open()
@@ -831,6 +846,26 @@ class GuruxSession:
             target = self.client.createObject(class_id)
         target.logicalName = logical_name
         return target
+
+    def prepare_profile_read(self, target: Any, attribute: int, selector: dict[str, Any] | None) -> Any:
+        if selector is None:
+            return _quiet_gurux(self.client.read, target, attribute)
+        if selector["kind"] == "entry":
+            return _quiet_gurux(self.client.readRowsByEntry, target, 1, 1)
+        if selector["kind"] == "range":
+            # The caller validates that this exact captured clock descriptor is
+            # supported by Gurux's range encoder (attribute 2, data index 0).
+            target.sortObject = self.create_object(8, selector["clock_logical_name"])
+            return _quiet_gurux(self.client.readRowsByRange, target, selector["start"], selector["end"])
+        raise ValueError("unknown selective-access selector")
+
+    def send_profile_read(self, packets: Any, target: Any, attribute: int, selector: dict[str, Any] | None) -> Any:
+        reply = GXReplyData()
+        self._read_blocks(packets, reply, phase="selective_access", purpose="restricted_profile_read",
+            operation="GET", attempt=1,
+            object_context={"class_id": int(target.objectType), "logical_name": str(target.logicalName), "attribute_id": attribute},
+            tx_context={"service": "get-request", "selector": selector["kind"] if selector else "none"})
+        return reply.value
 
     def read_attribute(
         self,
