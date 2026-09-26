@@ -32,6 +32,7 @@ from .capability_comparison import (
 )
 from .cross_role import parse_pairs, run_checks, render_checks
 from .association_checks import parse_instances
+from .title_checks import parse_titles
 from .config import (
     ConfigError,
     LlsProfile,
@@ -172,6 +173,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="verify output-state GETs on inconsistent class-70 instances under ROLE")
     active.add_argument("--association-instances", default="1:16", metavar="FIRST:LAST",
                         help="inclusive hidden-association instance range, 0..255 (default 1:16)")
+    active.add_argument("--system-title", action="append", default=[], metavar="ROLE:HEX",
+                        help="compare an HLS-GMAC role using an explicit 8-byte client title; repeat for variants")
+    active.add_argument("--title-limit", type=int, default=4,
+                        help="maximum explicit title variants across roles, 1..32 (default 4)")
     active.add_argument("--pair-limit", type=int, default=10)
     active.add_argument("--transmission-limit", type=int, default=50,
                         help="total active GET service attempts including baseline and recovery; inventory/bootstrap are separate")
@@ -291,8 +296,9 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
     pairs = parse_pairs(args.pair, {p.role for p in selected}) if active_checks else []
     if active_checks:
         parse_instances(args.association_instances)
-        if not pairs and not args.hidden_associations and not args.control_instance_check:
-            raise ConfigError("select --pair, --hidden-associations or --control-instance-check")
+        title_variants = parse_titles(args.system_title, config, args.title_limit)
+        if not pairs and not args.hidden_associations and not args.control_instance_check and not title_variants:
+            raise ConfigError("select --pair, --hidden-associations, --control-instance-check or --system-title")
         if any(role not in {p.role for p in selected} for role in args.hidden_associations + args.control_instance_check):
             raise ConfigError("probe role must be a selected configured role")
         config = replace(config, scan=replace(config.scan, union_profile_test=False),
@@ -911,12 +917,19 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         access_report = run_checks(config, usable_snapshots, role_reports, pairs,
             pair_limit=args.pair_limit, transmission_limit=args.transmission_limit,
             directory=run_directory, authorization=authorization,
-            hidden_roles=args.hidden_associations, control_roles=args.control_instance_check, instances=parse_instances(args.association_instances))
+            hidden_roles=args.hidden_associations, control_roles=args.control_instance_check, instances=parse_instances(args.association_instances),
+            title_variants=title_variants)
         (run_directory / "access-check.json").write_text(json.dumps(access_report, indent=2) + "\n", encoding="utf-8")
         (run_directory / "access-check.md").write_text(render_checks(access_report), encoding="utf-8")
         verified = sum(r.get("assessment") == "VERIFIED_POLICY_VIOLATION" for r in access_report["requests"])
-        console.print(f"Cross-role checks: {access_report['budget']['get_attempts']} GET attempts; {verified} verified policy violations")
+        console.print(f"Access checks: {access_report['budget']['get_attempts']} GET attempts; {verified} verified policy violations")
         console.print(f"Access-check report: {run_directory / 'access-check.md'}")
+        title_entries = [entry for role in access_report.get("system_title_checks", [])
+                         for entry in [role["baseline"], *role["variants"]]]
+        if any(entry.get("reason") == "interrupted" for entry in title_entries):
+            statuses.append("interrupted")
+        elif any(entry["status"] in {"INCONCLUSIVE", "NOT_TESTED"} for entry in title_entries):
+            statuses.append("failed")
         if any(d["status"] == "interrupted" for d in access_report["destinations"]):
             statuses.append("interrupted")
         elif any(r.get("assessment") == "INCONCLUSIVE" or

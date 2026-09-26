@@ -253,13 +253,17 @@ def run_checks(config: AppConfig, snapshots: dict[str, dict[str, Any]],
                role_reports: dict[str, dict[str, Any]], pairs: list[tuple[str, str]],
                *, pair_limit: int, transmission_limit: int, directory: Path,
                authorization: dict[str, Any], hidden_roles: list[str] | None = None, control_roles: list[str] | None = None,
-               instances: range = range(1, 17)) -> dict[str, Any]:
+               instances: range = range(1, 17), title_variants: dict[str, list[bytes]] | None = None) -> dict[str, Any]:
     from .scanner import scan
     from .traffic_logger import TrafficLogger
     from .reporter import write_report
 
     if transmission_limit < 1:
         raise ValueError("transmission limit must be positive")
+    from .title_checks import parse_titles, run_title_checks
+    # Validate programmatic callers as well as the CLI before opening a session.
+    title_variants = parse_titles([f"{role}:{title.hex()}" for role, titles in (title_variants or {}).items()
+                                  for title in titles], config, 32)
     plan = plan_checks(config, snapshots, pairs, pair_limit)
     if not isinstance(instances, range) or instances.step != 1 or not instances or instances.start < 0 or instances.stop > 256:
         raise ValueError("association instance range must be inclusive within 0..255")
@@ -393,7 +397,14 @@ def run_checks(config: AppConfig, snapshots: dict[str, dict[str, Any]],
                            (r.get("kind") == field or (field == "control_instance" and r.get("control_instance_check")))]
                 entry["status"] = ("inconclusive" if any(r.get("assessment") == "INCONCLUSIVE" for r in results)
                                    else "partial" if any(r["outcome"] == "NOT_TESTED" for r in results) else "completed")
-    return {**plan, "hidden_view_comparisons": hidden_views, "type": "cross_role_get_report", "authorization": authorization,
+    if any(d["status"] == "interrupted" for d in destinations):
+        system_title_checks = [{"role": role, "client_address": profiles[role].client_address,
+            "baseline": {"client_system_title": profiles[role].client_system_title.hex().upper(), "status": "NOT_TESTED", "reason": "interrupted"},
+            "variants": [{"client_system_title": title.hex().upper(), "status": "NOT_TESTED", "reason": "interrupted"} for title in titles]}
+            for role, titles in title_variants.items()]
+    else:
+        system_title_checks = run_title_checks(config, snapshots, role_reports, title_variants, budget, directory)
+    return {**plan, "system_title_checks": system_title_checks, "hidden_view_comparisons": hidden_views, "type": "cross_role_get_report", "authorization": authorization,
             "policy": config.access_policy.as_dict(), "destinations": destinations,
             "budget": {"pair_target_limit": pair_limit, "get_attempt_limit": budget.limit, "get_attempts": budget.used,
                        "includes": "probe, baseline and recovery GET service attempts; block continuations are not separate attempts",
@@ -429,4 +440,7 @@ def render_checks(report: dict[str, Any]) -> str:
     for view in report.get("hidden_view_comparisons", []):
         lines.extend(["", f"### {view['probe_role']} / {view['source_association']}",
                       render_role_matrix(view["comparison"])])
+    if report.get("system_title_checks"):
+        from .title_checks import render_title_checks
+        lines.extend(["", render_title_checks(report["system_title_checks"])])
     return "\n".join(lines) + "\n"

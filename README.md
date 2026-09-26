@@ -686,8 +686,57 @@ python -m dlms_enum access-check --config examples/access-check-meter.yaml \
 ```
 
 This reads class-70 attribute 2; it does not execute disconnect/reconnect methods
-or SET operations. Repeat the option for additional roles. All three selectors
-(`--pair`, `--hidden-associations`, `--control-instance-check`) can be combined;
-at least one is required. They share the same active GET budget. The
+or SET operations. Repeat the option for additional roles. These selectors
+(`--pair`, `--hidden-associations`, `--control-instance-check`) can be combined
+with `--system-title` below; at least one selector is required. They share the same active GET budget. The
 `--pair-limit` applies only to cross-role candidates; hidden candidates are
 bounded by their instance range and the shared budget.
+
+### System-title-dependent views (A6)
+
+Compare an HLS-GMAC role's Association LN view using explicit alternative client
+system titles while retaining its client SAP, credentials, Suite 0 protection,
+and selected transport endpoint:
+
+```bash
+python -m dlms_enum access-check --config examples/access-check-meter.yaml \
+  --authorization authorization.txt \
+  --system-title operator:434C49454E543032 --transmission-limit 10
+```
+
+Each title is exactly 16 hexadecimal digits (8 bytes). Repeat `--system-title
+ROLE:HEX` for additional variants or roles. The default `--title-limit 4` caps
+variants across all roles; configurable limits are 1–32. Titles must differ from
+the role's configured title and from other variants for that role. A6 supports
+HLS-GMAC profiles; public and LLS profiles do not configure client titles in the
+current adapter. Configurations using `invocation_counter.unsafe_override` are
+rejected for this check.
+
+For each role, A6 first opens a fresh association using the configured title,
+verifies negotiated title/SAP/HLS/protection, and reads a harmless logical name
+and the current Association LN object list. Only a successful baseline permits
+variant sessions. Each variant follows the same sequence. There is no automatic
+reconnect or weaker-authentication fallback. Persistent invocation-counter
+leases already include the client title in their identity; variants retain the
+same state file and use distinct records.
+
+A6 shares `--transmission-limit` with A3–A5 and runs after their requested checks.
+Each successful baseline or variant uses two active GET attempts; timeout
+retries also count. At least two remaining attempts are required before opening
+another title session. A6 opens at most one baseline session per selected role
+plus one session per explicit variant. Public bootstrap, association/HLS and
+teardown traffic remain outside the GET budget. Object-list block continuations
+are part of one GET attempt, not separately bounded frames or bytes.
+
+The aggregate `access-check.json` and Markdown report include `VIEW_CHANGED`,
+`VIEW_UNCHANGED`, `ASSOCIATION_REJECTED`, `INCONCLUSIVE`, or `NOT_TESTED` outcomes,
+with a separate `VIEW_READ` baseline. Only structured AARE rejection evidence
+produces `ASSOCIATION_REJECTED`; transport errors and incomplete HLS remain
+inconclusive. Each attempted title has a `system-title-N-I.json` report and
+traffic artifact. Comparisons include added/removed objects, versions and
+advertised GET/SET/ACTION rights. These views do not replace the role's cached
+view, and changed rights are not actively exercised.
+
+Changed views require review: the protocol may bind views to titles, and
+unrelated meter configuration changes between sequential observations can also
+produce differences. A changed view alone is not classified as a vulnerability.

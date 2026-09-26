@@ -497,6 +497,29 @@ class SecureScannerTests(unittest.TestCase):
         self.assertFalse(SecureSession.discover_called)
         self.assertEqual(BootstrapSession.events.count("secure_close"), 2)
 
+    def test_secure_rejection_preserves_structured_evidence_and_cleanup(self):
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = BootstrapSession
+        class Rejected(Exception):
+            result = 1
+            diagnostic = 13
+        class RejectedSession(SecureSession):
+            aarq_accepted = False
+            def connect(self):
+                raise Rejected("rejected association")
+        module.GuruxSecureSession = RejectedSession
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            cfg = secure_config(Path(directory) / "counters.json")
+            report = scan(cfg, object(), session_task=lambda *args: self.fail("callback after rejection"))
+            self.assertEqual(report["secure_association_failure"]["association_result"], 1)
+            self.assertEqual(report["secure_association_failure"]["diagnostic"], 13)
+            self.assertFalse(report["secure_association_failure"]["aarq_accepted"])
+            self.assertEqual(report["run"]["status"], "failed")
+            # A second scan can acquire the same lease after failed association.
+            second = scan(cfg, object(), session_task=lambda *args: {})
+            self.assertEqual(second["run"]["status"], "failed")
+        self.assertEqual(BootstrapSession.events.count("secure_close"), 2)
+
     def test_session_task_failure_still_closes_secure_session(self):
         module = types.ModuleType("dlms_enum.gurux_adapter")
         module.GuruxSession = BootstrapSession

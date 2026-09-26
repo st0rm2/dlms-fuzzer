@@ -2295,7 +2295,17 @@ def scan_public(
                 server_address_size=int(endpoint["address_size"]),
             )
             session = secure_session
-            association = secure_session.connect()
+            try:
+                association = secure_session.connect()
+            except Exception as exc:
+                # Preserve structured association-stage evidence for active checks.
+                report["secure_association_failure"] = {
+                    "error_type": type(exc).__name__,
+                    "aarq_accepted": bool(getattr(secure_session, "aarq_accepted", False)),
+                    "association_result": int(exc.result) if getattr(exc, "result", None) is not None else None,
+                    "diagnostic": int(exc.diagnostic) if getattr(exc, "diagnostic", None) is not None else None,
+                }
+                raise
             association["invocation_counter_bootstrap"] = {
                 "meter_reported_counter": meter_counter,
                 "first_secure_counter": starting_counter,
