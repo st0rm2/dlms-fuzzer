@@ -97,13 +97,13 @@ class ScanUITests(unittest.TestCase):
 
 
 class PromptSecretTests(unittest.TestCase):
-    def test_masked_prompt_returns_stripped_answer(self):
+    def test_masked_prompt_preserves_password_whitespace(self):
         console = Console(file=io.StringIO(), color_system=None)
 
         with patch("dlms_enum.tui.Prompt.ask", return_value="  s3cret  ") as ask:
             answer = prompt_secret("GAK", console)
 
-        self.assertEqual(answer, "s3cret")
+        self.assertEqual(answer, "  s3cret  ")
         self.assertTrue(ask.call_args.kwargs["password"])
         self.assertIs(ask.call_args.kwargs["console"], console)
 

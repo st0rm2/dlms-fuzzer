@@ -603,18 +603,22 @@ def _decode_lls_password(value: Any, label: str) -> bytes:
 
 
 def _parse_lls_password_source(raw: Any, label: str) -> SecretSource:
-    """Accept an inline YAML password or the name of an environment variable."""
+    """Accept an inline password, environment reference, or masked prompt."""
 
     if isinstance(raw, str):
         _decode_lls_password(raw, label)
         return SecretSource("inline", raw)
     data = _mapping(raw, label)
-    _only_keys(data, {"env", "inline"}, label)
-    selected = [key for key in ("env", "inline") if key in data]
+    _only_keys(data, {"env", "inline", "prompt"}, label)
+    selected = [key for key in ("env", "inline", "prompt") if key in data]
     if len(selected) != 1:
-        raise ConfigError(f"{label} must select exactly one of env or inline")
+        raise ConfigError(f"{label} must select exactly one of env, inline, or prompt")
     kind = selected[0]
     value = data[kind]
+    if kind == "prompt":
+        if value is not True:
+            raise ConfigError(f"{label}.prompt must be true")
+        return SecretSource("prompt")
     if not isinstance(value, str) or not value:
         raise ConfigError(f"{label}.{kind} must be a non-empty string")
     if kind == "inline":
@@ -978,8 +982,9 @@ def resolve_lls_password(
     profile: LlsProfile | AuthenticationScanConfig,
     *,
     environ: Mapping[str, str] | None = None,
+    prompt: Callable[[str], str] | None = None,
 ) -> bytes:
-    """Resolve an LLS password from inline YAML or an environment variable."""
+    """Resolve an LLS password without exposing its value in validation errors."""
 
     environ = os.environ if environ is None else environ
     source = profile.password
@@ -991,6 +996,8 @@ def resolve_lls_password(
         value = environ.get(str(source.locator))
         if value is None:
             raise ConfigError("LLS password environment variable is not set")
+    elif source.kind == "prompt":
+        value = (prompt or getpass.getpass)("LLS password: ")
     else:
         raise ConfigError("LLS password uses an unsupported secret source")
     return _decode_lls_password(value, "LLS password")
@@ -1013,22 +1020,15 @@ def dump_config(config: AppConfig, path: str | Path) -> None:
 
     password = config.authentication_scan.password
     if password is not None:
-        data["authentication_scan"]["password"] = (
-            {"env": password.locator}
-            if password.kind == "env"
-            else {"env": "DLMS_PASSWORD"}
-        )
+        data["authentication_scan"]["password"] = serializable_source(password)
     for index, profile in enumerate(config.profiles):
         if isinstance(profile, SecureProfile):
+            data["profiles"][index]["security"].pop("cipher", None)
             data["profiles"][index]["secrets"] = {
                 "gak": serializable_source(profile.secrets.gak),
                 "guek": serializable_source(profile.secrets.guek),
             }
         elif isinstance(profile, LlsProfile):
             password = profile.password
-            data["profiles"][index]["authentication"]["password"] = (
-                {"env": password.locator}
-                if password.kind == "env"
-                else {"env": "DLMS_LLS_PASSWORD"}
-            )
+            data["profiles"][index]["authentication"]["password"] = serializable_source(password)
     Path(path).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")

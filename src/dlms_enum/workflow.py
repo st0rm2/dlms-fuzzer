@@ -121,6 +121,7 @@ def run_public_preflight(
     *,
     progress: Callable[[dict[str, Any]], None] | None = None,
     counter_profiles: tuple[CounterProfile, ...] | None = None,
+    collect_role_suggestions: bool = False,
 ) -> PublicPreflight:
     """Discover the public endpoint and readable counter candidates."""
 
@@ -348,7 +349,7 @@ def run_public_preflight(
         association_objects = [
             target for target in objects if int(target.objectType) == 15
         ][:_ROLE_SUGGESTION_LIMIT]
-        for target in (() if preflight_inconclusive else association_objects):
+        for target in (() if preflight_inconclusive or not collect_role_suggestions else association_objects):
             try:
                 partners = selected_session.read_attribute(
                     target,

@@ -379,7 +379,7 @@ class WorkflowTests(unittest.TestCase):
         )
 
 
-    def _run_metadata_preflight(self, associations):
+    def _run_metadata_preflight(self, associations, *, collect=True):
         config = parse_config(
             {
                 "transport": {"device": "/dev/null", "baudrate": 9600},
@@ -397,7 +397,13 @@ class WorkflowTests(unittest.TestCase):
             patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}),
             patch("dlms_enum.workflow.validate_serial_device"),
         ):
-            return run_public_preflight(config, object())
+            return run_public_preflight(config, object(), collect_role_suggestions=collect)
+
+    def test_metadata_reads_are_opt_in(self):
+        result = self._run_metadata_preflight(
+            [AssociationLn("0.0.40.0.0.255", 16, "60857405080200")], collect=False
+        )
+        self.assertEqual(result.role_suggestions, ())
 
     def test_preflight_collects_association_role_suggestions(self):
         result = self._run_metadata_preflight(

@@ -10,17 +10,54 @@ The LLS and secure profiles use Gurux DLMS for authentication; the secure profil
 
 Python 3.11 or newer is required.
 
-To create a configuration with a small standalone form, open
-[`tools/config-generator.html`](tools/config-generator.html) in a browser. It
-runs entirely in the browser, has no dependencies, and can copy or download a
-YAML file. Environment-variable credential references are selected by default;
-inline credentials are intended only for controlled laboratory use.
-
 ```shell
 python -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
+dlms-enum scan /dev/ttyUSB0
 ```
+
+Connect the optical probe to your authorized meter and run that command. It
+discovers serial settings and the public endpoint, reads association metadata,
+and offers LLS and HLS-GMAC roles. Enter the credentials for roles you want to
+scan; empty credentials skip a new role. GMAC setup also requires an eight-byte
+client system title and invocation-counter selection. The default is full GET
+enumeration. The replay diagnostic remains explicitly opt-in per secure role.
+
+The reusable configuration is automatically saved to
+`~/.local/state/dlms-enum/profiles/<meter-identity>.yaml`. On the next run,
+discovery identifies the meter and offers `reuse`, `edit`, or `fresh` setup.
+Reuse keeps the roles and credential references and asks again for credentials
+stored as `{prompt: true}`. Edit lets you remove saved roles and add discovered
+ones. Unsafe filename characters are sanitized with a digest to avoid collisions.
+Saved YAML never contains inline passwords or keys; env/file references survive.
+
+Use `--save-profile PATH` to override the output location, or `--no-save-profile`
+to suppress saving (the flags cannot be combined). Automatic reuse looks in the
+identity-based store; custom profiles can be loaded with `--config PATH`.
+If identity is unavailable, automatic saving is skipped unless an explicit
+output path is supplied.
+
+Without a terminal, or with `--non-interactive`, no prompts occur: a matching
+saved profile is reused automatically, otherwise only public access is scanned.
+Missing credentials cause exit code 2. For unattended reuse, change prompt
+references to environment references and supply `--secrets secrets.env`:
+
+```shell
+dlms-enum scan /dev/ttyUSB0 --non-interactive --secrets secrets.env
+```
+
+The secrets file contains `KEY=VALUE` lines, blank lines, and `#` comments.
+Values are literal (no shell expansion or quote removal) and override existing
+environment variables. Protect that file yourself; it is credential input,
+not an automatically generated artifact. `dlms-enum scan` without arguments
+still opens guided setup in an interactive terminal.
+
+## Advanced configuration
+
+YAML remains available for detailed configuration and unattended runs. A device
+argument and `--config` are mutually exclusive. To create YAML with a standalone
+browser form, open [`tools/config-generator.html`](tools/config-generator.html).
 
 Public scan:
 
@@ -42,7 +79,7 @@ python -m dlms_enum scan --config meter-lls.yaml
 The LLS password may instead be written inline as `password: {inline: "..."}`
 or `password: "..."`. Prefix a binary password with `hex:`. Inline passwords
 are accepted for laboratory configurations, are redacted from effective
-configuration and reports, and are replaced with an environment reference if
+configuration and reports, and are replaced with `{prompt: true}` if
 the configuration is re-saved. The raw credential-bearing LLS AARQ is omitted
 from `traffic.jsonl`; its decoded XML remains available with the authentication
 value redacted.
@@ -88,8 +125,8 @@ authentication report.
 
 ### Standalone public connection discovery
 
-If the serial-HDLC connection parameters are unknown, run the separate
-reconnaissance discovery tool with only the device path:
+`scan DEVICE` includes discovery. The standalone reconnaissance tool remains
+available when you only need connection discovery:
 
 ```shell
 dlms-autodiscover /dev/ttyUSB0

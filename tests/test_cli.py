@@ -11,7 +11,8 @@ from unittest.mock import patch
 from rich.console import Console
 
 from dlms_enum.cli import _scan, build_parser, main
-from dlms_enum.config import ConfigError, parse_config
+from dlms_enum.config import ConfigError, load_config, parse_config
+from dlms_enum.quickscan import save_profile
 from dlms_enum.workflow import CounterCandidate, PublicPreflight
 
 
@@ -653,6 +654,70 @@ class ZeroConfigScanTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(observed["secret"], "0011")
         self.assertNotIn("DLMS_TEST_CLI_SECRET", os.environ)
+
+    def test_profile_auto_save_reuse_and_missing_secret_exit(self):
+        config = parse_config({
+            "transport": {"device": "/dev/null", "baudrate": 9600},
+            "profiles": [{"name": "public", "role": "public"}],
+        })
+        console = Console(file=io.StringIO(), color_system=None)
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "profiles/METER-1.yaml"
+            run_directory = Path(directory) / "run"
+            run_directory.mkdir()
+            with (
+                patch("dlms_enum.cli.discover_device", return_value={"meter_identity": "METER-1"}),
+                patch("dlms_enum.cli.config_from_discovery", return_value=config),
+                patch("dlms_enum.cli.profile_path", return_value=profile) as identity_path,
+                patch("dlms_enum.cli._run_directory", return_value=run_directory),
+                patch("dlms_enum.cli.TrafficLogger", NullLogger),
+                patch("dlms_enum.cli.run_public_preflight", return_value=self._public_preflight()) as preflight,
+                patch("dlms_enum.cli.scan", side_effect=self._fake_scan) as scan,
+                patch("dlms_enum.cli.write_report"),
+                patch("dlms_enum.cli.ScanUI.summary"),
+                patch("getpass.getpass", side_effect=AssertionError("headless prompt")),
+                patch("dlms_enum.quickscan.Prompt.ask", side_effect=AssertionError("headless prompt")),
+            ):
+                self.assertEqual(_scan(self._args(), console), 0)
+                self.assertTrue(profile.exists())
+                identity_path.assert_called_with("METER-1")
+                self.assertEqual(load_config(profile).profile.role, "public")
+                preflight.reset_mock()
+                self.assertEqual(_scan(self._args(), console), 0)
+                self.assertNotIn("collect_role_suggestions", preflight.call_args.kwargs)
+                override = Path(directory) / "custom.yaml"
+                self.assertEqual(_scan(self._args(save_profile=override), console), 0)
+                self.assertTrue(override.exists())
+                before = profile.read_bytes()
+                with patch("dlms_enum.cli.save_profile") as save:
+                    self.assertEqual(_scan(self._args(no_save_profile=True), console), 0)
+                    save.assert_not_called()
+                self.assertEqual(profile.read_bytes(), before)
+                protected = parse_config({
+                    "transport": {"device": "/dev/old"},
+                    "profiles": [
+                        {"name": "public"},
+                        {"name": "lls", "authentication": {"mechanism": "low", "password": {"env": "DLMS_TEST_MISSING"}}},
+                    ],
+                })
+                save_profile(protected, profile)
+                scan.reset_mock()
+                with patch.dict(os.environ, {}, clear=True):
+                    self.assertEqual(main(["scan", "/dev/null", "--non-interactive"]), 2)
+                scan.assert_not_called()
+                secret_file = Path(directory) / "secrets.env"
+                secret_file.write_text("DLMS_TEST_MISSING=fixture-secret\n")
+                with patch.dict(os.environ):
+                    self.assertEqual(_scan(self._args(secrets=secret_file), console), 0)
+                self.assertEqual(scan.call_count, 2)
+                self.assertIn("DLMS_TEST_MISSING", profile.read_text())
+                self.assertNotIn("fixture-secret", profile.read_text())
+
+    def test_conflicting_profile_flags_fail_before_discovery(self):
+        with patch("dlms_enum.cli.discover_device") as discover:
+            with self.assertRaisesRegex(ConfigError, "mutually exclusive"):
+                _scan(self._args(save_profile=Path("out.yaml"), no_save_profile=True), Console(file=io.StringIO()))
+        discover.assert_not_called()
 
     def test_suggested_lls_role_flows_through_interactive_device_scan(self):
         config = parse_config(

@@ -726,7 +726,7 @@ def prompt_secret(prompt_text: str, console: Console | None = None) -> str:
     """Ask for a credential with masked input; an empty answer skips the role."""
 
     console = console or Console()
-    return Prompt.ask(prompt_text, password=True, console=console).strip()
+    return Prompt.ask(prompt_text, password=True, console=console)
 
 
 def choose_invocation_counter_reuse_test(

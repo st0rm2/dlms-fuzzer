@@ -23,6 +23,7 @@ The vulnerability research behind Phases 2–5 — published flaws, multi-client
 ### Completed foundation
 
 - [x] Public Association LN discovery and read-only GET scanning.
+- [x] Zero-config usability: `dlms-enum scan DEVICE`, discovered credential-only role setup, safe reusable profiles, and unattended secret resolution. Automated coverage is in place; authorized live-meter validation of this combined flow remains a release gate.
 - [x] HLS-GMAC Security Suite 0 association with authenticated and encrypted xDLMS traffic.
 - [x] Crash-safe invocation-counter persistence and rollback prevention.
 - [x] Passive inventory of advertised GET, SET, and ACTION capabilities.

@@ -163,7 +163,7 @@ class LlsTests(unittest.TestCase):
             with self.subTest(password=password), self.assertRaises(ConfigError):
                 parse_config(lls_mapping(password))
 
-    def test_saved_inline_password_is_replaced_by_environment_reference(self):
+    def test_saved_inline_password_is_replaced_by_prompt_reference(self):
         password = "do-not-write-this"
         config = parse_config(lls_mapping(password))
 
@@ -173,7 +173,14 @@ class LlsTests(unittest.TestCase):
             saved = destination.read_text(encoding="utf-8")
 
         self.assertNotIn(password, saved)
-        self.assertIn("DLMS_LLS_PASSWORD", saved)
+        self.assertIn("prompt: true", saved)
+
+    def test_prompt_password_resolution_and_validation(self):
+        config = parse_config(lls_mapping({"prompt": True}))
+        self.assertEqual(resolve_lls_password(config.profile, prompt=lambda _: " secret "), b" secret ")
+        for source in ({"prompt": False}, {"prompt": "true"}, {"prompt": True, "env": "KEY"}):
+            with self.assertRaises(ConfigError):
+                parse_config(lls_mapping(source))
 
     def test_gurux_lls_session_uses_low_authentication_and_resolved_password(self):
         config = parse_config(lls_mapping({"inline": "00000000"}))

@@ -8,12 +8,17 @@ from unittest.mock import patch
 from rich.console import Console
 
 from dlms_enum.autodiscover import DiscoveryOptions
-from dlms_enum.config import LlsProfile, SecureProfile, parse_config
+from dlms_enum.config import ConfigError, LlsProfile, SecureProfile, load_config, parse_config, resolve_lls_password
 from dlms_enum.quickscan import (
     QuickscanError,
     build_profiles,
     discover_config,
     load_secrets_file,
+    config_from_discovery,
+    profile_path,
+    resolve_credentials,
+    reuse_profile,
+    save_profile,
 )
 
 from test_autodiscover import DiscoverySession, FailedSession
@@ -22,6 +27,96 @@ from test_autodiscover import DiscoverySession, FailedSession
 GAK = "00112233445566778899AABBCCDDEEFF"
 GUEK = "FFEEDDCCBBAA99887766554433221100"
 TITLE = "4D45544552303031"
+
+
+class ProfileStoreTests(unittest.TestCase):
+    def config(self):
+        return parse_config({
+            "transport": {"device": "/dev/old", "baudrate": 300},
+            "profiles": [
+                {"name": "public"},
+                {"name": "lls", "authentication": {"mechanism": "low", "password": {"inline": "fixture-password"}}},
+                {"name": "hls_gmac_suite0", "client_system_title": "hex:" + TITLE,
+                 "secrets": {"gak": {"inline": "hex:" + GAK}, "guek": {"env": "TEST_GUEK"}}},
+            ],
+            "authentication_scan": {"enabled": True, "password": {"inline": "auth-fixture"}},
+        })
+
+    def test_round_trip_redacts_all_inline_credentials_and_preserves_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profiles/meter.yaml"
+            save_profile(self.config(), path)
+            saved = path.read_text()
+            restored = load_config(path)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        for secret in ("fixture-password", "auth-fixture", GAK):
+            self.assertNotIn(secret, saved)
+        self.assertEqual(restored.profiles[1].password.kind, "prompt")
+        self.assertEqual(restored.profiles[2].secrets.gak.kind, "prompt")
+        self.assertEqual(restored.profiles[2].secrets.guek.locator, "TEST_GUEK")
+        self.assertEqual(restored.authentication_scan.password.kind, "prompt")
+
+    def test_identity_paths_are_safe_distinct_and_stable(self):
+        self.assertIsNone(profile_path(None))
+        self.assertEqual(profile_path("ISK123").name, "ISK123.yaml")
+        paths = [profile_path(name) for name in ("../meter", "meter", "a/b", "a-b", ".", "x" * 200)]
+        self.assertEqual(len(set(paths)), len(paths))
+        self.assertTrue(all(p.parent == profile_path("ISK123").parent for p in paths))
+
+    def test_reuse_repins_endpoint_and_disables_authentication_sweep(self):
+        console = Console(file=io.StringIO())
+        discovered = config_from_discovery(_successful_result("/dev/new"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "meter.yaml"
+            save_profile(self.config(), path)
+            with patch("dlms_enum.quickscan.Prompt.ask", side_effect=AssertionError("prompt")):
+                config, setup = reuse_profile(discovered, path, console, interactive=False)
+        self.assertFalse(setup)
+        self.assertEqual(config.transport, discovered.transport)
+        self.assertEqual(len(config.profiles), 3)
+        self.assertTrue(all(p.server_address_size == 2 and p.server_physical_address == 17 for p in config.profiles))
+        self.assertEqual(config.profiles[0].client_address, 1)
+        self.assertEqual(config.profiles[1].public_client_address, 1)
+        self.assertEqual(config.profiles[2].invocation_counter.public_client_address, 1)
+        self.assertFalse(config.authentication_scan.enabled)
+
+    def test_headless_prompt_reference_fails_without_reading_stdin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "meter.yaml"
+            save_profile(self.config(), path)
+            config = load_config(path)
+        with patch("getpass.getpass", side_effect=AssertionError("prompt")):
+            with self.assertRaisesRegex(ConfigError, "credentials require a terminal"):
+                resolve_credentials(config, Console(file=io.StringIO()), interactive=False)
+
+    def test_env_resolution_missing_secret_and_runtime_redaction(self):
+        config = parse_config({"transport": {"device": "/dev/null"}, "profiles": [
+            {"name": "lls", "authentication": {"mechanism": "low", "password": {"env": "TEST_PASSWORD"}}}
+        ]})
+        console = Console(file=io.StringIO())
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ConfigError, "environment variable is not set"):
+                resolve_credentials(config, console, interactive=False)
+            os.environ["TEST_PASSWORD"] = " runtime password "
+            runtime = resolve_credentials(config, console, interactive=False)
+        self.assertEqual(resolve_lls_password(runtime.profile), b" runtime password ")
+        self.assertNotIn("runtime password", str(runtime.redacted_dict()))
+        self.assertEqual(config.profile.password.kind, "env")
+
+    def test_interactive_fresh_and_edit(self):
+        discovered = config_from_discovery(_successful_result("/dev/new"))
+        console = Console(file=io.StringIO())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "meter.yaml"
+            save_profile(self.config(), path)
+            with patch("dlms_enum.quickscan.Prompt.ask", return_value="fresh"):
+                config, setup = reuse_profile(discovered, path, console, interactive=True)
+            self.assertIs(config, discovered)
+            self.assertTrue(setup)
+            with patch("dlms_enum.quickscan.Prompt.ask", return_value="edit"), patch("dlms_enum.quickscan.Confirm.ask", return_value=False):
+                config, setup = reuse_profile(discovered, path, console, interactive=True)
+            self.assertEqual(len(config.profiles), 1)
+            self.assertTrue(setup)
 
 
 def _successful_result(device):

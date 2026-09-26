@@ -43,6 +43,10 @@ from .quickscan import (
     config_from_discovery,
     discover_device,
     load_secrets_file,
+    profile_path,
+    reuse_profile,
+    resolve_credentials,
+    save_profile,
 )
 from .reporter import load_report, summary_lines, write_report
 from .scanner import (
@@ -194,6 +198,11 @@ def _safe_role_directory(role: str) -> str:
 
 def _scan(args: argparse.Namespace, console: Console) -> int:
     non_interactive = bool(getattr(args, "non_interactive", False))
+    interactive = console.is_terminal and sys.stdin.isatty() and not non_interactive
+    setup_roles = True
+    saved_path: Path | None = None
+    if getattr(args, "save_profile", None) and getattr(args, "no_save_profile", False):
+        raise ConfigError("--save-profile and --no-save-profile are mutually exclusive")
     if getattr(args, "secrets", None):
         os.environ.update(load_secrets_file(args.secrets))
     run_directory: Path | None = None
@@ -217,7 +226,14 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         console.print(
             f"Discovery traffic: [green]{discovery_traffic_path.resolve()}[/green]"
         )
-    elif non_interactive:
+        identity = discovery_result.get("meter_identity")
+        saved_path = getattr(args, "save_profile", None) or profile_path(identity)
+        # An explicit output path does not establish meter identity: reuse is
+        # always looked up using the identity proven by discovery.
+        loaded_config, setup_roles = reuse_profile(
+            loaded_config, profile_path(identity), console, interactive=interactive
+        )
+    elif not interactive:
         raise ConfigError(
             "--non-interactive requires a device argument or --config; "
             "guided setup needs an interactive terminal"
@@ -225,7 +241,8 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
     else:
         loaded_config = interactive_config(console)
     selected = _selected_roles(
-        loaded_config, args.roles, console, non_interactive=non_interactive
+        loaded_config, args.roles, console,
+        non_interactive=not interactive or discovery_result is not None,
     )
     public_preflight_profile = next(
         (
@@ -236,9 +253,6 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         selected[0],
     )
     config = replace(loaded_config, profiles=selected)
-    interactive = (
-        console.is_terminal and sys.stdin.isatty() and not non_interactive
-    )
     if args.short:
         config = with_object_limit(config, 10)
     elif args.full:
@@ -272,13 +286,14 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 for profile in config.profiles
                 if isinstance(profile, SecureProfile)
             ),
+            **({"collect_role_suggestions": True} if discovery_result is not None and setup_roles else {}),
         )
     finally:
         ui.close()
         preflight_logger.close()
 
     show_public_preflight(preflight, console)
-    if discovery_result is not None:
+    if discovery_result is not None and setup_roles:
         config = build_profiles(
             config,
             preflight.role_suggestions,
@@ -441,7 +456,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         )
     config = replace(config, profiles=tuple(verified_profiles))
 
-    if interactive:
+    if interactive and discovery_result is None:
         config = choose_read_plan(
             config,
             preflight,
@@ -450,6 +465,28 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 args.short or args.full or args.get_limit is not None
             ),
         )
+    if discovery_result is not None:
+        if interactive and not Confirm.ask(
+            f"Scan plan: {len(config.profiles)} roles, GET enumeration. Start",
+            default=True, console=console,
+        ):
+            return 130
+        reusable_config = config
+        config = resolve_credentials(config, console, interactive=interactive)
+        if not getattr(args, "no_save_profile", False):
+            if saved_path is not None:
+                # Role filtering affects this run, not the saved role inventory.
+                updated = {p.role: p for p in reusable_config.profiles}
+                profiles = tuple(updated.pop(p.role, p) for p in loaded_config.profiles)
+                reusable_config = replace(reusable_config, profiles=profiles + tuple(updated.values()))
+                save_profile(reusable_config, saved_path)
+                console.print(f"Profile saved to {saved_path}")
+            else:
+                console.print("Profile not saved: meter identity unavailable; use --save-profile PATH.")
+    elif not interactive:
+        # Validate deferred sources without changing the effective configuration
+        # reported by the existing YAML-driven workflow.
+        resolve_credentials(config, console, interactive=False)
     association_view_plans: dict[str, dict[str, Any]] = {}
     for profile in config.profiles:
         cache_path = default_cache_path(config.transport.device, profile.role)
@@ -485,7 +522,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 getattr(args, "save_association_view", False)
                 and mode in {"live", "compare"}
             )
-        elif interactive:
+        elif interactive and discovery_result is None:
             mode, save = choose_association_view_mode(
                 role=profile.role, snapshot=snapshot, console=console
             )
@@ -497,7 +534,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             "snapshot": snapshot,
             "cache_path": cache_path,
         }
-    if interactive and not Confirm.ask(
+    if interactive and discovery_result is None and not Confirm.ask(
         "Start the selected READ-only scans", default=True, console=console
     ):
         raise KeyboardInterrupt

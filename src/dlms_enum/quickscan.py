@@ -1,21 +1,28 @@
-"""Zero-config scan bootstrap: inline discovery and secrets-file loading."""
+"""Zero-config discovery, credential setup, and reusable profile storage."""
 
 from __future__ import annotations
 
 import re
+import hashlib
+import os
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 from rich.console import Console
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
 
 from .autodiscover import (
     DiscoveryOptions,
     discover_public_device,
     suggested_public_config,
 )
-from .config import AppConfig, _parse_profiles, parse_config
+from .config import (
+    AppConfig, ConfigError, LlsProfile, PublicProfile, SecureProfile,
+    SecretSource, _parse_profiles, dump_config, load_config, parse_config,
+    resolve_lls_password, resolve_secret,
+)
 from .traffic_logger import TrafficLogger
 from .tui import prompt_secret
 
@@ -26,6 +33,98 @@ DEFAULT_OUTPUT_DIRECTORY = "./runs"
 _SECRET_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 _ROLE_NAME_BASES = {"low": "meter_reader", "high_gmac": "meter_client"}
+
+
+def profile_path(identity: str | None) -> Path | None:
+    """Use a readable, traversal-safe name without merging sanitized identities."""
+    if not identity:
+        return None
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", identity).strip("-.")[:100]
+    if name != identity:
+        name = f"{name or 'meter'}-{hashlib.sha256(identity.encode()).hexdigest()[:16]}"
+    return Path.home() / ".local/state/dlms-enum/profiles" / f"{name}.yaml"
+
+
+def reuse_profile(
+    config: AppConfig, path: Path | None, console: Console, *, interactive: bool
+) -> tuple[AppConfig, bool]:
+    """Reload saved roles while retaining the newly discovered endpoint."""
+    if path is None or not path.exists():
+        return config, True
+    choice = Prompt.ask(
+        "Saved profile found — reuse roles and credential references",
+        choices=["reuse", "edit", "fresh"], default="reuse", console=console,
+    ) if interactive else "reuse"
+    if choice == "fresh":
+        return config, True
+    saved = load_config(path)
+    endpoint = config.profile
+    profiles = tuple(replace(
+        profile,
+        server_logical_address=endpoint.server_logical_address,
+        server_physical_address=endpoint.server_physical_address,
+        server_address_size=endpoint.server_address_size,
+        **({"client_address": endpoint.client_address} if isinstance(profile, PublicProfile) else {}),
+    ) for profile in saved.profiles)
+    # Discovery remains the authority for the public SAP, including secure
+    # counter reads, even if the meter has moved to another serial port.
+    profiles = tuple(
+        replace(p, invocation_counter=replace(p.invocation_counter, public_client_address=endpoint.client_address))
+        if isinstance(p, SecureProfile) else
+        replace(p, public_client_address=endpoint.client_address)
+        if isinstance(p, LlsProfile) else p
+        for p in profiles
+    )
+    if not any(isinstance(p, PublicProfile) for p in profiles):
+        profiles = (endpoint,) + profiles
+    if choice == "edit":
+        profiles = tuple(p for p in profiles if isinstance(p, PublicProfile) or Confirm.ask(
+            f"Keep saved role {p.role}", default=True, console=console
+        ))
+    return replace(saved, transport=config.transport, profiles=profiles,
+                   authentication_scan=config.authentication_scan), choice == "edit"
+
+
+def save_profile(config: AppConfig, path: Path) -> None:
+    """Atomically save only reusable references, never resolved credentials."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".profile-", dir=path.parent)
+    os.close(fd)
+    try:
+        dump_config(config, temporary)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def resolve_credentials(
+    config: AppConfig, console: Console, *, interactive: bool
+) -> AppConfig:
+    """Resolve once in memory and prevent hidden getpass calls in headless runs."""
+    def reader(label: str) -> str:
+        if not interactive:
+            raise ConfigError("credentials require a terminal; use env references and --secrets FILE")
+        return prompt_secret(label, console)
+
+    profiles = []
+    for profile in config.profiles:
+        try:
+            if isinstance(profile, LlsProfile):
+                password = resolve_lls_password(profile, prompt=reader)
+                profile = replace(profile, password=SecretSource("inline", "hex:" + password.hex()))
+            elif isinstance(profile, SecureProfile):
+                keys = {name: SecretSource("inline", "hex:" + resolve_secret(
+                    getattr(profile.secrets, name), name.upper(), prompt=reader
+                ).hex()) for name in ("gak", "guek")}
+                profile = replace(profile, secrets=replace(profile.secrets, **keys))
+        except ConfigError as exc:
+            raise ConfigError(f"role {profile.role}: {exc}") from None
+        profiles.append(profile)
+    authentication = config.authentication_scan
+    if authentication.enabled and authentication.password is not None:
+        password = resolve_lls_password(authentication, prompt=reader)
+        authentication = replace(authentication, password=SecretSource("inline", "hex:" + password.hex()))
+    return replace(config, profiles=tuple(profiles), authentication_scan=authentication)
 
 
 class QuickscanError(RuntimeError):
@@ -123,7 +222,7 @@ def _prompt_hex_secret(
         )
         if not answer:
             return None
-        candidate = answer.lower()
+        candidate = answer.strip().lower()
         if candidate.startswith("hex:"):
             candidate = candidate[4:]
         try:
@@ -137,7 +236,7 @@ def _prompt_hex_secret(
                 f"({byte_length * 2} hexadecimal characters).[/red]"
             )
             continue
-        return candidate.upper()
+        return raw.hex().upper()
 
 
 def _unique_role(base: str, client_sap: int, taken: set[str]) -> str | None:
@@ -165,6 +264,7 @@ def build_profiles(
         if item.get("kind") == "client" and item.get("hex")
     ]
     taken = {profile.role for profile in config.profiles}
+    public_sap = next((p.client_address for p in config.profiles if isinstance(p, PublicProfile)), 16)
     new_profiles: list[Any] = []
     warnings: tuple[str, ...] = ()
     console.rule("Discovered associations")
@@ -173,6 +273,13 @@ def build_profiles(
         client_sap = suggestion.get("client_sap")
         logical_name = suggestion.get("logical_name")
         if mechanism in (None, "none") or client_sap is None:
+            continue
+        if not isinstance(client_sap, int) or isinstance(client_sap, bool) or not 1 <= client_sap <= 0x3FFF:
+            continue
+        if any(p.client_address == client_sap and (
+            isinstance(p, LlsProfile) and mechanism == "low" or
+            isinstance(p, SecureProfile) and mechanism == "high_gmac"
+        ) for p in (*config.profiles, *new_profiles)):
             continue
         console.print(
             f"Association {logical_name}: client SAP {client_sap}, "
@@ -209,6 +316,7 @@ def build_profiles(
                 "name": "lls",
                 "role": role,
                 "client_address": client_sap,
+                "public_client_address": public_sap,
                 "authentication": {"mechanism": "low", "password": {"inline": password}},
             }
         else:
@@ -230,6 +338,7 @@ def build_profiles(
                 "role": role,
                 "client_address": client_sap,
                 "client_system_title": f"hex:{title}",
+                "invocation_counter": {"public_client_address": public_sap},
                 "secrets": {
                     "gak": {"inline": f"hex:{gak}"},
                     "guek": {"inline": f"hex:{guek}"},
