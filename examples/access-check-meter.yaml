@@ -1,0 +1,36 @@
+version: 1
+transport:
+  device: /dev/ttyUSB0
+
+# Inventory GET selection is separate from the access-check attempt budget.
+scan:
+  common_catalogue: false
+  get_limit: 10
+
+profiles:
+  - name: public
+    role: public
+  - name: lls
+    role: reader
+    client_address: 32
+    authentication:
+      password: {env: DLMS_LLS_PASSWORD}
+  - name: hls_gmac_suite0
+    role: operator
+    client_address: 48
+    client_system_title: "hex:434C49454E543031"
+    secrets:
+      gak: {env: DLMS_GAK}
+      guek: {env: DLMS_GUEK}
+
+access_policy:
+  public_baseline: true
+  low_privilege_roles: [reader]
+  exceptions: []
+  # Exact exceptions require a reason, for example:
+  # - role: public
+  #   class_id: 3
+  #   logical_name: 1.0.1.8.0.255
+  #   operation: GET
+  #   member_id: 2
+  #   reason: Approved public display value for this laboratory meter

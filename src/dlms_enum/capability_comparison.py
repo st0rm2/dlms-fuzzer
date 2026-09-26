@@ -129,6 +129,15 @@ def compare_role_capabilities(
     public_objects, public_members, public_capabilities = _snapshot_model(public_snapshot)
     auth_objects, auth_members, auth_capabilities = _snapshot_model(authenticated_snapshot)
     direct_results = _direct_public_results(role_report)
+    probe_identity = (role_report or {}).get("public_union_test", {}).get("public_association", {})
+    public_identity = public_snapshot.get("identity", {})
+    if (probe_identity.get("client_address") is not None
+            and probe_identity["client_address"] != public_identity.get("client_address")):
+        direct_results = {}
+    if not compatible_identities(public_identity, authenticated_snapshot.get("identity", {})):
+        direct_results = {}
+    public_all = normalized_capabilities(public_snapshot)
+    authenticated_all = normalized_capabilities(authenticated_snapshot)
     rows: list[dict[str, Any]] = []
     counts: dict[str, Counter[str]] = {
         operation: Counter() for operation in ("GET", "SET", "ACTION")
@@ -154,13 +163,13 @@ def compare_role_capabilities(
             "classification": classification,
             "public": _side(
                 advertised=public is not None,
-                rights=public.get("rights") if public else None,
+                rights=public.get("rights") if public else public_all.get(key),
                 object_present=(class_id, logical_name) in public_objects,
                 member_present=member_key in public_members,
             ),
             "authenticated": _side(
                 advertised=authenticated is not None,
-                rights=authenticated.get("rights") if authenticated else None,
+                rights=authenticated.get("rights") if authenticated else authenticated_all.get(key),
                 object_present=(class_id, logical_name) in auth_objects,
                 member_present=member_key in auth_members,
             ),
@@ -229,7 +238,7 @@ def build_workflow_comparison(
 
 def render_comparison_markdown(report: dict[str, Any]) -> str:
     lines = [
-        "# Public versus authenticated permissions",
+        "# Role permissions",
         "",
         "This is a passive comparison of advertised permissions. Only the separate public GET verification may contain transmitted access tests; SET and ACTION are never sent.",
         "",
@@ -268,10 +277,11 @@ def render_comparison_markdown(report: dict[str, Any]) -> str:
         capabilities = comparison.get("capabilities", [])
         omitted_authenticated_only = sum(
             item.get("classification") == "authenticated_only"
+            and not item.get("public_get_verification")
             for item in capabilities
         )
         for item in capabilities:
-            if item.get("classification") == "authenticated_only":
+            if item.get("classification") == "authenticated_only" and not item.get("public_get_verification"):
                 continue
             verification = item.get("public_get_verification") or {}
             lines.append(
@@ -296,6 +306,8 @@ def render_comparison_markdown(report: dict[str, Any]) -> str:
                 ]
             )
         lines.append("")
+    if report.get("role_matrix"):
+        lines.extend(["", render_role_matrix(report["role_matrix"])])
     return "\n".join(lines)
 
 
@@ -309,3 +321,103 @@ def write_workflow_comparison(
     Path(markdown_path).write_text(
         render_comparison_markdown(report), encoding="utf-8"
     )
+
+
+def normalized_capabilities(snapshot: dict[str, Any]) -> dict[CapabilityKey, dict[str, Any]]:
+    """Retain denied members and their raw requirements, as well as grants."""
+    result = {}
+    for obj in snapshot.get("objects", []):
+        for kind, members in (("attribute", obj.get("attributes", [])), ("method", obj.get("methods", []))):
+            for member in members:
+                rights = member.get("access_rights", {})
+                operations = (("ACTION", "action"),) if kind == "method" else (("GET", "read"), ("SET", "write"))
+                for operation, permission in operations:
+                    key = (operation, int(obj["class_id"]), str(obj["logical_name"]), int(member[kind + "_id"]))
+                    result[key] = {"object_present": True, "member_present": True,
+                        "advertised": bool(rights.get(permission)),
+                        "state": "allowed" if rights.get(permission) else "denied",
+                        "mode": rights.get("mode"), "raw": rights.get("raw"),
+                        "requirements": list(_requirements(rights)),
+                        "object_version": obj.get("object_version", 0)}
+    return result
+
+
+def compatible_identities(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Missing identity is unknown; a known contradiction is incompatible."""
+    return all(left.get(key) is None or right.get(key) is None or left[key] == right[key]
+               for key in ("device", "meter_identity", "server_address"))
+
+
+def build_role_matrix(snapshots: dict[str, dict[str, Any]], roles: list[str]) -> dict[str, Any]:
+    from itertools import combinations
+
+    models = {role: normalized_capabilities(snapshot) for role, snapshot in snapshots.items()}
+    objects = {role: {(int(o["class_id"]), o["logical_name"]) for o in snapshot.get("objects", [])}
+               for role, snapshot in snapshots.items()}
+    rows = []
+    for key in sorted(set().union(*(set(model) for model in models.values()))):
+        operation, class_id, logical_name, member_id = key
+        cells = {}
+        for role in roles:
+            cell = models.get(role, {}).get(key)
+            if cell is None:
+                present = (class_id, logical_name) in objects.get(role, set())
+                cell = {"state": "view_unavailable" if role not in models else "member_absent" if present else "object_absent",
+                        "object_present": present if role in models else None,
+                        "member_present": False if role in models else None,
+                        "advertised": None, "requirements": [], "raw": None, "mode": None}
+            cells[role] = cell
+        rows.append({"operation": operation, "class_id": class_id, "logical_name": logical_name,
+                     "member_id": member_id, "roles": cells})
+    pairs = []
+    for left, right in combinations(roles, 2):
+        compatible = compatible_identities(snapshots.get(left, {}).get("identity", {}), snapshots.get(right, {}).get("identity", {}))
+        differences = []
+        for row in rows:
+            a, b = row["roles"][left], row["roles"][right]
+            if not compatible:
+                classification = "identity_mismatch"
+            elif "view_unavailable" in (a["state"], b["state"]):
+                classification = "view_unavailable"
+            elif a.get("object_version") is not None and b.get("object_version") is not None and a["object_version"] != b["object_version"]:
+                classification = "version_mismatch"
+            elif a["state"] != b["state"]:
+                classification = "rights_or_presence_differ"
+            elif a["requirements"] == b["requirements"]:
+                classification = "same"
+            elif set(a["requirements"]) < set(b["requirements"]):
+                classification = "left_broader"
+            elif set(b["requirements"]) < set(a["requirements"]):
+                classification = "right_broader"
+            else:
+                classification = "requirements_differ"
+            differences.append({k: v for k, v in row.items() if k != "roles"} | {"classification": classification})
+        pairs.append({"left_role": left, "right_role": right, "compatible_identity": compatible,
+                      "summary": dict(Counter(item["classification"] for item in differences)),
+                      "by_operation": {op: dict(Counter(item["classification"] for item in differences if item["operation"] == op))
+                                       for op in ("GET", "SET", "ACTION")},
+                      "differences": differences})
+    return {"schema_version": 1, "roles": [{"role": role,
+        "identity": snapshots.get(role, {}).get("identity"),
+        "saved_at": snapshots.get(role, {}).get("saved_at"),
+        "source": snapshots.get(role, {}).get("source", "unknown"),
+        "status": "available" if role in snapshots else "view_unavailable"} for role in roles],
+        "capabilities": rows, "pairs": pairs,
+        "role_totals": {role: {op: sum(row["roles"][role]["advertised"] is True for row in rows if row["operation"] == op)
+                               for op in ("GET", "SET", "ACTION")} for role in roles}}
+
+
+def render_role_matrix(report: dict[str, Any]) -> str:
+    lines = ["## All-role permissions", "", "Advertised rights only. Missing views are unknown, not denial.", "",
+             "| Left role | Right role | Differences | Identity compatible |", "|---|---|---:|---|"]
+    for pair in report.get("pairs", []):
+        lines.append(f"| {str(pair['left_role']).replace('|', '/')} | {str(pair['right_role']).replace('|', '/')} | "
+                     f"{sum(v for k, v in pair['summary'].items() if k != 'same')} | {pair['compatible_identity']} |")
+    roles = [item["role"] for item in report.get("roles", [])]
+    lines += ["", "| Operation | Class | Logical name | Member | " + " | ".join(r.replace("|", "/") for r in roles) + " |",
+              "|---|---:|---|---:|" + "---|" * len(roles)]
+    for row in report.get("capabilities", []):
+        cells = [row["roles"][role] for role in roles]
+        lines.append(f"| {row['operation']} | {row['class_id']} | {row['logical_name']} | {row['member_id']} | " +
+                     " | ".join(cell["state"] + (": " + ", ".join(cell["requirements"]) if cell["requirements"] else "") for cell in cells) + " |")
+    return "\n".join(lines) + "\n"

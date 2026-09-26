@@ -591,7 +591,20 @@ def show_capability_comparison(
                     + summary.get("authenticated_broader", 0)
                 ),
             )
-    console.print(table)
+    if report.get("comparisons"):
+        console.print(table)
+    matrix = report.get("role_matrix", {})
+    if matrix:
+        pairs = Table(title="All-role permission comparisons")
+        pairs.add_column("Roles")
+        pairs.add_column("Differences")
+        pairs.add_column("Identity")
+        for pair in matrix.get("pairs", []):
+            pairs.add_row(f"{pair['left_role']} / {pair['right_role']}",
+                          str(sum(v for k, v in pair["summary"].items() if k != "same")),
+                          "compatible" if pair["compatible_identity"] else "mismatch")
+        console.print(pairs)
+
 
 
 def _counter_table(candidates: tuple[CounterCandidate, ...]) -> Table:

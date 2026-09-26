@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .access_policy import AccessPolicy, PolicyException
 from .catalogues import CANDIDATE_PROVIDERS, CatalogueEntry
 
 DEFAULT_BAUD_RATES = (9600, 19200, 4800, 2400, 1200, 600, 300, 38400, 57600, 115200)
@@ -165,6 +166,7 @@ class AppConfig:
     profiles: tuple[ProfileConfig, ...]
     output: OutputConfig
     warnings: tuple[str, ...] = field(default=(), repr=False)
+    access_policy: AccessPolicy = AccessPolicy()
 
     @property
     def is_secure(self) -> bool:
@@ -264,6 +266,7 @@ class AppConfig:
             "authentication_scan": authentication_scan,
             "profiles": profiles,
             "output": asdict(self.output),
+            "access_policy": {k: v for k, v in self.access_policy.as_dict().items() if k != "baseline"},
         }
 
 
@@ -873,11 +876,49 @@ def _parse_output(raw: Any) -> OutputConfig:
     return OutputConfig(**values, redact_secrets=redact_secrets)
 
 
+def _parse_access_policy(raw: Any, profiles: tuple[ProfileConfig, ...]) -> AccessPolicy:
+    data = _mapping(raw, "access_policy")
+    _only_keys(data, {"public_baseline", "low_privilege_roles", "exceptions"}, "access_policy")
+    enabled = data.get("public_baseline", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError("access_policy.public_baseline must be boolean")
+    roles = {profile.role for profile in profiles}
+    low = data.get("low_privilege_roles", [])
+    if not isinstance(low, (list, tuple)) or any(not isinstance(r, str) or r not in roles for r in low) or len(set(low)) != len(low):
+        raise ConfigError("access_policy.low_privilege_roles must contain unique configured roles")
+    exceptions = data.get("exceptions", [])
+    if not isinstance(exceptions, (list, tuple)):
+        raise ConfigError("access_policy.exceptions must be a list")
+    parsed = []
+    seen = set()
+    for value in exceptions:
+        item = _mapping(value, "policy exception")
+        _only_keys(item, {"role", "class_id", "logical_name", "operation", "member_id", "reason"}, "policy exception")
+        role, operation = item.get("role"), item.get("operation")
+        if not isinstance(role, str) or role not in roles or operation not in ("GET", "SET", "ACTION"):
+            raise ConfigError("policy exception requires a configured role and GET, SET, or ACTION")
+        name = item.get("logical_name")
+        if not isinstance(name, str) or len(name.split(".")) != 6 or any(not part.isascii() or not part.isdecimal() or not 0 <= int(part) <= 255 for part in name.split(".")):
+            raise ConfigError("policy exception logical_name must be six decimal bytes")
+        name = ".".join(str(int(part)) for part in name.split("."))
+        reason = item.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ConfigError("policy exception requires a non-empty reason")
+        entry = PolicyException(role, _integer(item.get("class_id"), "class_id", 1, 65535), name,
+                                operation, _integer(item.get("member_id"), "member_id", 1, 255), reason.strip())
+        key = (entry.role, entry.class_id, entry.logical_name, entry.operation, entry.member_id)
+        if key in seen:
+            raise ConfigError("duplicate policy exception")
+        seen.add(key)
+        parsed.append(entry)
+    return AccessPolicy(enabled, tuple(low), tuple(parsed))
+
+
 def parse_config(data: Any, *, base_directory: str | Path | None = None) -> AppConfig:
     root = _mapping(data, "configuration")
     _only_keys(
         root,
-        {"version", "transport", "scan", "authentication_scan", "profiles", "output"},
+        {"version", "transport", "scan", "authentication_scan", "profiles", "output", "access_policy"},
         "configuration",
     )
     profiles, warnings = _parse_profiles(
@@ -914,6 +955,7 @@ def parse_config(data: Any, *, base_directory: str | Path | None = None) -> AppC
         profiles=profiles,
         output=output,
         warnings=warnings,
+        access_policy=_parse_access_policy(root.get("access_policy"), profiles),
     )
 
 

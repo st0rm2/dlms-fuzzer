@@ -2,6 +2,18 @@
 
 Status: 2026-09-25
 
+A1–A3 review and implementation: see
+[the assessment and implementation record](docs/a1-a3-implementation-plan.md).
+
+Short completion plan (implemented in code, live validation pending):
+
+- [x] Fix cross-role evidence visibility and tested/advertised flags.
+- [x] Add all-role GET/SET/ACTION comparisons, including non-public pairs.
+- [x] Add a public exposure baseline, low-privilege control rules, and exact exceptions.
+- [x] Add explicit bounded `access-check` GET verification for public, LLS, and HLS roles.
+- [x] Add regression/integration coverage, documentation, and a three-role example.
+- [ ] Validate on an authorized meter before declaring the A1–A3 milestone complete.
+
 ## Direction
 
 `dlms-enum` is an authorized DLMS/COSEM vulnerability scanner and fuzzer. Its mission is to assess the security posture of DLMS/COSEM meters: enumerate the attack surface, verify access-control and authentication policy with active tests, and fuzz the protocol implementation for robustness defects.

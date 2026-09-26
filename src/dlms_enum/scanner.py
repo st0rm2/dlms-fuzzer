@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .access_policy import evaluate_profile
 from .catalogues import bounded_candidates
 from .config import (
     AppConfig,
@@ -1111,7 +1112,8 @@ def _run_public_union_gets(
                     "outcome": Outcome.SUCCESS.value,
                     "access_assessment": "UNEXPECTED_PUBLIC_ACCESS",
                     "unexpected_public_access": True,
-                    "decoded": decoded,
+                    "decoded": _redact_sensitive_attribute(decoded, class_id=candidate["class_id"],
+                        attribute_id=candidate["attribute_id"], redact_secrets=config.output.redact_secrets),
                 }
             )
             result["attempts"].append(
@@ -1139,6 +1141,8 @@ def _run_public_union_gets(
                 }
             )
             if outcome == Outcome.DLMS_ERROR:
+                from .cross_role import rejection_detail
+                result.update(rejection_detail(last_exception))
                 rejected += 1
             else:
                 inconclusive += 1
@@ -1992,6 +1996,7 @@ def scan_public(
     invocation_counter_reuse_test: bool = False,
     association_view_mode: str = "live",
     association_view_snapshot: dict[str, Any] | None = None,
+    session_task: Callable[[Any, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run the configured public, LLS, or secure read-only scan."""
 
@@ -2305,6 +2310,12 @@ def scan_public(
                 "enabled": invocation_counter_reuse_test,
                 "status": "not_requested",
             }
+
+        if session_task is not None:
+            report["profiles"] = [{"name": profile_name, "association": association, "objects": []}]
+            report["access_check"] = session_task(session, association)
+            report["run"]["status"] = "completed"
+            return report
 
         if association_view_mode == "reuse":
             progress(
@@ -3212,6 +3223,7 @@ def scan_public(
             }
         )
         profile_result["security_posture"] = build_security_posture(profile_result)
+        profile_result["access_policy"] = evaluate_profile(profile_result, config.access_policy)
         profile_result["summary"].update(
             {
                 "objects": len(object_records),
@@ -3494,10 +3506,10 @@ def scan_public(
             row["profiles"]["public"] = {
                 "status": result["outcome"],
                 "outcome": result["outcome"],
-                "success": result["outcome"] == Outcome.SUCCESS.value,
-                "advertised": False,
+                "success": (result["outcome"] == Outcome.SUCCESS.value if result.get("attempt_count", 0) else None),
+                "advertised": result.get("public_advertised", False),
                 "advertised_access": result.get("public_advertised_access"),
-                "tested": True,
+                "tested": bool(result.get("attempt_count", 0)),
                 "cross_profile_probe": True,
                 "access_assessment": result["access_assessment"],
             }

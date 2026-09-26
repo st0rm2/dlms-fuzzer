@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -26,8 +27,10 @@ from .association_view import (
 from .catalogues import CANDIDATE_PROVIDERS
 from .capability_comparison import (
     build_workflow_comparison,
+    build_role_matrix,
     write_workflow_comparison,
 )
+from .cross_role import parse_pairs, run_checks, render_checks
 from .config import (
     ConfigError,
     LlsProfile,
@@ -154,6 +157,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="test at most N mapped GET operations; report all remaining operations as NOT_TESTED",
     )
+    active = subparsers.add_parser(
+        "access-check", parents=[scan_parser], add_help=False,
+        help="inventory roles, then perform explicitly selected cross-role GET checks",
+    )
+    active.add_argument("--pair", action="append", required=True, metavar="SOURCE:PROBE",
+                        help="repeat for each directed role pair; GETs run under PROBE")
+    active.add_argument("--authorization", type=Path, required=True,
+                        help="non-empty written target authorization file; its SHA-256 is recorded")
+    active.add_argument("--pair-limit", type=int, default=10)
+    active.add_argument("--transmission-limit", type=int, default=50,
+                        help="total active GET service attempts including baseline and recovery; inventory/bootstrap are separate")
     validate = subparsers.add_parser("validate-config", help="validate a YAML configuration")
     validate.add_argument("config", type=Path)
     subparsers.add_parser("list-catalogues", help="list built-in catalogue data")
@@ -197,7 +211,21 @@ def _safe_role_directory(role: str) -> str:
 
 
 def _scan(args: argparse.Namespace, console: Console) -> int:
-    non_interactive = bool(getattr(args, "non_interactive", False))
+    active_checks = getattr(args, "command", "scan") == "access-check"
+    authorization = None
+    if active_checks:
+        if not args.config:
+            raise ConfigError("access-check requires --config with named roles")
+        if args.pair_limit < 1 or args.transmission_limit < 1:
+            raise ConfigError("access-check limits must be positive")
+        if getattr(args, "association_view_mode", None) in {"reuse", "compare"}:
+            raise ConfigError("access-check requires live Association Views")
+        authorization_text = args.authorization.read_bytes()
+        if not authorization_text.strip():
+            raise ConfigError("authorization file must contain written target authorization")
+        authorization = {"file": str(args.authorization), "sha256": hashlib.sha256(authorization_text).hexdigest()}
+        args.association_view_mode = "live"
+    non_interactive = active_checks or bool(getattr(args, "non_interactive", False))
     interactive = console.is_terminal and sys.stdin.isatty() and not non_interactive
     setup_roles = True
     saved_path: Path | None = None
@@ -253,6 +281,11 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         selected[0],
     )
     config = replace(loaded_config, profiles=selected)
+    pairs = parse_pairs(args.pair, {p.role for p in selected}) if active_checks else []
+    if active_checks:
+        config = replace(config, scan=replace(config.scan, union_profile_test=False),
+                         authentication_scan=replace(config.authentication_scan, enabled=False),
+                         output=replace(config.output, redact_secrets=True))
     if args.short:
         config = with_object_limit(config, 10)
     elif args.full:
@@ -626,6 +659,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             {"mode": view_plan["mode"], "source": "meter"},
         )
         if exported_snapshot is not None:
+            exported_snapshot = {**exported_snapshot, "source": view_plan["mode"]}
             write_snapshot(exported_snapshot, association_export_path)
             view_report["snapshot_saved_at"] = exported_snapshot.get("saved_at")
             if view_plan["mode"] == "compare":
@@ -683,17 +717,16 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         for profile in config.profiles
         if not isinstance(profile, PublicProfile) and profile.role in role_snapshots
     ]
-    if (
-        public_profile is not None
-        and public_profile.role in role_snapshots
-        and authenticated_profiles
-    ):
-        capability_comparison = build_workflow_comparison(
-            role_snapshots[public_profile.role],
-            [
-                (role_snapshots[profile.role], role_reports.get(profile.role))
-                for profile in authenticated_profiles
-            ],
+    if config.profiles:
+        capability_comparison = (
+            build_workflow_comparison(
+                role_snapshots[public_profile.role],
+                [(role_snapshots[p.role], role_reports.get(p.role)) for p in authenticated_profiles],
+            ) if public_profile is not None and public_profile.role in role_snapshots
+            else {"schema_version": 1, "type": "multi_role_capability_comparison", "public_role": None, "comparisons": []}
+        )
+        capability_comparison["role_matrix"] = build_role_matrix(
+            role_snapshots, [p.role for p in config.profiles]
         )
         comparison_json_path = run_directory / "capability-comparison.json"
         comparison_markdown_path = run_directory / "capability-comparison.md"
@@ -858,9 +891,30 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             f"Authentication report: [green]{authentication_report_path.resolve()}[/green]"
         )
 
+    access_report = None
+    if active_checks:
+        # Failed role scans cannot supply trusted inventories for active tests.
+        usable_snapshots = {role: snapshot for role, snapshot in role_snapshots.items()
+                            if role_reports[role].get("run", {}).get("status") in {"completed", "completed_with_errors"}}
+        access_report = run_checks(config, usable_snapshots, role_reports, pairs,
+            pair_limit=args.pair_limit, transmission_limit=args.transmission_limit,
+            directory=run_directory, authorization=authorization)
+        (run_directory / "access-check.json").write_text(json.dumps(access_report, indent=2) + "\n", encoding="utf-8")
+        (run_directory / "access-check.md").write_text(render_checks(access_report), encoding="utf-8")
+        verified = sum(r.get("assessment") == "VERIFIED_POLICY_VIOLATION" for r in access_report["requests"])
+        console.print(f"Cross-role checks: {access_report['budget']['get_attempts']} GET attempts; {verified} verified policy violations")
+        console.print(f"Access-check report: {run_directory / 'access-check.md'}")
+        if any(d["status"] == "interrupted" for d in access_report["destinations"]):
+            statuses.append("interrupted")
+        elif any(r.get("assessment") == "INCONCLUSIVE" or
+                 r.get("reason") in {"destination_association_failed", "baseline_failed_or_budget_exhausted", "reconnect_failed", "recovery_health_failed", "association_identity_mismatch"}
+                 for r in access_report["requests"]) or any(p["status"] == "NOT_TESTED" for p in access_report["pairs"]):
+            statuses.append("failed")
+
     workflow_report = {
         "schema_version": 1,
         "type": "multi_role_read_workflow",
+        "access_check": {"report": "access-check.json", "summary": "access-check.md"} if access_report else {"status": "disabled"},
         "selected_roles": [profile.role for profile in config.profiles],
         "preflight": preflight.as_dict(),
         "system_title_discovery": system_title_discovery,
@@ -874,10 +928,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                 "json": "capability-comparison.json",
                 "summary": "capability-comparison.md",
                 "public_role": capability_comparison.get("public_role"),
-                "compared_roles": [
-                    item.get("authenticated_role")
-                    for item in capability_comparison.get("comparisons", [])
-                ],
+                "compared_roles": [item["role"] for item in capability_comparison["role_matrix"]["roles"]],
             }
             if capability_comparison is not None
             else {"status": "not_available"}
@@ -909,7 +960,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     console = Console()
     try:
-        if args.command == "scan":
+        if args.command in {"scan", "access-check"}:
             return _scan(args, console)
         if args.command == "validate-config":
             config = load_config(args.config)

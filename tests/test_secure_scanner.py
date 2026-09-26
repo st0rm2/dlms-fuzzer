@@ -1,4 +1,5 @@
 import sys
+from dataclasses import replace
 import tempfile
 import types
 import unittest
@@ -368,7 +369,7 @@ class SecureScannerTests(unittest.TestCase):
         )
 
     def test_get_limit_also_caps_public_cross_profile_test(self):
-        SecureSession.objects = [FakeObject(), SecureOnlyObject()]
+        SecureSession.objects = [FakeObject(), SecureOnlyObject(), SecondSecureOnlyObject()]
         with tempfile.TemporaryDirectory() as directory:
             report = self._run(
                 secure_config(
@@ -379,20 +380,20 @@ class SecureScannerTests(unittest.TestCase):
             )
 
         union_test = report["public_union_test"]
-        self.assertEqual(union_test["candidate_gets"], 1)
+        self.assertEqual(union_test["candidate_gets"], 2)
         self.assertEqual(union_test["selected_gets"], 1)
         self.assertEqual(union_test["attempted_gets"], 1)
         public_rows = [
             row["profiles"]["public"]
             for row in report["capability_matrix"]
             if row["operation"] == "GET"
-            and row["logical_name"] == SecureOnlyObject.logicalName
+            and row["logical_name"] in {SecureOnlyObject.logicalName, SecondSecureOnlyObject.logicalName}
             and "public" in row["profiles"]
         ]
         self.assertEqual(sum(item["tested"] for item in public_rows), 1)
         self.assertEqual(
             sum(item["status"] == "NOT_TESTED" for item in public_rows),
-            0,
+            1,
         )
 
     def test_public_cross_profile_retries_are_suppressed_after_timeouts(self):
@@ -442,6 +443,70 @@ class SecureScannerTests(unittest.TestCase):
         self.assertTrue(
             all(item["public_object_advertised"] for item in union_test["results"])
         )
+
+    def test_skipped_union_rows_are_not_marked_tested(self):
+        third = FakeObject()
+        third.logicalName = "1.0.99.3.0.255"
+        SecureSession.objects = [SecureOnlyObject(), SecondSecureOnlyObject(), third]
+        BootstrapSession.public_read_error = TimeoutError()
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = secure_config(Path(directory) / "counters.json", union_profile_test=True)
+            cfg = replace(cfg, scan=replace(cfg.scan, timeout_breaker_threshold=3))
+            with patch("dlms_enum.scanner._recover_timeout_circuit", return_value=(False, 0)):
+                # Supply the reason normally set by recovery.
+                from dlms_enum.scanner import _timeout_policy_scope
+                original = _timeout_policy_scope
+                def scope(*args, **kwargs):
+                    return {**original(*args, **kwargs), "stop_reason": "test dead session"}
+                with patch("dlms_enum.scanner._timeout_policy_scope", side_effect=scope):
+                    report = self._run(cfg)
+        rows = [row["profiles"]["public"] for row in report["capability_matrix"]
+                if row["operation"] == "GET" and "public" in row["profiles"]]
+        skipped = [row for row in rows if row["outcome"] == "INCONCLUSIVE"]
+        self.assertEqual(len(skipped), 1)
+        self.assertFalse(skipped[0]["tested"])
+        self.assertIsNone(skipped[0]["success"])
+
+    def test_session_task_uses_secure_bootstrap_and_releases_counter_lease(self):
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = BootstrapSession
+        class LeasedSession(SecureSession):
+            def __init__(self, config, baudrate, traffic, lease, *args, **kwargs):
+                super().__init__(config, baudrate, traffic, lease, *args, **kwargs)
+                self.lease = lease
+        module.GuruxSecureSession = LeasedSession
+        tasks = []
+        def task(session, association):
+            self.assertIsInstance(session, SecureSession)
+            self.assertTrue(association["hls_validated"])
+            self.assertIn("counter_read", BootstrapSession.events)
+            tasks.append(session.client.ciphering.invocationCounter)
+            session.lease.persist_next(session.client.ciphering.invocationCounter + 1)
+            session.client.ciphering.invocationCounter += 1
+            return {"status": "completed"}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            cfg = secure_config(Path(directory) / "counters.json")
+            with patch("dlms_enum.scanner.acquire_counter_lease", wraps=__import__("dlms_enum.counter_state", fromlist=["acquire_counter_lease"]).acquire_counter_lease) as acquire:
+                first = scan(cfg, object(), session_task=task)
+                second = scan(cfg, object(), session_task=task)
+                self.assertEqual(acquire.call_count, 2)
+            self.assertEqual(first["run"]["status"], "completed")
+            self.assertEqual(second["run"]["status"], "completed")
+        self.assertEqual(len(tasks), 2)
+        self.assertGreater(tasks[1], tasks[0])
+        self.assertFalse(SecureSession.discover_called)
+        self.assertEqual(BootstrapSession.events.count("secure_close"), 2)
+
+    def test_session_task_failure_still_closes_secure_session(self):
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = BootstrapSession
+        module.GuruxSecureSession = SecureSession
+        def task(*args):
+            raise RuntimeError("test task failure")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}):
+            report = scan(secure_config(Path(directory) / "counters.json"), object(), session_task=task)
+        self.assertEqual(report["run"]["status"], "failed")
+        self.assertIn("secure_close", BootstrapSession.events)
 
 
 if __name__ == "__main__":

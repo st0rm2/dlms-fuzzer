@@ -1574,6 +1574,22 @@ def render_summary_report(
     if profile_log_file:
         lines.append(f"Profile Generic rows: `{_markdown(profile_log_file)}`")
     lines.append("")
+    for profile in profiles:
+        policy = profile.get("access_policy", {})
+        if not policy:
+            continue
+        lines.extend(["", "## Access policy — " + _markdown(profile.get("name", "unknown")), "",
+                      "Advertised permissions and verified GETs are separate evidence. Policy exceptions remain visible.", "",
+                      "| Rule | Operation | Class / logical name / member | Evidence | Assessment | Requirements / exception |",
+                      "|---|---|---|---|---|---|"])
+        for finding in policy.get("findings", []):
+            evidence = "verified GET" if finding["verified"] else "advertised only"
+            cells = (finding["rule"], finding["operation"],
+                     f"{finding['class_id']} / {finding['logical_name']} / {finding['member_id']}",
+                     evidence, finding["assessment"], finding.get("exception_reason") or ", ".join(finding["requirements"]))
+            lines.append("| " + " | ".join(_markdown(cell) for cell in cells) + " |")
+        if not policy.get("findings"):
+            lines.append("No exposure found in the available evidence.")
     return "\n".join(lines)
 
 
@@ -1806,4 +1822,9 @@ def summary_lines(report: dict[str, Any]) -> list[str]:
                 union_test.get("inconclusive", 0),
             )
         )
+    for profile in profiles:
+        policy_summary = profile.get("access_policy", {}).get("summary")
+        if policy_summary:
+            lines.append(f"Access policy ({profile.get('name')}): {policy_summary['exposures']} exposures, "
+                         f"{policy_summary['verified']} verified GETs, {policy_summary['exceptions']} exceptions")
     return lines

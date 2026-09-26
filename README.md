@@ -2,7 +2,7 @@
 
 `dlms-enum` is a DLMS/COSEM vulnerability scanner and fuzzer in active development, operating over direct serial HDLC. The completed first phase built and validated the reconnaissance and access engine: reliable serial-HDLC DLMS interaction and authenticated access through unauthenticated public associations, password-authenticated LLS associations, and HLS-GMAC Security Suite 0 associations with authenticated-and-encrypted xDLMS traffic. All profiles use logical-name referencing, read the Association LN object list, supplement it with a conservative OBIS catalogue, and write a canonical JSON report plus side-by-side JSONL traffic. Secure scans can additionally retest authenticated-only targets through the public client to identify unadvertised public access. Later phases add active vulnerability tests and protocol fuzzing on top of this engine; see [plan.md](plan.md).
 
-Logical-name attribute 1 is not read or emitted as a separate result because it duplicates the OBIS logical name already stored on every object record.
+Normal enumeration does not read or emit logical-name attribute 1 as a separate result because it duplicates the OBIS logical name stored on every object. Active access checks use one such harmless GET for destination-session health.
 
 The LLS and secure profiles use Gurux DLMS for authentication; the secure profile also uses Gurux for HLS-GMAC and AES-GCM. The tool does not implement cryptography itself. Association View access rights for SET and ACTION are reported passively. In the current enumeration phase, a run transmits only GET requests, plus the mandatory Association LN method 1 ACTION required to complete configured HLS authentication and the opt-in invocation-counter replay diagnostic. No modifying SET, arbitrary ACTION, key transfer, or key rotation is transmitted in this phase. Active vulnerability modules — transmitted SET/ACTION verification, credential-policy testing, and protocol fuzzing — are roadmap items tracked in [plan.md](plan.md).
 
@@ -52,6 +52,85 @@ Values are literal (no shell expansion or quote removal) and override existing
 environment variables. Protect that file yourself; it is credential input,
 not an automatically generated artifact. `dlms-enum scan` without arguments
 still opens guided setup in an interactive terminal.
+
+## Access-control assessment (A1–A3)
+
+Normal scans now include a versioned `public-minimal-v1` exposure baseline and
+an all-role permission matrix. Public-only scans flag advertised or verified
+access outside identity/nameplate, clock time, and discovery metadata. Findings
+retain protection requirements; advertised SET/ACTION rights do not prove that
+those operations succeed. A Profile Generic buffer or register exposed equally
+to all roles still receives a public policy finding.
+
+`capability-comparison.json` keeps the existing public comparison and adds
+`role_matrix`: all selected roles, explicit denied rights, missing views/members,
+object versions, per-role operation totals, and every unordered role pair.
+The Markdown and terminal summaries also include non-public comparisons.
+Policy findings live under each profile's `access_policy` in its report and
+Markdown summary. Classes 64 and 18 cross-reference the existing posture findings.
+
+Use explicit policy settings to designate additional low-privilege roles and
+record exact exceptions. Authentication mechanism and client SAP do not imply
+privilege order:
+
+```yaml
+access_policy:
+  public_baseline: true
+  low_privilege_roles: [reader]
+  exceptions:
+    - role: public
+      class_id: 3
+      logical_name: 1.0.1.8.0.255
+      operation: GET
+      member_id: 2
+      reason: Approved public display value for this laboratory meter
+```
+
+Sensitive control rules cover disconnect, security, script, clock, calendar,
+schedule, and firmware SET/ACTION rights. Exceptions remain visible. Unknown
+non-baseline public reads remain findings without guessing their business meaning.
+
+For active verification, start with [examples/access-check-meter.yaml](examples/access-check-meter.yaml),
+configure the meter's real SAPs and credentials, and provide the written target
+authorization file:
+
+```shell
+dlms-enum access-check --config meter.yaml \
+  --pair reader:public --pair operator:reader \
+  --authorization lab-authorization.txt --pair-limit 10 --transmission-limit 50
+```
+
+`SOURCE:PROBE` means use SOURCE's advertised readable targets and send GETs
+under PROBE's configured credentials. Public, LLS, and HLS-GMAC destinations
+are supported. A public+LLS configuration needs no HLS role. To compare only
+authenticated roles, use `scan --roles reader,operator`; to actively verify that
+pair use `access-check --roles reader,operator --pair operator:reader` with the
+other required arguments above. The existing public preflight still occurs.
+
+`access-check` runs without prompts, requires a YAML configuration and fresh
+Association Views, forces secret redaction, and disables the separate mechanism
+sweep, legacy union test, and replay diagnostic for this run. It first inventories
+the selected roles, then opens each destination sequentially. Each destination
+must pass a harmless logical-name GET before probes begin; required HLS
+handshake ACTIONs still occur. No SET or application ACTION is tested.
+
+The per-pair limit selects unique targets deterministically. The shared attempt
+limit includes active probe retries, baseline GETs, and recovery GETs across all
+destinations. A multi-block GET counts as one service attempt, not one wire
+frame. Inventory GETs (controlled by `scan.get_limit`/`--get-limit`), public
+identity/counter bootstrap, association/HLS, and teardown are separate traffic
+and are recorded in their traffic files. Recovery is limited to one reconnect
+per destination. Exhausted budgets and unavailable views leave visible untested
+scope. Targets shared by several sources are transmitted once per destination;
+normal inventory reads are not reused as active verification.
+
+Results are written to `access-check.json`, `access-check.md`, and numbered
+per-destination report/traffic files. `VERIFIED_ACCESS` is an observation;
+`VERIFIED_POLICY_VIOLATION` additionally requires an applicable prohibiting
+policy rule. Explicit access denial, other DLMS errors, transport-inconclusive
+outcomes, and untested targets remain separate. The authorization file's path
+and SHA-256 are retained, not its contents. Legacy `scan.union_profile_test`
+keeps its existing HLS-to-public scope.
 
 ## Advanced configuration
 
