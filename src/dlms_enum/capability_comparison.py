@@ -338,7 +338,9 @@ def normalized_capabilities(snapshot: dict[str, Any]) -> dict[CapabilityKey, dic
                         "state": "allowed" if rights.get(permission) else "denied",
                         "mode": rights.get("mode"), "raw": rights.get("raw"),
                         "requirements": list(_requirements(rights)),
-                        "object_version": obj.get("object_version", 0)}
+                        "object_version": obj.get("object_version", 0),
+                        "discovery_sources": obj.get("discovery_sources", ["association_view"]),
+                        "source_association": obj.get("source_association")}
     return result
 
 
@@ -350,6 +352,7 @@ def compatible_identities(left: dict[str, Any], right: dict[str, Any]) -> bool:
 
 def build_role_matrix(snapshots: dict[str, dict[str, Any]], roles: list[str]) -> dict[str, Any]:
     from itertools import combinations
+    from .association_checks import control_findings
 
     models = {role: normalized_capabilities(snapshot) for role, snapshot in snapshots.items()}
     objects = {role: {(int(o["class_id"]), o["logical_name"]) for o in snapshot.get("objects", [])}
@@ -402,6 +405,7 @@ def build_role_matrix(snapshots: dict[str, dict[str, Any]], roles: list[str]) ->
         "saved_at": snapshots.get(role, {}).get("saved_at"),
         "source": snapshots.get(role, {}).get("source", "unknown"),
         "status": "available" if role in snapshots else "view_unavailable"} for role in roles],
+        "control_instance_findings": [f for role, snapshot in snapshots.items() for f in control_findings(snapshot, role)],
         "capabilities": rows, "pairs": pairs,
         "role_totals": {role: {op: sum(row["roles"][role]["advertised"] is True for row in rows if row["operation"] == op)
                                for op in ("GET", "SET", "ACTION")} for role in roles}}
@@ -413,6 +417,14 @@ def render_role_matrix(report: dict[str, Any]) -> str:
     for pair in report.get("pairs", []):
         lines.append(f"| {str(pair['left_role']).replace('|', '/')} | {str(pair['right_role']).replace('|', '/')} | "
                      f"{sum(v for k, v in pair['summary'].items() if k != 'same')} | {pair['compatible_identity']} |")
+    findings = report.get("control_instance_findings", [])
+    if findings:
+        lines += ["", "### Disconnect-control instance differences (A5)", "",
+                  "Review required: instances may control different outputs. SET/ACTION were not tested.", ""]
+        for finding in findings:
+            lines.append(f"- {finding['role']}: {finding['left_logical_name']} / {finding['right_logical_name']}")
+            for difference in finding["differences"]:
+                lines.append(f"  - {difference['operation']} {difference['member_id']}: {difference['classification']}")
     roles = [item["role"] for item in report.get("roles", [])]
     lines += ["", "| Operation | Class | Logical name | Member | " + " | ".join(r.replace("|", "/") for r in roles) + " |",
               "|---|---:|---|---:|" + "---|" * len(roles)]

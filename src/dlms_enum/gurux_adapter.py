@@ -808,6 +808,22 @@ class GuruxSession:
             setattr(target, "_dlms_access_selectors", selectors)
         return objects
 
+    def read_association_objects(self, logical_name: str, attempt: int) -> Any:
+        reply = GXReplyData()
+        self._read_blocks(
+            _quiet_gurux(self.client.read, self.create_object(15, logical_name), 2),
+            reply,
+            phase=f"{self.profile_name}_reconnaissance",
+            purpose="hidden_association_view",
+            operation="GET",
+            attempt=attempt,
+            object_context={"class_id": 15, "logical_name": logical_name, "attribute_id": 2},
+            tx_context={"service": "get-request", "attribute": "object-list"},
+        )
+        # Keep the current session's object collection intact. Hidden views may
+        # use a different rights encoding than the default association.
+        return reply.value
+
     def create_object(self, class_id: int, logical_name: str) -> Any:
         try:
             target = self.client.createObject(ObjectType(class_id))

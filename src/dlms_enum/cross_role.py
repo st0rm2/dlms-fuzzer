@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .access_policy import assess_capability
+from .association_checks import hidden_requests, association_snapshot, control_findings
 from .capability_comparison import compatible_identities, normalized_capabilities
 from .config import AppConfig, PublicProfile, SecureProfile
 from .result_model import Outcome, classify_exception
@@ -166,6 +167,12 @@ def execute_destination(session: Any, association: dict[str, Any], *, config: Ap
         if stop:
             request["reason"] = stop
             continue
+        if request.get("kind") == "hidden_association" and request["attribute_id"] == 2:
+            presence = next(r for r in requests if r.get("kind") == "hidden_association"
+                            and r["logical_name"] == request["logical_name"] and r["attribute_id"] == 1)
+            if presence["outcome"] != "SUCCESS":
+                request["reason"] = "presence_not_confirmed"
+                continue
         try:
             target = session.create_object(request["class_id"], request["logical_name"])
             target.version = request["object_version"]
@@ -180,8 +187,14 @@ def execute_destination(session: Any, association: dict[str, Any], *, config: Ap
                 break
             request["attempt_count"] += 1
             try:
-                session.read_attribute(target, request["attribute_id"], attempt,
-                                       phase="access_check", purpose="cross_role_verification")
+                if request.get("kind") == "hidden_association" and request["attribute_id"] == 2:
+                    objects = list(session.read_association_objects(request["logical_name"], attempt))
+                    request["discovered_view"] = association_snapshot(objects, request["logical_name"],
+                        {"role": config.profile.role, "client_address": config.profile.client_address})
+                else:
+                    session.read_attribute(target, request["attribute_id"], attempt,
+                                           phase="access_check", purpose="hidden_association_presence"
+                                           if request.get("kind") == "hidden_association" else "cross_role_verification")
             except Exception as exc:
                 outcome = classify_exception(exc)
                 event = {"attempt": attempt, "outcome": outcome.value, "error_type": type(exc).__name__}
@@ -200,6 +213,9 @@ def execute_destination(session: Any, association: dict[str, Any], *, config: Ap
                 request["outcome"] = "SUCCESS"
                 request["assessment"] = ("VERIFIED_POLICY_VIOLATION" if
                     (request.get("policy") or {}).get("assessment") == "policy_exposure" else "VERIFIED_ACCESS")
+                if request.get("kind") == "hidden_association":
+                    request["assessment"] = ("HIDDEN_ASSOCIATION_PRESENT" if request["attribute_id"] == 1
+                                             else "HIDDEN_ASSOCIATION_LIST_READABLE")
                 consecutive = 0
                 retry.record(Outcome.SUCCESS)
                 break
@@ -236,7 +252,8 @@ def execute_destination(session: Any, association: dict[str, Any], *, config: Ap
 def run_checks(config: AppConfig, snapshots: dict[str, dict[str, Any]],
                role_reports: dict[str, dict[str, Any]], pairs: list[tuple[str, str]],
                *, pair_limit: int, transmission_limit: int, directory: Path,
-               authorization: dict[str, Any]) -> dict[str, Any]:
+               authorization: dict[str, Any], hidden_roles: list[str] | None = None, control_roles: list[str] | None = None,
+               instances: range = range(1, 17)) -> dict[str, Any]:
     from .scanner import scan
     from .traffic_logger import TrafficLogger
     from .reporter import write_report
@@ -244,6 +261,51 @@ def run_checks(config: AppConfig, snapshots: dict[str, dict[str, Any]],
     if transmission_limit < 1:
         raise ValueError("transmission limit must be positive")
     plan = plan_checks(config, snapshots, pairs, pair_limit)
+    if not isinstance(instances, range) or instances.step != 1 or not instances or instances.start < 0 or instances.stop > 256:
+        raise ValueError("association instance range must be inclusive within 0..255")
+    plan["association_instances"] = {"first": instances.start, "last": instances.stop - 1}
+    plan["hidden_roles"] = []
+    profiles_by_role = {p.role: p for p in config.profiles}
+    for role in sorted(set(hidden_roles or [])):
+        if role not in profiles_by_role:
+            raise ValueError("unknown hidden-association role")
+        snapshot = snapshots.get(role)
+        identity = (snapshot or {}).get("identity", {})
+        reason = ("view_unavailable" if not snapshot or not snapshot.get("objects") else
+                  "role_identity_mismatch" if identity.get("role") != role or
+                  identity.get("client_address") != profiles_by_role[role].client_address else None)
+        plan["hidden_roles"].append({"role": role, "status": "NOT_TESTED" if reason else "planned", "reason": reason})
+        if reason is None:
+            plan["requests"].extend(hidden_requests(role, snapshot, instances))
+    plan["control_roles"] = []
+    for role in sorted(set(control_roles or [])):
+        if role not in profiles_by_role:
+            raise ValueError("unknown control-instance role")
+        snapshot = snapshots.get(role)
+        identity = (snapshot or {}).get("identity", {})
+        reason = ("view_unavailable" if not snapshot or not snapshot.get("objects") else
+                  "role_identity_mismatch" if identity.get("role") != role or
+                  identity.get("client_address") != profiles_by_role[role].client_address else None)
+        plan["control_roles"].append({"role": role, "status": "NOT_TESTED" if reason else "planned", "reason": reason})
+        if reason:
+            continue
+        names = {finding[key] for finding in control_findings(snapshot, role)
+                 if any(d["classification"] == "inconsistent_rights" for d in finding["differences"])
+                 for key in ("left_logical_name", "right_logical_name")}
+        for obj in snapshot["objects"]:
+            if obj["class_id"] != 70 or obj["logical_name"] not in names:
+                continue
+            existing = next((r for r in plan["requests"] if r["probe_role"] == role and
+                             r["class_id"] == 70 and r["logical_name"] == obj["logical_name"] and r["attribute_id"] == 2), None)
+            if existing is not None:
+                existing["control_instance_check"] = True
+                continue
+            plan["requests"].append({"class_id": 70, "logical_name": obj["logical_name"],
+                "object_version": obj.get("object_version", 0), "attribute_id": 2, "probe_role": role,
+                "source_roles": [], "selected": True, "kind": "control_instance", "control_instance_check": True,
+                "policy": assess_capability(config.access_policy, role, isinstance(profiles_by_role[role], PublicProfile),
+                                            70, obj["logical_name"], "GET", 2),
+                "outcome": "NOT_TESTED", "attempt_count": 0, "attempts": []})
     budget = GetBudget(transmission_limit)
     for request in plan["requests"]:
         source_evidence = []
@@ -299,7 +361,7 @@ def run_checks(config: AppConfig, snapshots: dict[str, dict[str, Any]],
                 if pending["outcome"] == "NOT_TESTED" and not pending.get("reason"):
                     pending["reason"] = "interrupted"
             break
-    indexed = {(r["probe_role"], r["class_id"], r["logical_name"], r["attribute_id"]): r for r in plan["requests"]}
+    indexed = {(r["probe_role"], r["class_id"], r["logical_name"], r["attribute_id"]): r for r in plan["requests"] if r.get("kind") != "hidden_association"}
     for pair in plan["pairs"]:
         for candidate in pair["candidates"]:
             if candidate.get("reason"):
@@ -313,7 +375,25 @@ def run_checks(config: AppConfig, snapshots: dict[str, dict[str, Any]],
                               else "completed")
         pair["summary"] = {state: sum(c["outcome"] == state for c in pair["candidates"])
                            for state in ("SUCCESS", "DLMS_ERROR", "TIMEOUT", "PROTOCOL_ERROR", "TRANSPORT_ERROR", "ARGUMENT_GENERATION_FAILED", "NOT_TESTED")}
-    return {**plan, "type": "cross_role_get_report", "authorization": authorization,
+    from .capability_comparison import build_role_matrix
+    hidden_views = []
+    for request in plan["requests"]:
+        view = request.get("discovered_view")
+        if view is not None:
+            role = request["probe_role"]
+            view["identity"] = dict(snapshots[role]["identity"])
+            label = f"{role}@{request['logical_name']}"
+            hidden_views.append({"probe_role": role, "source_association": request["logical_name"],
+                "rights_scope": "source association advertisement; not verified current-role permissions",
+                "comparison": build_role_matrix({role: snapshots[role], label: view}, [role, label])})
+    for group, field in ((plan["hidden_roles"], "hidden_association"), (plan["control_roles"], "control_instance")):
+        for entry in group:
+            if entry["status"] == "planned":
+                results = [r for r in plan["requests"] if r["probe_role"] == entry["role"] and
+                           (r.get("kind") == field or (field == "control_instance" and r.get("control_instance_check")))]
+                entry["status"] = ("inconclusive" if any(r.get("assessment") == "INCONCLUSIVE" for r in results)
+                                   else "partial" if any(r["outcome"] == "NOT_TESTED" for r in results) else "completed")
+    return {**plan, "hidden_view_comparisons": hidden_views, "type": "cross_role_get_report", "authorization": authorization,
             "policy": config.access_policy.as_dict(), "destinations": destinations,
             "budget": {"pair_target_limit": pair_limit, "get_attempt_limit": budget.limit, "get_attempts": budget.used,
                        "includes": "probe, baseline and recovery GET service attempts; block continuations are not separate attempts",
@@ -331,4 +411,22 @@ def render_checks(report: dict[str, Any]) -> str:
             cells = (pair["source_role"], pair["probe_role"], f"{item['class_id']} / {item['logical_name']} / {item['attribute_id']}",
                      item["outcome"], item.get("assessment") or item.get("reason", "not tested"), item["attempt_count"])
             lines.append("| " + " | ".join(str(c).replace("|", "\\|").replace("\n", " ") for c in cells) + " |")
+    lines += ["", "## Hidden associations", "", "Presence alone is not a vulnerability. Hidden-list rights describe the source association.", ""]
+    for entry in report.get("hidden_roles", []):
+        lines.append(f"- {entry['role']}: {entry['status']} ({entry.get('reason') or 'see probes below'})")
+    for item in report["requests"]:
+        if item.get("kind") == "hidden_association":
+            lines.append(f"- {item['probe_role']} / {item['logical_name']} / attribute {item['attribute_id']}: "
+                         f"{item['outcome']} — {item.get('assessment') or item.get('reason', 'not tested')}")
+    lines += ["", "## Control-instance GET verification", "", "Only output-state GETs are verified; SET/ACTION rights remain passive evidence.", ""]
+    for entry in report.get("control_roles", []):
+        lines.append(f"- {entry['role']}: {entry['status']} ({entry.get('reason') or 'see probes below'})")
+    for item in report["requests"]:
+        if item.get("control_instance_check"):
+            lines.append(f"- {item['probe_role']} / {item['logical_name']} / attribute 2: "
+                         f"{item['outcome']} — {item.get('assessment') or item.get('reason', 'not tested')}")
+    from .capability_comparison import render_role_matrix
+    for view in report.get("hidden_view_comparisons", []):
+        lines.extend(["", f"### {view['probe_role']} / {view['source_association']}",
+                      render_role_matrix(view["comparison"])])
     return "\n".join(lines) + "\n"

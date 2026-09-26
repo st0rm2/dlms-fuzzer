@@ -31,6 +31,7 @@ from .capability_comparison import (
     write_workflow_comparison,
 )
 from .cross_role import parse_pairs, run_checks, render_checks
+from .association_checks import parse_instances
 from .config import (
     ConfigError,
     LlsProfile,
@@ -161,10 +162,16 @@ def build_parser() -> argparse.ArgumentParser:
         "access-check", parents=[scan_parser], add_help=False,
         help="inventory roles, then perform explicitly selected cross-role GET checks",
     )
-    active.add_argument("--pair", action="append", required=True, metavar="SOURCE:PROBE",
+    active.add_argument("--pair", action="append", default=[], metavar="SOURCE:PROBE",
                         help="repeat for each directed role pair; GETs run under PROBE")
     active.add_argument("--authorization", type=Path, required=True,
                         help="non-empty written target authorization file; its SHA-256 is recorded")
+    active.add_argument("--hidden-associations", action="append", default=[], metavar="ROLE",
+                        help="probe hidden Association LN instances under this role; repeat for more roles")
+    active.add_argument("--control-instance-check", action="append", default=[], metavar="ROLE",
+                        help="verify output-state GETs on inconsistent class-70 instances under ROLE")
+    active.add_argument("--association-instances", default="1:16", metavar="FIRST:LAST",
+                        help="inclusive hidden-association instance range, 0..255 (default 1:16)")
     active.add_argument("--pair-limit", type=int, default=10)
     active.add_argument("--transmission-limit", type=int, default=50,
                         help="total active GET service attempts including baseline and recovery; inventory/bootstrap are separate")
@@ -283,6 +290,11 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
     config = replace(loaded_config, profiles=selected)
     pairs = parse_pairs(args.pair, {p.role for p in selected}) if active_checks else []
     if active_checks:
+        parse_instances(args.association_instances)
+        if not pairs and not args.hidden_associations and not args.control_instance_check:
+            raise ConfigError("select --pair, --hidden-associations or --control-instance-check")
+        if any(role not in {p.role for p in selected} for role in args.hidden_associations + args.control_instance_check):
+            raise ConfigError("probe role must be a selected configured role")
         config = replace(config, scan=replace(config.scan, union_profile_test=False),
                          authentication_scan=replace(config.authentication_scan, enabled=False),
                          output=replace(config.output, redact_secrets=True))
@@ -898,7 +910,8 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
                             if role_reports[role].get("run", {}).get("status") in {"completed", "completed_with_errors"}}
         access_report = run_checks(config, usable_snapshots, role_reports, pairs,
             pair_limit=args.pair_limit, transmission_limit=args.transmission_limit,
-            directory=run_directory, authorization=authorization)
+            directory=run_directory, authorization=authorization,
+            hidden_roles=args.hidden_associations, control_roles=args.control_instance_check, instances=parse_instances(args.association_instances))
         (run_directory / "access-check.json").write_text(json.dumps(access_report, indent=2) + "\n", encoding="utf-8")
         (run_directory / "access-check.md").write_text(render_checks(access_report), encoding="utf-8")
         verified = sum(r.get("assessment") == "VERIFIED_POLICY_VIOLATION" for r in access_report["requests"])
@@ -908,7 +921,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             statuses.append("interrupted")
         elif any(r.get("assessment") == "INCONCLUSIVE" or
                  r.get("reason") in {"destination_association_failed", "baseline_failed_or_budget_exhausted", "reconnect_failed", "recovery_health_failed", "association_identity_mismatch"}
-                 for r in access_report["requests"]) or any(p["status"] == "NOT_TESTED" for p in access_report["pairs"]):
+                 for r in access_report["requests"]) or any(p["status"] == "NOT_TESTED" for p in access_report["pairs"] + access_report["hidden_roles"] + access_report["control_roles"]):
             statuses.append("failed")
 
     workflow_report = {

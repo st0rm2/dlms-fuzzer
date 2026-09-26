@@ -642,3 +642,52 @@ Protocol tests use fakes, the real Gurux request generator, and sanitized struct
 The current phase — the enumeration and access engine — accepts multiple named `public`, `lls`, and `hls_gmac_suite0` roles and scans each selected role independently after one public planning preflight. The LLS profile currently uses unprotected xDLMS messages after password authentication. A secure role can also perform the bounded public cross-profile test described above. Negotiated GET-with-list batching is available for Association View-advertised reads, with bounded groups and individual fallback. The optional final authentication phase probes the supported password-based HLS variants and Suite 0 HLS-GMAC only on configured client SAPs.
 
 Not yet implemented in this phase: LLS combined with APDU ciphering, Security Suites 1/2, dedicated keys, signing, key agreement, key management, unconfigured client-address sweeps, and transmitted SET/arbitrary ACTION verification. These are roadmap items rather than exclusions; see [plan.md](plan.md) for the phased vulnerability-scanning and fuzzing roadmap.
+
+### Hidden associations and control-instance rights (A4–A5)
+
+`access-check` can probe Association LN instances omitted from a role's live
+object list. Select a role and an inclusive instance range (`0..255`):
+
+```bash
+python -m dlms_enum access-check --config examples/access-check-meter.yaml \
+  --authorization authorization.txt --hidden-associations public \
+  --association-instances 1:16 --transmission-limit 40
+```
+
+Repeat `--hidden-associations ROLE` for additional configured roles. The default
+range is `1:16`; advertised class-15 instances are excluded. Each candidate first
+receives a logical-name GET. Only successful presence probes proceed to an
+object-list GET. Baselines, retries, list reads, and recovery GETs share the
+active transmission limit. Inventory/bootstrap traffic remains outside that
+limit, as for cross-role checks. Object-list block continuations count as part
+of one GET service attempt; this is not a byte or frame limit.
+
+`access-check.json` and `access-check.md` distinguish hidden-object presence,
+readable hidden lists, explicit rejections, and inconclusive or skipped probes.
+Hidden presence alone is not classified as a vulnerability. Discovered views
+include the source association and separate comparisons against the current
+role's view. Their advertised rights describe that source association, not
+verified permissions of the probing role. When the source association's version
+is absent, rights remain uninterpreted. Hidden views do not replace cached live
+views or become automatic cross-role probe inputs.
+
+Normal role comparisons now include A5 findings for class-70 instances with
+different GET/SET/ACTION permissions or protection requirements. Missing member
+metadata and object-version differences are reported separately. Multiple
+instances with identical rights do not produce an inconsistency finding;
+instances may legitimately control different outputs.
+
+To verify harmless output-state GETs on instances with inconsistent rights:
+
+```bash
+python -m dlms_enum access-check --config examples/access-check-meter.yaml \
+  --authorization authorization.txt --control-instance-check public \
+  --transmission-limit 10
+```
+
+This reads class-70 attribute 2; it does not execute disconnect/reconnect methods
+or SET operations. Repeat the option for additional roles. All three selectors
+(`--pair`, `--hidden-associations`, `--control-instance-check`) can be combined;
+at least one is required. They share the same active GET budget. The
+`--pair-limit` applies only to cross-role candidates; hidden candidates are
+bounded by their instance range and the shared budget.

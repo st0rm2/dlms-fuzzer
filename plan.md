@@ -1,6 +1,6 @@
 # dlms-enum roadmap
 
-Status: 2026-09-25
+Status: 2026-09-26
 
 A1–A3 review and implementation: see
 [the assessment and implementation record](docs/a1-a3-implementation-plan.md).
@@ -13,6 +13,14 @@ Short completion plan (implemented in code, live validation pending):
 - [x] Add explicit bounded `access-check` GET verification for public, LLS, and HLS roles.
 - [x] Add regression/integration coverage, documentation, and a three-role example.
 - [ ] Validate on an authorized meter before declaring the A1–A3 milestone complete.
+
+A4–A5 implementation:
+
+- [x] Add explicit role/range selectors for hidden Association LN discovery.
+- [x] Probe presence then object lists using the shared active GET budget.
+- [x] Preserve source-association provenance and compare discovered views separately.
+- [x] Report class-70 instance rights inconsistencies and offer output-state GET verification.
+- [x] Cover discovery, limits, rights encoding, and report integration with regression tests.
 
 ## Direction
 
@@ -189,8 +197,8 @@ Feature IDs refer to [docs/vulnerability-research.md](docs/vulnerability-researc
 - [ ] Bound attempts, reuse the transport session guard, and add lockout warnings.
 - [ ] Never continue a normal scan under a weaker association after the expected secure association fails.
 - [ ] Produce a matrix of proposed versus negotiated/observed properties and explain why each result is or is not a downgrade.
-- [ ] A4: hidden-association discovery — probe Association LN objects absent from the current view.
-- [ ] A5: duplicate/multi-instance disconnect-control objects with inconsistent rights.
+- [x] A4: hidden-association discovery — probe Association LN objects absent from the current view.
+- [x] A5: duplicate/multi-instance disconnect-control objects with inconsistent rights.
 - [ ] A6: system-title-dependent association views (same SAP, different claimed titles).
 - [ ] A7: selective-access leaks on restricted Profile Generic buffers.
 - [ ] B1: classify the mechanism acceptance matrix — MD5/SHA-1 acceptance is an offline-dictionary-attack finding.
