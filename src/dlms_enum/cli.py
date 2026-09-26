@@ -30,13 +30,20 @@ from .capability_comparison import (
 )
 from .config import (
     ConfigError,
+    LlsProfile,
     PublicProfile,
     SecureProfile,
     load_config,
     with_get_limit,
     with_object_limit,
 )
-from .quickscan import DEFAULT_OUTPUT_DIRECTORY, discover_config, load_secrets_file
+from .quickscan import (
+    DEFAULT_OUTPUT_DIRECTORY,
+    build_profiles,
+    config_from_discovery,
+    discover_device,
+    load_secrets_file,
+)
 from .reporter import load_report, summary_lines, write_report
 from .scanner import (
     AUTHENTICATION_DISPLAY_NAMES,
@@ -190,6 +197,7 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
     if getattr(args, "secrets", None):
         os.environ.update(load_secrets_file(args.secrets))
     run_directory: Path | None = None
+    discovery_result: dict[str, Any] | None = None
     if args.config:
         loaded_config = load_config(args.config)
     elif getattr(args, "device", None):
@@ -202,7 +210,8 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
             f"Discovering public DLMS endpoint on [bold]{args.device}[/bold]..."
         )
         try:
-            loaded_config = discover_config(args.device, discovery_logger)
+            discovery_result = discover_device(args.device, discovery_logger)
+            loaded_config = config_from_discovery(discovery_result)
         finally:
             discovery_logger.close()
         console.print(
@@ -269,6 +278,27 @@ def _scan(args: argparse.Namespace, console: Console) -> int:
         preflight_logger.close()
 
     show_public_preflight(preflight, console)
+    if discovery_result is not None:
+        config = build_profiles(
+            config,
+            preflight.role_suggestions,
+            discovery_result,
+            console,
+            interactive=interactive,
+        )
+        console.print("Configured roles:")
+        for profile in config.profiles:
+            mechanism = (
+                "none"
+                if isinstance(profile, PublicProfile)
+                else "low"
+                if isinstance(profile, LlsProfile)
+                else "high_gmac"
+            )
+            console.print(
+                f"  {profile.role} ({profile.name}): client SAP "
+                f"{profile.client_address}, authentication {mechanism}"
+            )
     config = apply_preflight_endpoint(config, preflight)
     system_title_discovery: dict[str, Any] = {
         "enabled": False,

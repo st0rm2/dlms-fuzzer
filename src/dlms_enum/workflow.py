@@ -13,6 +13,7 @@ from .config import (
     SecureProfile,
 )
 from .scanner import (
+    AUTHENTICATION_MECHANISMS,
     _GetRetryPolicy,
     _TimeoutCircuitBreaker,
     _advertised_attributes,
@@ -49,6 +50,7 @@ class PublicPreflight:
     association_view_objects: int
     counter_candidates: tuple[CounterCandidate, ...]
     errors: tuple[dict[str, Any], ...] = ()
+    role_suggestions: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +60,7 @@ class PublicPreflight:
             "association_view_objects": self.association_view_objects,
             "counter_candidates": [item.as_dict() for item in self.counter_candidates],
             "errors": list(self.errors),
+            "role_suggestions": [dict(item) for item in self.role_suggestions],
         }
 
 
@@ -66,6 +69,50 @@ def _counter_value(decoded: dict[str, Any]) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if 0 <= value <= 0xFFFFFFFF else None
+
+
+# COSEM authentication-mechanism-name OID prefix: 2.16.756.5.8.2.<id>
+_MECHANISM_OID_PREFIX = bytes.fromhex("608574050802")
+_ROLE_SUGGESTION_LIMIT = 8
+
+
+def _association_client_sap(decoded: dict[str, Any]) -> int | None:
+    for key in ("value", "raw_value"):
+        value = decoded.get(key)
+        if (
+            isinstance(value, list)
+            and value
+            and isinstance(value[0], int)
+            and not isinstance(value[0], bool)
+        ):
+            return int(value[0])
+    return None
+
+
+def _association_mechanism_id(decoded: dict[str, Any]) -> int | None:
+    for key in ("raw_value", "value"):
+        value = decoded.get(key)
+        if isinstance(value, dict) and value.get("encoding") == "octet-string":
+            hex_value = value.get("hex")
+            if not isinstance(hex_value, str):
+                continue
+            try:
+                raw = bytes.fromhex(hex_value)
+            except ValueError:
+                continue
+            if len(raw) == 7 and raw[:6] == _MECHANISM_OID_PREFIX:
+                return int(raw[6])
+        elif isinstance(value, str):
+            try:
+                numbers = [int(part) for part in value.replace(".", " ").split()]
+            except ValueError:
+                continue
+            if len(numbers) == 7 and numbers[:6] in (
+                [2, 16, 756, 5, 8, 2],
+                [0, 0, 0, 5, 8, 2],
+            ):
+                return numbers[6]
+    return None
 
 
 def run_public_preflight(
@@ -297,6 +344,55 @@ def run_public_preflight(
                             ),
                         )
 
+        role_suggestions: list[dict[str, Any]] = []
+        association_objects = [
+            target for target in objects if int(target.objectType) == 15
+        ][:_ROLE_SUGGESTION_LIMIT]
+        for target in (() if preflight_inconclusive else association_objects):
+            try:
+                partners = selected_session.read_attribute(
+                    target,
+                    3,
+                    1,
+                    phase="public_preflight",
+                    purpose="association_partners_read",
+                )
+                mechanism = selected_session.read_attribute(
+                    target,
+                    6,
+                    1,
+                    phase="public_preflight",
+                    purpose="association_mechanism_read",
+                )
+            except Exception as exc:
+                record_candidate_outcome(classify_exception(exc))
+                errors.append(
+                    {
+                        "phase": "preflight_role_suggestion",
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "logical_name": str(target.logicalName),
+                    }
+                )
+                if not recover_if_needed():
+                    preflight_inconclusive = True
+                    break
+                continue
+            record_candidate_outcome(Outcome.SUCCESS)
+            mechanism_id = _association_mechanism_id(mechanism)
+            role_suggestions.append(
+                {
+                    "logical_name": str(target.logicalName),
+                    "client_sap": _association_client_sap(partners),
+                    "mechanism_id": mechanism_id,
+                    "mechanism": (
+                        AUTHENTICATION_MECHANISMS.get(mechanism_id)
+                        if mechanism_id is not None
+                        else None
+                    ),
+                }
+            )
+
         transport = {
             "type": "serial_hdlc",
             "device": config.transport.device,
@@ -316,6 +412,7 @@ def run_public_preflight(
             association_view_objects=len(objects),
             counter_candidates=tuple(candidates),
             errors=tuple(errors),
+            role_suggestions=tuple(role_suggestions),
         )
     finally:
         if selected_session is not None:

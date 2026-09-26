@@ -98,6 +98,56 @@ class RecordingPreflightSession(PreflightSession):
         self.__class__.client_addresses.append(kwargs.get("client_address"))
 
 
+class AssociationLn:
+    objectType = 15
+    version = 2
+    attributes = [Attribute(1), Attribute(2), Attribute(3), Attribute(6)]
+    methodAttributes = []
+    description = ""
+
+    def __init__(self, logical_name, client_sap, mechanism_hex, *, fail=False):
+        self.logicalName = logical_name
+        self.client_sap = client_sap
+        self.mechanism_hex = mechanism_hex
+        self.fail = fail
+
+    def getAccess(self, _index):
+        return 1
+
+    def getAttributeCount(self):
+        return 6
+
+
+class AssociationMetadataSession(PreflightSession):
+    associations = []
+
+    def discover_objects(self, _attempt):
+        return [
+            PublicData("0.0.43.1.0.255", "Invocation counter"),
+            *self.associations,
+        ]
+
+    def read_attribute(self, target, attribute_id, _attempt, **_kwargs):
+        if int(target.objectType) == 15:
+            if target.fail:
+                raise TimeoutError("meter did not reply")
+            if attribute_id == 3:
+                return {
+                    "value": [target.client_sap, 1],
+                    "raw_value": [target.client_sap, 1],
+                    "dlms_data_type": "structure",
+                }
+            if attribute_id == 6:
+                blob = {
+                    "encoding": "octet-string",
+                    "hex": target.mechanism_hex,
+                    "length": 7,
+                }
+                return {"value": dict(blob), "raw_value": blob}
+            raise AssertionError(f"unexpected association attribute {attribute_id}")
+        return super().read_attribute(target, attribute_id, _attempt, **_kwargs)
+
+
 def multi_role_config():
     secure = {
         "name": "hls_gmac_suite0",
@@ -327,6 +377,113 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(
             all(profile.server_address_size == 2 for profile in effective.profiles)
         )
+
+
+    def _run_metadata_preflight(self, associations):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null", "baudrate": 9600},
+                "profiles": [{"name": "public", "role": "public"}],
+            }
+        )
+        session = type(
+            "AssociationMetadataSessionVariant",
+            (AssociationMetadataSession,),
+            {"associations": associations, "timeout_changes": []},
+        )
+        module = types.ModuleType("dlms_enum.gurux_adapter")
+        module.GuruxSession = session
+        with (
+            patch.dict(sys.modules, {"dlms_enum.gurux_adapter": module}),
+            patch("dlms_enum.workflow.validate_serial_device"),
+        ):
+            return run_public_preflight(config, object())
+
+    def test_preflight_collects_association_role_suggestions(self):
+        result = self._run_metadata_preflight(
+            [
+                AssociationLn("0.0.40.0.0.255", 16, "60857405080200"),
+                AssociationLn("0.0.40.0.1.255", 32, "60857405080201"),
+                AssociationLn("0.0.40.0.2.255", 1, "60857405080205"),
+            ]
+        )
+
+        suggestions = result.role_suggestions
+        self.assertEqual(
+            [
+                (
+                    item["logical_name"],
+                    item["client_sap"],
+                    item["mechanism_id"],
+                    item["mechanism"],
+                )
+                for item in suggestions
+            ],
+            [
+                ("0.0.40.0.0.255", 16, 0, "none"),
+                ("0.0.40.0.1.255", 32, 1, "low"),
+                ("0.0.40.0.2.255", 1, 5, "high_gmac"),
+            ],
+        )
+        self.assertEqual(
+            result.as_dict()["role_suggestions"],
+            [dict(item) for item in suggestions],
+        )
+        self.assertEqual(result.errors, ())
+
+    def test_preflight_records_unknown_mechanism_oids_without_names(self):
+        result = self._run_metadata_preflight(
+            [
+                AssociationLn("0.0.40.0.3.255", 48, "60857405080209"),
+                AssociationLn("0.0.40.0.4.255", 64, "01020304050607"),
+            ]
+        )
+
+        suggestions = result.role_suggestions
+        self.assertEqual(suggestions[0]["mechanism_id"], 9)
+        self.assertIsNone(suggestions[0]["mechanism"])
+        self.assertIsNone(suggestions[1]["mechanism_id"])
+        self.assertIsNone(suggestions[1]["mechanism"])
+
+    def test_preflight_association_read_failure_is_non_fatal(self):
+        result = self._run_metadata_preflight(
+            [
+                AssociationLn("0.0.40.0.5.255", 40, "60857405080201", fail=True),
+                AssociationLn("0.0.40.0.6.255", 48, "60857405080205"),
+            ]
+        )
+
+        self.assertEqual(len(result.role_suggestions), 1)
+        self.assertEqual(result.role_suggestions[0]["client_sap"], 48)
+        suggestion_errors = [
+            error
+            for error in result.errors
+            if error["phase"] == "preflight_role_suggestion"
+        ]
+        self.assertEqual(len(suggestion_errors), 1)
+        self.assertEqual(suggestion_errors[0]["logical_name"], "0.0.40.0.5.255")
+
+    def test_preflight_bounds_association_metadata_reads(self):
+        result = self._run_metadata_preflight(
+            [
+                AssociationLn(f"0.0.40.0.{index}.255", 16 + index, "60857405080201")
+                for index in range(10)
+            ]
+        )
+
+        self.assertEqual(len(result.role_suggestions), 8)
+
+    def test_public_preflight_role_suggestions_default_to_empty(self):
+        preflight = PublicPreflight(
+            transport={},
+            association={},
+            meter_identity=None,
+            association_view_objects=0,
+            counter_candidates=(),
+        )
+
+        self.assertEqual(preflight.role_suggestions, ())
+        self.assertEqual(preflight.as_dict()["role_suggestions"], [])
 
 
 if __name__ == "__main__":

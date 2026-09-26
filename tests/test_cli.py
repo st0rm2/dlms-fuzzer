@@ -575,7 +575,11 @@ class ZeroConfigScanTests(unittest.TestCase):
             run_directory = Path(directory) / "run"
             run_directory.mkdir()
             with (
-                patch("dlms_enum.cli.discover_config", return_value=config) as discover,
+                patch(
+                    "dlms_enum.cli.discover_device",
+                    return_value={"device": "/dev/null"},
+                ) as discover,
+                patch("dlms_enum.cli.config_from_discovery", return_value=config),
                 patch("dlms_enum.cli._run_directory", return_value=run_directory),
                 patch("dlms_enum.cli.TrafficLogger", NullLogger),
                 patch(
@@ -621,7 +625,7 @@ class ZeroConfigScanTests(unittest.TestCase):
 
         def fake_discover(device, _traffic):
             observed["secret"] = os.environ.get("DLMS_TEST_CLI_SECRET")
-            return config
+            return {"device": device}
 
         console = Console(file=io.StringIO(), color_system=None)
         with tempfile.TemporaryDirectory() as directory:
@@ -631,7 +635,8 @@ class ZeroConfigScanTests(unittest.TestCase):
             run_directory.mkdir()
             with (
                 patch.dict(os.environ),
-                patch("dlms_enum.cli.discover_config", side_effect=fake_discover),
+                patch("dlms_enum.cli.discover_device", side_effect=fake_discover),
+                patch("dlms_enum.cli.config_from_discovery", return_value=config),
                 patch("dlms_enum.cli._run_directory", return_value=run_directory),
                 patch("dlms_enum.cli.TrafficLogger", NullLogger),
                 patch(
@@ -648,6 +653,110 @@ class ZeroConfigScanTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(observed["secret"], "0011")
         self.assertNotIn("DLMS_TEST_CLI_SECRET", os.environ)
+
+    def test_suggested_lls_role_flows_through_interactive_device_scan(self):
+        config = parse_config(
+            {
+                "transport": {"device": "/dev/null", "baudrate": 9600},
+                "profiles": [{"name": "public", "role": "public"}],
+            }
+        )
+        preflight = PublicPreflight(
+            transport={
+                "device": "/dev/null",
+                "selected_baudrate": 9600,
+                "selected_server_address": 1,
+                "selected_server_logical_address": 0,
+                "selected_server_physical_address": 1,
+                "server_address_size": 1,
+                "server_addressing_type": "1-byte addressing",
+            },
+            association={"negotiated_conformance": ["get"]},
+            meter_identity="METER-1",
+            association_view_objects=2,
+            counter_candidates=(),
+            role_suggestions=(
+                {
+                    "logical_name": "0.0.40.0.1.255",
+                    "client_sap": 32,
+                    "mechanism_id": 1,
+                    "mechanism": "low",
+                },
+            ),
+        )
+        scanned_roles = []
+        scanned_addresses = []
+
+        def fake_scan(runtime_config, *_args, **_kwargs):
+            scanned_roles.append(runtime_config.profile.role)
+            scanned_addresses.append(runtime_config.profile.server_logical_address)
+            return {
+                "run": {"id": runtime_config.profile.role, "status": "completed"},
+                "effective_configuration": runtime_config.redacted_dict(),
+                "transport": {"device": "/dev/null", "selected_server_address": 1},
+                "profiles": [],
+                "errors": [],
+            }
+
+        console = Console(
+            file=io.StringIO(), color_system=None, force_terminal=True
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run_directory = Path(directory) / "run"
+            run_directory.mkdir()
+            with (
+                patch("sys.stdin.isatty", return_value=True),
+                patch(
+                    "dlms_enum.cli.discover_device",
+                    return_value={"device": "/dev/null"},
+                ),
+                patch("dlms_enum.cli.config_from_discovery", return_value=config),
+                patch("dlms_enum.cli._run_directory", return_value=run_directory),
+                patch("dlms_enum.cli.TrafficLogger", NullLogger),
+                patch(
+                    "dlms_enum.cli.run_public_preflight", return_value=preflight
+                ),
+                patch("dlms_enum.cli.scan", side_effect=fake_scan),
+                patch("dlms_enum.cli.write_report"),
+                patch("dlms_enum.cli.ScanUI.summary"),
+                patch(
+                    "dlms_enum.cli.select_roles",
+                    side_effect=lambda cfg, _console: cfg.profiles,
+                ),
+                patch(
+                    "dlms_enum.cli.choose_read_plan",
+                    side_effect=lambda cfg, *_args, **_kwargs: cfg,
+                ),
+                patch(
+                    "dlms_enum.cli.choose_association_view_mode",
+                    return_value=("live", False),
+                ),
+                patch("dlms_enum.cli.Confirm.ask", return_value=True),
+                patch("dlms_enum.quickscan.Confirm.ask", return_value=True),
+                patch(
+                    "dlms_enum.quickscan.prompt_secret", return_value="s3cret"
+                ),
+            ):
+                status = _scan(self._args(non_interactive=False), console)
+            workflow = json.loads((run_directory / "workflow.json").read_text())
+            leaked = [
+                str(path)
+                for path in run_directory.rglob("*")
+                if path.is_file() and "s3cret" in path.read_bytes().decode(
+                    "utf-8", errors="replace"
+                )
+            ]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(scanned_roles, ["public", "meter_reader"])
+        self.assertEqual(scanned_addresses, [0, 0])
+        self.assertEqual(workflow["selected_roles"], ["public", "meter_reader"])
+        self.assertEqual(
+            [item["role"] for item in workflow["role_runs"]],
+            ["public", "meter_reader"],
+        )
+        self.assertEqual(leaked, [])
+        self.assertNotIn("s3cret", console.file.getvalue())
 
     def test_non_interactive_without_device_or_config_errors(self):
         console = Console(file=io.StringIO(), color_system=None)

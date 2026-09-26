@@ -1,10 +1,11 @@
 import io
 import unittest
+from unittest.mock import patch
 
 from rich.console import Console
 
 from dlms_enum.reporter import summary_lines
-from dlms_enum.tui import ScanUI
+from dlms_enum.tui import ScanUI, prompt_secret
 
 
 class ScanUITests(unittest.TestCase):
@@ -93,6 +94,18 @@ class ScanUITests(unittest.TestCase):
         self.assertIn("Retry Invocation Counter", rendered)
         self.assertIn("Attempt 0x00000000 as invocation counter", rendered)
         self.assertIn("Attempt 0x12345678 as invocation counter", rendered)
+
+
+class PromptSecretTests(unittest.TestCase):
+    def test_masked_prompt_returns_stripped_answer(self):
+        console = Console(file=io.StringIO(), color_system=None)
+
+        with patch("dlms_enum.tui.Prompt.ask", return_value="  s3cret  ") as ask:
+            answer = prompt_secret("GAK", console)
+
+        self.assertEqual(answer, "s3cret")
+        self.assertTrue(ask.call_args.kwargs["password"])
+        self.assertIs(ask.call_args.kwargs["console"], console)
 
 
 if __name__ == "__main__":
